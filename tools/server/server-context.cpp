@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "kv-chain-store.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -276,6 +277,13 @@ struct server_slot {
         }
 
         return true;
+    }
+
+    bool kv_chain_save(kv_chain_store & store) const {
+        if (prompt.tokens.size() == 0 || ctx_tgt == nullptr) {
+            return false;
+        }
+        return store.save(ctx_tgt, id, prompt.tokens.get_tokens());
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -865,6 +873,7 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<kv_chain_store> kv_chain;
 
     server_metrics metrics;
 
@@ -1325,6 +1334,13 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        if (!params_base.kv_chain_dir.empty()) {
+            const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
+                ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
+                : 0;
+            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes);
+        }
+
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
@@ -1597,6 +1613,10 @@ private:
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
+
+                if (kv_chain) {
+                    ret->kv_chain_save(*kv_chain);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2370,6 +2390,10 @@ private:
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
+                                }
+
+                                if (kv_chain) {
+                                    slot.kv_chain_save(*kv_chain);
                                 }
 
                                 if (params_base.kv_unified) {
@@ -3324,6 +3348,24 @@ private:
                                     } else {
                                         ++it;
                                     }
+                                }
+                            }
+                        }
+
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && kv_chain && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
+                            // restore a saved prefix from the disk hash-chain cache
+                            size_t n_saved = 0;
+                            const std::vector<uint8_t> blob = kv_chain->load_prefix(input_tokens.get_tokens(), &n_saved);
+                            if (!blob.empty() && n_saved > 0) {
+                                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, blob.data(), blob.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (n == blob.size()) {
+                                    for (size_t i = 0; i < n_saved && i < input_tokens.size(); ++i) {
+                                        slot.prompt.tokens.push_back(input_tokens[i]);
+                                    }
+                                    n_past = (int) n_saved;
+                                    SLT_INF(slot, "kv-chain: restored %d tokens from disk cache\n", n_past);
+                                } else {
+                                    SLT_WRN(slot, "kv-chain: failed to restore state (%zu of %zu bytes), falling back to prefill\n", n, blob.size());
                                 }
                             }
                         }
