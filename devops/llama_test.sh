@@ -2,20 +2,43 @@
 # Hash-chain KV cache restore test.
 #
 # Usage:
-#   llama_test.sh [--flush] "prompt1" "[restart]" "prompt2" ...
+#   llama_test.sh [--flush] "prompt1" "[restart]" "prompt2" ... [-- extra llama_run.sh args]
 #     --flush   start from an empty disk cache (default: keep existing)
 #     [restart] restart the server (keeping the disk cache) before the next prompt
+#     -- ...    extra args forwarded to llama_run.sh (e.g. "-ub 8")
 
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
 
-# keep the disk cache across the run; pass --flush to start from an empty cache
 FLUSH=0
 if [ "${1:-}" = "--flush" ]; then
     FLUSH=1
     shift
 fi
+
+# split off a trailing `-- extra args` for llama_run.sh
+RUN_ARGS=()
+PROMPTS=()
+SEEN_DD=0
+for arg in "$@"; do
+    if [ "${SEEN_DD}" -eq 1 ]; then
+        RUN_ARGS+=("${arg}")
+    elif [ "${arg}" = "--" ]; then
+        SEEN_DD=1
+    else
+        PROMPTS+=("${arg}")
+    fi
+done
+RUN_ARGS_STR="${RUN_ARGS[*]:-}"
+
+run_server() {
+    if [ -n "${RUN_ARGS_STR}" ]; then
+        "${DEVS}/llama_run.sh" --keep-cache -- ${RUN_ARGS[@]} | tail -3
+    else
+        "${DEVS}/llama_run.sh" --keep-cache | tail -3
+    fi
+}
 
 echo "=== [1/5] flush kv-cache ==="
 if [ "${FLUSH}" -eq 1 ]; then
@@ -32,7 +55,7 @@ echo "=== [2/5] llama_build.sh ==="
 echo ""
 
 echo "=== [3/5] llama_run.sh ==="
-"${DEVS}/llama_run.sh" --keep-cache | tail -3
+run_server
 echo ""
 
 echo "=== [4/5] llama_wait.sh ==="
@@ -40,10 +63,10 @@ echo "=== [4/5] llama_wait.sh ==="
 echo ""
 
 counter=1
-for prompt in "$@" ; do
-    if [ "${prompt}" = '[restart]' ] ; then
+for prompt in "${PROMPTS[@]}"; do
+    if [ "${prompt}" = '[restart]' ]; then
         echo "=== [restart] ==="
-        "${DEVS}/llama_run.sh" --keep-cache | tail -3
+        run_server
         "${DEVS}/llama_wait.sh"
         echo ""
     else
@@ -55,3 +78,6 @@ for prompt in "$@" ; do
         counter="$((counter + 1))"
     fi
 done
+
+echo "=== chunks on disk ==="
+ls -la "${KV_CACHE_DIR}" 2>/dev/null | grep kvchunk || echo "(none)"

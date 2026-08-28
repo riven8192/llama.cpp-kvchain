@@ -387,6 +387,12 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // [EXPERIMENTAL] called after each ubatch is processed by llama_decode
+        // n_pos = the position just completed (last pos of the ubatch)
+        // used by the kv-chain disk cache to snapshot the state per ubatch
+        void (* cb_ubatch)(void * user_data, uint32_t n_pos);
+        void *              cb_ubatch_data;
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
@@ -922,10 +928,28 @@ extern "C" {
 
     LLAMA_API size_t llama_state_seq_set_data_ext(
             struct llama_context * ctx,
-                   const uint8_t * src,
-                          size_t   size,
-                    llama_seq_id   dest_seq_id,
-           llama_state_seq_flags   flags);
+                    const uint8_t * src,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+
+    // [EXPERIMENTAL] like the _ext above, but only (de)serialize cells with pos < pos_limit.
+    // used by the kv-chain disk cache to snapshot a prompt prefix at a ubatch boundary.
+    LLAMA_API size_t llama_state_seq_get_data_prefix_ext(
+            struct llama_context * ctx,
+                          uint8_t * dst,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_limit);
+
+    LLAMA_API size_t llama_state_seq_set_data_prefix_ext(
+            struct llama_context * ctx,
+                    const uint8_t * src,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_limit);
 
     //
     // Decoding

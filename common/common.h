@@ -481,6 +481,9 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
+    void (* cb_ubatch)(void * user_data, uint32_t n_pos) = nullptr;
+    void * cb_ubatch_data                                = nullptr;
+
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;

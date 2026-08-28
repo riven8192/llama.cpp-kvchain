@@ -122,8 +122,9 @@ struct llama_memory_i {
     // state write/read
     //
 
-    virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
-    virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+    // pos_limit: only (de)serialize cells with pos < pos_limit (INT32_MAX = all)
+    virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_limit = INT32_MAX) const = 0;
+    virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_limit = INT32_MAX) = 0;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

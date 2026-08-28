@@ -157,14 +157,14 @@ bool llama_kv_cache_msa::get_can_shift() const {
            kv_base->get_size() == kv_idx->get_size();
 }
 
-void llama_kv_cache_msa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    kv_base->state_write(io, seq_id, flags);
-    kv_idx ->state_write(io, seq_id, flags);
+void llama_kv_cache_msa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) const {
+    kv_base->state_write(io, seq_id, flags, pos_limit);
+    kv_idx ->state_write(io, seq_id, flags, pos_limit);
 }
 
-void llama_kv_cache_msa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_base->state_read(io, seq_id, flags);
-    kv_idx ->state_read(io, seq_id, flags);
+void llama_kv_cache_msa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) {
+    kv_base->state_read(io, seq_id, flags, pos_limit);
+    kv_idx ->state_read(io, seq_id, flags, pos_limit);
 }
 
 llama_kv_cache * llama_kv_cache_msa::get_base() const {

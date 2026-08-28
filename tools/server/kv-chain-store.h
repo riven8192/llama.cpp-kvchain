@@ -5,8 +5,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
+
+namespace fs = std::filesystem;
 
 // disk-backed, content-addressed KV state store
 // layout: <root_dir>/<root_hash>/<chain_hash>.kvchunk
@@ -14,7 +17,7 @@
 //             u32 n_tokens, llama_token[n_tokens], then the seq state blob
 // (u32 io_magic, u32 src_seq, module data), then u64 fnv1a checksum of everything before it
 struct kv_chain_store {
-    kv_chain_store(std::string root_dir, uint64_t limit_bytes);
+    kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size);
 
     // saves the full state of seq_id covering the given prompt tokens
     // returns false on failure (store disabled, io error, ...)
@@ -32,8 +35,18 @@ private:
     static uint32_t hash_tokens(const llama_tokens & tokens, uint32_t prev);
     static std::string hash_str(uint64_t h);
 
+    bool write_chunk(const fs::path & dir, uint32_t chain_hash, const llama_tokens & chunk_tokens,
+                     const std::vector<uint8_t> & state, size_t lo, size_t hi);
+    bool write_chunk_file(const fs::path & tmp, const fs::path & file, uint32_t chain_hash,
+                          const llama_tokens & tokens, const std::vector<uint8_t> & state);
+    void evict_oldest(uint64_t need_bytes);
+
+    // reads the state blob from a chunk file; returns empty if missing/corrupt
+    static std::vector<uint8_t> read_chunk_blob(const fs::path & file, size_t n_tokens);
+
     std::string root_dir;
     uint64_t    limit_bytes;
+    int32_t     batch_size; // dump granularity (= n_batch = n_ubatch)
     uint64_t    total_bytes_cur = 0;
     bool        index_loaded    = false;
 };

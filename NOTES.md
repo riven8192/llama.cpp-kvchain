@@ -74,93 +74,109 @@ Model: Qwen3.8-27B, hybrid memory (16 full-attn layers + 48 Gated DeltaNet recur
     recurrent state can only be restored from a checkpoint; with `--parallel 1` and
     a new slot there is none, hence full prefill.
 
-## 4. Design for the disk hash-chain cache (open questions marked ?)
+## 4. Implementation status (as of this commit)
 
-File layout per project plan:
-  <cache_dir>/<root_hash>/<chain_hash>.kvchunk
+### v1 - WORKING (committed, tested)
+- tools/server/kv-chain-store.{h,cpp}: disk store, one chunk = full-prompt state.
+  - file: <dir>/<chain_hash>.kvchunk = u32 magic "KVC1", u32 version, u32
+    chain_hash, u32 n_tokens, llama_token[n_tokens], state blob, u64 fnv1a64 sum.
+    chain_hash = fnv1a64 over the prefix token ids. Atomic .tmp+rename.
+  - save() called from post_decode() at SLOT_STATE_DONE_PROMPT (state = exactly
+    the prompt cells, no decode tokens). Saving on release() is WRONG (would
+    include generated tokens -> oversized state -> position mismatch).
+  - load_prefix() walks candidate chunks, verifies checksum, returns longest
+    intact prefix state blob.
+- server-context.cpp restore (SLOT_STATE_STARTED, n_past==0, slot empty,
+  cache_prompt): set_data, push prompt tokens, n_past=n_saved. Flags:
+  - kv_chain_restored: skip truncating seq_rm (recurrent can't roll back).
+  - kv_chain_full_restore: whole prompt restored -> go straight to GENERATING
+    (avoids the empty-batch assert in the DONE_PROMPT path).
+  - skip the [TAG_PROMPT_LOGITS] n_past-- when restored.
+- common: --kv-chain-dir, --kv-chain-limit-gb.
+- TESTED PASS (devops/llama_test.sh, Qwen3.8-27B): prime, 100% match (restart,
+  zero prefill), partial (restart, +4 -> restore 15 + prefill 4), crash-restart
+  (kill -9, chunk intact, restore), corruption (flipped byte -> checksum reject
+  -> prefill fallback, no crash). All coherent output.
 
-Chunk = state blob of a token-prefix (root_hash = hash of first chunk's tokens,
-chain_hash = H(parent_chain_hash + this chunk's tokens)).
+### v2 - IN PROGRESS (not yet working; build currently BROKEN)
+Goal: per-ubatch chunks so an aborted long prefill (e.g. 50K of 80K) leaves the
+completed chunks on disk; on reprompt, restore the longest COMPLETE chunk
+boundary (if the match lands mid-chunk N, discard chunk N, resume from end of
+N-1, prefill the rest). Never need to resume mid-chunk.
 
-- What to store per chunk:
-  - `llama_state_seq_get_data_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_NONE)` blob
-    (full state: attn KV rows + recurrent R/S rows, tagged with that seq).
-  - plus the token ids of the prefix (for re-tokenization checks / hashing).
-  ? decide: store per-chunk (prefix grows) or incremental (delta rows only).
-    Full-state-per-chunk is simplest and matches the checkpoint machinery;
-    incremental would need the cell-range knowledge from state_write_meta.
-- Save hook: on slot completion (callback_on_reset in slot.release(),
-  server-context.cpp:319) or on dispatch-time prompt_save (server-context.cpp:1599).
-  Save the longest prefix we keep (the whole prompt, or up to a chunk boundary).
-- Restore hook: in task dispatch, before/alongside `prompt_load`
-  (server-context.cpp:1601): look up root_hash + chain in the disk index,
-  read the longest chain prefix that matches the incoming tokens,
-  `llama_state_seq_set_data_ext` into the slot, set n_past accordingly.
-  ? the dispatch-time path sets n_past via get_common_prefix on slot.prompt.tokens,
-    which is replaced by prompt_load's moved prompt; for disk restore we must
-    keep the token list consistent with the restored state (pos alignment).
-- Index: <cache_dir>/index.json or a per-root dir listing (chain_hash -> file size,
-  n_tokens). Atomic writes: .tmp + rename (per project plan).
-- Limits: --kv-chain-limit-gb (total), evict oldest root dirs / longest-unused chains.
-- ? whether to also serve the RAM cache from the same store (dedup) - v1: no.
+What is in the tree (uncommitted, partial):
+1. Per-ubatch hook: llama.h llama_context_params gained cb_ubatch(cb_ubatch_data)
+   + cb_ubatch_data, copied into cparams (llama-cparams.h, llama-context.cpp:142,
+   common.h/common.cpp). Fired in llama_decode's ubatch loop (llama-context.cpp
+   ~line 1969) after each ubatch commits. Server registers it (server-context.cpp
+   load_model) and arms kv_chain_prefill_slot in SLOT_STATE_STARTED, clears it at
+   the DONE_PROMPT->GENERATING transition (so nothing is saved after prefill -
+   decode-generated state is worthless for caching: tokenizer round-trip is not
+   stable and clients rarely re-send generated text).
+2. Server snapshot (kv_chain_save_prefill_ubatch): reads pos_max from
+   llama_memory_seq_pos_max (authoritative; the context-side ubatch.pos and
+   memory->seq_pos_max inside the callback were stale/0). Saves only at
+   n_ubatch-aligned positions or the prompt end. Slices prompt.tokens[0..pos].
+3. Position-truncated state API (the core fix):
+   - llama.h: llama_state_seq_get_data_prefix_ext / _set_data_prefix_ext
+     (extra llama_pos pos_limit arg).
+   - llama-context.{h,cpp}: state_seq_get_data_prefix/_set_data_prefix ->
+     state_seq_write_data/_read_data (now take pos_limit, default INT32_MAX).
+   - llama-memory.h: state_write/read virtuals gained pos_limit=INT32_MAX.
+   - llama-kv-cache.cpp state_write: added `add_cell &&= cells.pos_get(i) <
+     pos_limit`. state_read ignores it (blob already truncated).
+   - llama-memory-recurrent.cpp state_write: added `if (cell.pos >= pos_limit)
+     continue;` in the cell loop. (R/S tensors are per-position-row, so this
+     yields the true prefix recurrent state.)
+   - Composites (hybrid, hybrid-iswa, msa, iswa, dsa, dsv4) forward pos_limit.
 
-## 5. v1 implementation (DONE - working)
+WHY v2 was needed (root cause found):
+- `llama_state_seq_get_data_ext` returns a FULL-CONTEXT state blob that is
+  byte-identical at the 32- and 60-token boundaries (differ only in the header
+  token array, 112 bytes). Reason: the memory cell table is sized to n_ctx and
+  ALL batch cells get seq_id 0 assigned during init_batch/prepare (batch-wide),
+  before any ubatch computes. So a mid-prefill dump includes not-yet-computed
+  cells, and the restored state reports the stale pos_max (e.g. 59 for a
+  32-token chunk) -> the leftover-prefill batch at pos 32 fails the
+  "Y = X+1" consistency check (llama-batch.cpp:300) -> "Invalid input batch".
+- The fix is to filter cells by pos < pos_limit in state_write (done above), so
+  a 32-token chunk truly holds 32 rows and restores to pos_max=31.
 
-Files:
-- tools/server/kv-chain-store.{h,cpp} - the store.
-  - layout: <dir>/<chain_hash>.kvchunk (v1: no root dir, single-level).
-  - file: u32 magic(0x4b564331 "KVC1"), u32 version(1), u32 chain_hash,
-    u32 n_tokens, llama_token[n_tokens], state blob, u64 fnv1a64 checksum.
-  - chain_hash = fnv1a64 over the token ids (chained, prev=0).
-  - atomic write: .tmp + fs::rename.
-  - save() at post_decode() SLOT_STATE_DONE_PROMPT (server-context.cpp:3826):
-    the state contains EXACTLY the prompt cells (no decode tokens yet), so the
-    token list and the state blob are consistent. Saving on release() was WRONG
-    (it included generated tokens -> oversized state -> position mismatch).
-  - load_prefix() matches an exact-length chunk by hash, verifies checksum,
-    returns the state blob.
-- server-context.cpp:
-  - restore in SLOT_STATE_STARTED when n_past==0 && slot empty && cache_prompt:
-    set_data_ext, push prompt tokens, n_past = n_saved, set flags.
-  - kv_chain_restored: skip the truncating seq_rm (recurrent state can't roll back).
-  - kv_chain_full_restore: when the restore covers the whole prompt, go straight
-    to SLOT_STATE_GENERATING (the DONE_PROMPT path asserts batch.size()>0, which
-    fails when no prompt token was added this iter).
-  - skip the [TAG_PROMPT_LOGITS] n_past-- when restored (the last cached token
-    must not be re-processed).
-- common: --kv-chain-dir, --kv-chain-limit-gb (common.h/arg.cpp).
+### BLOCKER (why build is red) - FIX NEXT
+- src/llama-kv-cache-dsv4.cpp:1606-1608: llama_kv_cache_dsv4::state_read forwards
+  pos_limit to llama_dsv4_comp_state::state_read, which does NOT take pos_limit
+  (it's a non-override helper, llama-kv-cache-dsv4.cpp:1066). Either add the
+  param to llama_dsv4_comp_state::state_read (and its callers) or stop forwarding
+  it in the dsv4 composite. dsv4 is not the model we test, so the minimal fix is
+  to NOT forward pos_limit in llama_kv_cache_dsv4::state_read/write (drop the
+  `, pos_limit` arg on the llama_dsv4_comp_state calls there).
+- After that: rebuild, then re-run the multi-chunk test (devops/llama_test.sh
+  --flush <60tok> [restart] <67tok> -- -ub 32 -b 32) and verify: (a) 2 chunks
+  saved at distinct sizes (NOT byte-identical - proves truncation works),
+  (b) 100% match restores 60, (c) partial (67) restores 32 then prefills 35
+  WITHOUT "Invalid input batch".
+- If the truncated recurrent state still misbehaves on resume, the recurrent
+  rs_idx/rollback machinery may need attention - investigate llama-memory-recurrent
+  state_read_meta / find_slot with a truncated cell set.
 
-KEY CONSTRAINT (hybrid / Gated DeltaNet recurrent state):
-- The recurrent state S_n is non-invertible. A chunk stores (attn rows 0..n-1,
-  S_n). You can only RESUME FROM position n - never roll back to m<n.
-- So a chunk must be a self-consistent (rows, S_n) pair, and restore always
-  resumes at n. Partial match (restore n, prefill n..m) works. 100% match
-  (restore n, decode from n) works via the full_restore path.
-- You must NEVER "strip the last token" from a restored chunk to make room -
-  S_n is not S_{n-1}.
+## 5. Dev tooling (devops/)
+- env.sh (model, port 50081, paths), llama_build.sh (cmake+ninja, Vulkan,
+  logs to devops/.llama-build.log, exits 1 on failure), llama_run.sh
+  (--keep-cache/--no-kv-chain/-- <extra args>), llama_kill.sh, llama_wait.sh,
+  llama_prompt.sh (sends /v1/completions with cache_prompt:true), llama_test.sh
+  (--flush, [restart] markers, trailing `-- <extra run args>`; NOTE: the `--`
+  tail must come LAST, after all prompts).
+- IMPORTANT: `llama_build.sh | tail -1` masks the exit code - check EXIT=$? or
+  the "build OK" line, never assume success from the last ninja line.
 
-Test results (devops/llama_test.sh, Qwen3.8-27B, ctx 4096):
-- prime:            cached_tokens 0,  prompt 15  (full prefill, chunk saved)
-- 100% match (restart): cached_tokens 15, prompt 15  (zero prefill, coherent)
-- partial (restart, +4): cached_tokens 15, prompt 19  (restore 15 + prefill 4)
-All coherent English output, no aborts.
-
-## 6. Test plan (from docs/project-plan.md)
-
-1. Build (done: devops/llama_build.sh, build 10520).
-2. Smoke: serve Qwen3.8-27B UD-Q8_K_XL, /v1/completions with cache_prompt,
-   check n_prompt_tokens_cache in metrics for repeated prefixes. (DONE)
-3. Disk: enable --kv-chain-dir, kill -9 server mid-session, restart, send same
-   prefix, verify cached tokens > 0 and output matches pre-kill run.
-4. Corruption: flip bytes in a .kvchunk, verify magic/size check rejects it
-   and falls back to prefill (no crash).
-
-## 7. v2 (future)
-
-- ubatch-sized chunks forming a true hash CHAIN: chunk_k = H(chunk_{k-1} + tokens
-  of this ubatch). A prefix = root chunk + full chunks; the trailing partial
-  (leaf) chunk is ignored. This is what makes arbitrary-length prefix restore
-  possible instead of exact-length match.
-- incremental deltas (store only new attn rows + the recurrent state) to cut the
-  ~150 MiB / 15 tokens blow-up of full-state-per-chunk.
-- LRU eviction per chunk (v1 evicts all when over limit).
+## 6. Key constraints / gotchas
+- Gated DeltaNet recurrent state S_n is NON-INVERTIBLE: a chunk is a
+  self-consistent (attn rows 0..n-1, S_n) pair; you can only resume FROM n,
+  never roll back to m<n. Never "strip the last token" from a chunk.
+- -ub (n_ubatch) has a lower bound of 32 (-ub 8 is silently ignored, falls back
+  to the default 2048). Use -ub 32 for multi-chunk tests.
+- The server processes a whole prompt in one llama_decode call (internal
+  ubatch split is invisible to the server loop); that is why the per-ubatch
+  hook had to go INSIDE llama_decode, not in the server post_decode.
+- n_batch/n_ubatch: server.cpp forces n_batch=n_ubatch only for embeddings;
+  otherwise -ub/-b take effect (verified 256/512/1024).

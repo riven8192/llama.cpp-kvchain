@@ -1532,7 +1532,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
-void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
@@ -1543,7 +1543,7 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    kv_raw->state_write(io, seq_id, flags);
+    kv_raw->state_write(io, seq_id, flags, pos_limit);
 
     if (!partial_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
@@ -1566,7 +1566,7 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     lid_state->state_write(io, seq_id, flags, rs_idx);
 }
 
-void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) {
     uint32_t magic;
     uint32_t version;
     uint32_t mode = DSV4_STATE_MODE_FULL;
@@ -1591,7 +1591,7 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    kv_raw->state_read(io, seq_id, flags, pos_limit);
 
     if (!partial_only) {
         kv_csa->clear(true);
@@ -1603,9 +1603,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
     }
 
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
+    csa_state->state_read(io, seq_id, flags, pos_limit);
+    hca_state->state_read(io, seq_id, flags, pos_limit);
+    lid_state->state_read(io, seq_id, flags, pos_limit);
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);

@@ -187,18 +187,18 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
-void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_write(io, seq_id, flags);
+        mem_attn->state_write(io, seq_id, flags, pos_limit);
     }
-    mem_recr->state_write(io, seq_id, flags);
+    mem_recr->state_write(io, seq_id, flags, pos_limit);
 }
 
-void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_read(io, seq_id, flags);
+        mem_attn->state_read(io, seq_id, flags, pos_limit);
     }
-    mem_recr->state_read(io, seq_id, flags);
+    mem_recr->state_read(io, seq_id, flags, pos_limit);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

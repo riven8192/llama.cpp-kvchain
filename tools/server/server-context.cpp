@@ -65,6 +65,18 @@ enum slot_state {
 };
 
 struct server_slot; // forward declaration
+struct server_context_impl;
+
+// per-ubatch hook state: the context snapshots the prefilling slot's state
+// after each ubatch is committed, so each saved chunk holds a self-consistent
+// (rows, recurrent) prefix that can be restored and resumed from
+struct kv_chain_ubatch_state {
+    server_context_impl * ctx = nullptr;
+    server_slot *         slot = nullptr;
+};
+
+// defined after server_context_impl (needs the full type)
+static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos);
 
 struct server_batch {
     llama_batch batch;
@@ -286,16 +298,6 @@ struct server_slot {
         }
 
         return true;
-    }
-
-    bool kv_chain_save(kv_chain_store & store) const {
-        // called from post_decode() at SLOT_STATE_DONE_PROMPT, where the state
-        // contains exactly the prompt cells (no decode tokens yet), so the
-        // token list and the state blob are consistent
-        if (prompt.tokens.size() == 0 || ctx_tgt == nullptr) {
-            return false;
-        }
-        return store.save(ctx_tgt, id, prompt.tokens.get_tokens());
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -810,6 +812,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 
 struct server_context_impl {
     friend struct server_context;
+    friend void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos);
 
 public:
     // only use these pointers outside of this class:
@@ -888,6 +891,51 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
     std::unique_ptr<kv_chain_store> kv_chain;
+
+    // the slot whose prompt is currently being prefilled; the per-ubatch
+    // callback snapshots its state. with --parallel 1 there is at most one.
+    server_slot * kv_chain_prefill_slot = nullptr;
+    uint32_t      kv_chain_last_saved_pos = 0;
+    kv_chain_ubatch_state kv_chain_cb_state;
+
+    // snapshot the prefilling slot's state after a ubatch is committed. the
+    // callback fires after every internal ubatch, but we only persist at
+    // n_ubatch-aligned boundaries (and the final position), so chunk k holds the
+    // state of the prefix [0, k*n_ubatch]. the position is read from the memory
+    // module (authoritative); the token list is sliced to match.
+    void kv_chain_save_prefill_ubatch(server_slot & slot) {
+        if (!kv_chain || kv_chain_prefill_slot != &slot) {
+            return;
+        }
+        const int pos_max = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max < 0) {
+            return;
+        }
+        // avoid re-saving the same boundary (the callback can fire more than once)
+        if ((uint32_t) pos_max <= kv_chain_last_saved_pos) {
+            return;
+        }
+        const int n_ubatch = llama_n_ubatch(ctx_tgt);
+        const size_t n_prompt = slot.task->n_tokens();
+        const size_t pos = (size_t) pos_max + 1;
+        // only save at a ubatch boundary or at the end of the prompt
+        const bool at_boundary = (pos % (size_t) n_ubatch) == 0;
+        const bool at_end      = (pos >= n_prompt);
+        if (!at_boundary && !at_end) {
+            return;
+        }
+        kv_chain_last_saved_pos = (uint32_t) pos_max;
+        const size_t n = slot.prompt.n_tokens();
+        if (pos > n) {
+            return;
+        }
+        llama_tokens prefix;
+        prefix.reserve(pos);
+        for (size_t i = 0; i < pos; ++i) {
+            prefix.push_back(slot.prompt.tokens[i]);
+        }
+        kv_chain->save(slot.ctx_tgt, slot.id, prefix);
+    }
 
     server_metrics metrics;
 
@@ -1125,6 +1173,14 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // attach the per-ubatch kv-chain callback (snapshots state mid-prefill)
+        if (!params_base.kv_chain_dir.empty()) {
+            kv_chain_cb_state.ctx = this;
+            kv_chain_cb_state.slot = nullptr;
+            params_base.cb_ubatch      = kv_chain_cb_ubatch;
+            params_base.cb_ubatch_data = &kv_chain_cb_state;
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1354,7 +1410,7 @@ private:
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
                 : 0;
-            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes);
+            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes, llama_n_batch(ctx_tgt));
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -3105,6 +3161,13 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // arm the per-ubatch kv-chain snapshot for this slot
+                        if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                            kv_chain_prefill_slot    = &slot;
+                            kv_chain_last_saved_pos  = 0;
+                            kv_chain_cb_state.slot   = &slot;
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3360,17 +3423,13 @@ private:
                             }
                         }
 
-                        if (kv_chain) {
-                            SLT_INF(slot, "kv-chain: gate check n_past=%d prompt_n=%d cache_prompt=%d mtmd=%d\n",
-                                    n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt, (int) input_tokens.has_mtmd);
-                        }
                         if (kv_chain && n_past == 0 && slot.prompt.n_tokens() == 0 && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
                             // restore a saved prefix from the disk hash-chain cache
                             size_t n_saved = 0;
-                            SLT_INF(slot, "kv-chain: trying restore, input_tokens=%zu\n", input_tokens.size());
                             const std::vector<uint8_t> blob = kv_chain->load_prefix(input_tokens.get_tokens(), &n_saved);
                             if (!blob.empty() && n_saved > 0) {
-                                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, blob.data(), blob.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                const size_t n = llama_state_seq_set_data_prefix_ext(ctx_tgt, blob.data(), blob.size(), slot.id,
+                                        LLAMA_STATE_SEQ_FLAGS_NONE, (llama_pos) n_saved);
                                 if (n == blob.size()) {
                                     for (size_t i = 0; i < n_saved && i < input_tokens.size(); ++i) {
                                         slot.prompt.tokens.push_back(input_tokens[i]);
@@ -3822,12 +3881,6 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
-                // the prompt cells are committed and no decode token has been added
-                // yet, so the state contains exactly the prompt prefix - persist it
-                if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
-                    slot.kv_chain_save(*kv_chain);
-                }
-
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
@@ -3847,6 +3900,12 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // the prompt is fully committed; stop per-ubatch snapshots
+                if (kv_chain_prefill_slot == &slot) {
+                    kv_chain_prefill_slot = nullptr;
+                    kv_chain_cb_state.slot = nullptr;
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -4149,6 +4208,14 @@ private:
         }
     }
 };
+
+static void kv_chain_cb_ubatch(void * user_data, uint32_t /*n_pos*/) {
+    auto * s = static_cast<kv_chain_ubatch_state *>(user_data);
+    if (s == nullptr || s->ctx == nullptr || s->slot == nullptr) {
+        return;
+    }
+    s->ctx->kv_chain_save_prefill_ubatch(*s->slot);
+}
 
 //
 // server_context (public API)
