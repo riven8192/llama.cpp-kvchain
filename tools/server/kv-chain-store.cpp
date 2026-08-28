@@ -18,28 +18,23 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes) :
         return;
     }
     std::error_code ec;
-    fs::create_directories(root_dir, ec);
+    fs::create_directories(this->root_dir, ec);
     if (ec) {
-        SRV_ERR("kv-chain: failed to create cache dir '%s': %s\n", root_dir.c_str(), ec.message().c_str());
-        root_dir.clear();
+        SRV_ERR("kv-chain: failed to create cache dir '%s': %s (ec=%d)\n",
+                this->root_dir.c_str(), ec.message().c_str(), ec.value());
+        this->root_dir.clear();
         return;
     }
     // index existing chunks
-    for (const auto & root_entry : fs::directory_iterator(root_dir)) {
-        if (!root_entry.is_directory()) {
-            continue;
-        }
-        for (const auto & chunk_entry : fs::directory_iterator(root_entry.path())) {
-            if (!chunk_entry.is_regular_file()) {
-                continue;
-            }
+    for (const auto & chunk_entry : fs::recursive_directory_iterator(this->root_dir, fs::directory_options::skip_permission_denied)) {
+        if (chunk_entry.is_regular_file()) {
             const auto size = static_cast<uint64_t>(chunk_entry.file_size());
             total_bytes_cur += size;
         }
     }
     index_loaded = true;
     SRV_INF("kv-chain: cache dir '%s', %zu bytes on disk, %.3f GiB (limit %.3f GiB)\n",
-            root_dir.c_str(), (size_t) total_bytes_cur,
+            this->root_dir.c_str(), (size_t) total_bytes_cur,
             (double) total_bytes_cur / (1024.0*1024.0*1024.0),
             (double) limit_bytes / (1024.0*1024.0*1024.0));
 }
@@ -97,38 +92,16 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_
 
     // evict oldest roots until we fit under the limit
     const uint64_t entry_bytes = state_size + 64 + sizeof(llama_token) * tokens.size();
-    if (limit_bytes > 0) {
-        struct root_info {
-            fs::path path;
-            uint64_t bytes;
-            fs::file_time_type mtime;
-        };
-        std::vector<root_info> roots;
-        for (const auto & e : fs::directory_iterator(root_dir)) {
-            if (!e.is_directory()) {
-                continue;
-            }
-            uint64_t b = 0;
-            for (const auto & c : fs::directory_iterator(e.path())) {
-                if (c.is_regular_file()) {
-                    b += static_cast<uint64_t>(c.file_size());
-                }
-            }
-            roots.push_back({ e.path(), b, e.last_write_time() });
-        }
-        std::sort(roots.begin(), roots.end(), [](const root_info & a, const root_info & b) {
-            return a.mtime < b.mtime;
-        });
-        for (const auto & r : roots) {
-            if (total_bytes_cur + entry_bytes <= limit_bytes) {
-                break;
-            }
-            std::error_code ec;
-            fs::remove_all(r.path, ec);
-            if (!ec) {
-                total_bytes_cur -= r.bytes;
+    if (limit_bytes > 0 && total_bytes_cur + entry_bytes > limit_bytes) {
+        // v1: evict all existing chunks when over the limit
+        // (v2: LRU eviction per chunk)
+        std::error_code ec;
+        for (const auto & e : fs::directory_iterator(this->root_dir)) {
+            if (e.is_regular_file()) {
+                fs::remove(e.path(), ec);
             }
         }
+        total_bytes_cur = 0;
     }
 
     std::vector<uint8_t> state(state_size);
@@ -222,42 +195,51 @@ std::vector<uint8_t> kv_chain_store::load_prefix(const llama_tokens & tokens, si
             continue;
         }
         std::ifstream f(e.path(), std::ios::binary);
-        uint32_t hdr[5];
+        // header: magic, version, chain_hash, n_tokens
+        uint32_t hdr[4];
         if (!f.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) {
             continue;
         }
         if (hdr[0] != KV_CHAIN_MAGIC || hdr[1] != KV_CHAIN_VERSION) {
             continue;
         }
-        cands.push_back({ e.path(), hdr[4] });
+        cands.push_back({ e.path(), hdr[3] });
     }
     std::sort(cands.begin(), cands.end(), [](const candidate & a, const candidate & b) {
         return a.n_tok > b.n_tok;
     });
 
+    SRV_INF("kv-chain: load_prefix: %zu candidates, incoming tokens=%zu\n", cands.size(), tokens.size());
     for (const auto & c : cands) {
         if (c.n_tok > tokens.size()) {
+            SRV_INF("kv-chain:   skip %s (n_tok=%u > incoming %zu)\n", c.file.stem().c_str(), c.n_tok, tokens.size());
             continue;
         }
         // verify the chain hash matches the incoming tokens
         llama_tokens prefix(tokens.begin(), tokens.begin() + c.n_tok);
         const uint32_t chain_hash = hash_tokens(prefix, 0);
-        if (hash_str(chain_hash) != c.file.stem().string()) {
+        const std::string want = hash_str(chain_hash);
+        if (want != c.file.stem().string()) {
+            SRV_INF("kv-chain:   hash mismatch: want %s have %s (n_tok=%u)\n", want.c_str(), c.file.stem().c_str(), c.n_tok);
             continue;
         }
         // verify checksum
         std::ifstream f(c.file, std::ios::binary);
         if (!f) {
+            SRV_WRN("kv-chain:   cannot open %s\n", c.file.string().c_str());
             continue;
         }
         f.seekg(0, std::ios::end);
         const uint64_t file_size = static_cast<uint64_t>(f.tellg());
         if (file_size < sizeof(uint32_t) * 4 + sizeof(uint64_t)) {
+            SRV_WRN("kv-chain:   %s too small (%zu bytes)\n", c.file.string().c_str(), file_size);
             continue;
         }
+        f.seekg(0, std::ios::beg);
         std::vector<uint8_t> buf(file_size);
         f.read(reinterpret_cast<char *>(buf.data()), file_size);
         if (!f) {
+            SRV_WRN("kv-chain:   read failed for %s (%zu of %zu bytes)\n", c.file.string().c_str(), f.gcount(), file_size);
             continue;
         }
         f.close();

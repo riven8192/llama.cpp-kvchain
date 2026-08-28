@@ -104,12 +104,63 @@ chain_hash = H(parent_chain_hash + this chunk's tokens)).
 - Limits: --kv-chain-limit-gb (total), evict oldest root dirs / longest-unused chains.
 - ? whether to also serve the RAM cache from the same store (dedup) - v1: no.
 
-## 5. Test plan (from docs/project-plan.md)
+## 5. v1 implementation (DONE - working)
 
-1. Build (done: build-vulkan/bin/llama-server, build 10520).
+Files:
+- tools/server/kv-chain-store.{h,cpp} - the store.
+  - layout: <dir>/<chain_hash>.kvchunk (v1: no root dir, single-level).
+  - file: u32 magic(0x4b564331 "KVC1"), u32 version(1), u32 chain_hash,
+    u32 n_tokens, llama_token[n_tokens], state blob, u64 fnv1a64 checksum.
+  - chain_hash = fnv1a64 over the token ids (chained, prev=0).
+  - atomic write: .tmp + fs::rename.
+  - save() at post_decode() SLOT_STATE_DONE_PROMPT (server-context.cpp:3826):
+    the state contains EXACTLY the prompt cells (no decode tokens yet), so the
+    token list and the state blob are consistent. Saving on release() was WRONG
+    (it included generated tokens -> oversized state -> position mismatch).
+  - load_prefix() matches an exact-length chunk by hash, verifies checksum,
+    returns the state blob.
+- server-context.cpp:
+  - restore in SLOT_STATE_STARTED when n_past==0 && slot empty && cache_prompt:
+    set_data_ext, push prompt tokens, n_past = n_saved, set flags.
+  - kv_chain_restored: skip the truncating seq_rm (recurrent state can't roll back).
+  - kv_chain_full_restore: when the restore covers the whole prompt, go straight
+    to SLOT_STATE_GENERATING (the DONE_PROMPT path asserts batch.size()>0, which
+    fails when no prompt token was added this iter).
+  - skip the [TAG_PROMPT_LOGITS] n_past-- when restored (the last cached token
+    must not be re-processed).
+- common: --kv-chain-dir, --kv-chain-limit-gb (common.h/arg.cpp).
+
+KEY CONSTRAINT (hybrid / Gated DeltaNet recurrent state):
+- The recurrent state S_n is non-invertible. A chunk stores (attn rows 0..n-1,
+  S_n). You can only RESUME FROM position n - never roll back to m<n.
+- So a chunk must be a self-consistent (rows, S_n) pair, and restore always
+  resumes at n. Partial match (restore n, prefill n..m) works. 100% match
+  (restore n, decode from n) works via the full_restore path.
+- You must NEVER "strip the last token" from a restored chunk to make room -
+  S_n is not S_{n-1}.
+
+Test results (devops/llama_test.sh, Qwen3.8-27B, ctx 4096):
+- prime:            cached_tokens 0,  prompt 15  (full prefill, chunk saved)
+- 100% match (restart): cached_tokens 15, prompt 15  (zero prefill, coherent)
+- partial (restart, +4): cached_tokens 15, prompt 19  (restore 15 + prefill 4)
+All coherent English output, no aborts.
+
+## 6. Test plan (from docs/project-plan.md)
+
+1. Build (done: devops/llama_build.sh, build 10520).
 2. Smoke: serve Qwen3.8-27B UD-Q8_K_XL, /v1/completions with cache_prompt,
-   check n_prompt_tokens_cache in metrics for repeated prefixes.
+   check n_prompt_tokens_cache in metrics for repeated prefixes. (DONE)
 3. Disk: enable --kv-chain-dir, kill -9 server mid-session, restart, send same
    prefix, verify cached tokens > 0 and output matches pre-kill run.
 4. Corruption: flip bytes in a .kvchunk, verify magic/size check rejects it
    and falls back to prefill (no crash).
+
+## 7. v2 (future)
+
+- ubatch-sized chunks forming a true hash CHAIN: chunk_k = H(chunk_{k-1} + tokens
+  of this ubatch). A prefix = root chunk + full chunks; the trailing partial
+  (leaf) chunk is ignored. This is what makes arbitrary-length prefix restore
+  possible instead of exact-length match.
+- incremental deltas (store only new attn rows + the recurrent state) to cut the
+  ~150 MiB / 15 tokens blow-up of full-state-per-chunk.
+- LRU eviction per chunk (v1 evicts all when over limit).

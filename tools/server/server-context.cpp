@@ -251,6 +251,15 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // set when the prompt state was restored from the disk hash-chain cache;
+    // the truncating seq_rm() must be skipped in that case, because the
+    // restored recurrent state cannot be rolled back to an arbitrary position
+    bool kv_chain_restored = false;
+
+    // set when a disk restore covered the entire prompt (nothing left to
+    // prefill); the slot starts decoding instead of going through DONE_PROMPT
+    bool kv_chain_full_restore = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -280,6 +289,9 @@ struct server_slot {
     }
 
     bool kv_chain_save(kv_chain_store & store) const {
+        // called from post_decode() at SLOT_STATE_DONE_PROMPT, where the state
+        // contains exactly the prompt cells (no decode tokens yet), so the
+        // token list and the state blob are consistent
         if (prompt.tokens.size() == 0 || ctx_tgt == nullptr) {
             return false;
         }
@@ -334,6 +346,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        kv_chain_restored = false;
+        kv_chain_full_restore = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -1334,6 +1348,8 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        SRV_INF("kv-chain: params kv_chain_dir='%s', kv_chain_limit_gb=%d\n",
+                params_base.kv_chain_dir.c_str(), params_base.kv_chain_limit_gb);
         if (!params_base.kv_chain_dir.empty()) {
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
@@ -1613,10 +1629,6 @@ private:
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
-
-                if (kv_chain) {
-                    ret->kv_chain_save(*kv_chain);
-                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2390,10 +2402,6 @@ private:
                                 if (slot.prompt_save(*prompt_cache)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
-                                }
-
-                                if (kv_chain) {
-                                    slot.kv_chain_save(*kv_chain);
                                 }
 
                                 if (params_base.kv_unified) {
@@ -3352,9 +3360,14 @@ private:
                             }
                         }
 
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && kv_chain && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
+                        if (kv_chain) {
+                            SLT_INF(slot, "kv-chain: gate check n_past=%d prompt_n=%d cache_prompt=%d mtmd=%d\n",
+                                    n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt, (int) input_tokens.has_mtmd);
+                        }
+                        if (kv_chain && n_past == 0 && slot.prompt.n_tokens() == 0 && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
                             // restore a saved prefix from the disk hash-chain cache
                             size_t n_saved = 0;
+                            SLT_INF(slot, "kv-chain: trying restore, input_tokens=%zu\n", input_tokens.size());
                             const std::vector<uint8_t> blob = kv_chain->load_prefix(input_tokens.get_tokens(), &n_saved);
                             if (!blob.empty() && n_saved > 0) {
                                 const size_t n = llama_state_seq_set_data_ext(ctx_tgt, blob.data(), blob.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -3363,6 +3376,8 @@ private:
                                         slot.prompt.tokens.push_back(input_tokens[i]);
                                     }
                                     n_past = (int) n_saved;
+                                    slot.kv_chain_restored = true;
+                                    slot.kv_chain_full_restore = (n_saved >= (size_t) slot.task->n_tokens());
                                     SLT_INF(slot, "kv-chain: restored %d tokens from disk cache\n", n_past);
                                 } else {
                                     SLT_WRN(slot, "kv-chain: failed to restore state (%zu of %zu bytes), falling back to prefill\n", n, blob.size());
@@ -3371,7 +3386,9 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                        // a restored prefix already has its last token in the cache, so it
+                        // must not be re-processed; skip the decrement in that case
+                        if (!slot.kv_chain_restored && n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
@@ -3412,7 +3429,14 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (slot.kv_chain_restored) {
+                        // the restored state already contains exactly the cached
+                        // prefix; the recurrent state cannot be rolled back to an
+                        // arbitrary position, so skip the truncating seq_rm
+                        slot.kv_chain_restored = false;
+                    } else {
+                        slot.mem.seq_rm(slot.id, p0, -1);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3561,17 +3585,28 @@ private:
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        slot.state = SLOT_STATE_DONE_PROMPT;
+                        // a full disk restore leaves no prompt token in the batch; the
+                        // recurrent state is already at the end of the prompt, so start
+                        // decoding from here (the first decode token is added next iter)
+                        if (slot.kv_chain_full_restore) {
+                            slot.state = SLOT_STATE_GENERATING;
+                            slot.stats.n_gen = 0;
+                            slot.kv_chain_full_restore = false;
+                            slot.kv_chain_restored = false;
+                            SLT_INF(slot, "%s", "kv-chain: full prompt restored, starting decode\n");
+                        } else {
+                            slot.state = SLOT_STATE_DONE_PROMPT;
 
-                        GGML_ASSERT(batch.size() > 0);
+                            GGML_ASSERT(batch.size() > 0);
 
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                            // extract the logits only for the last token
+                            batch.set_output(batch.size() - 1, true);
 
-                        slot.stats.n_gen = 0;
-                        slot.i_batch     = batch.size() - 1;
+                            slot.stats.n_gen = 0;
+                            slot.i_batch     = batch.size() - 1;
 
-                        slot.init_sampler();
+                            slot.init_sampler();
+                        }
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
@@ -3787,6 +3822,12 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                // the prompt cells are committed and no decode token has been added
+                // yet, so the state contains exactly the prompt prefix - persist it
+                if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                    slot.kv_chain_save(*kv_chain);
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);

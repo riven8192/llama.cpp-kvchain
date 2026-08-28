@@ -1,0 +1,6 @@
+# runtime artifacts
+.llama-server.log
+.llama-server.pid
+.llama-build.log
+.kv-cache/
+prompt-*.log
