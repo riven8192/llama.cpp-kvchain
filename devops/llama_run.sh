@@ -75,6 +75,23 @@ echo "  cache : ${CACHE_DESC}"
 echo "  log   : ${LLAMA_LOG}"
 
 # fully detach so the launcher shell does not wait on the server
-setsid "${LLAMA_SERVER_BIN}" "${ARGS[@]}" > "${LLAMA_LOG}" 2>&1 < /dev/null &
-echo $! > "${LLAMA_PIDFILE}"
-echo "pid: $(cat "${LLAMA_PIDFILE}")"
+
+log_ts="$(date +%Y%m%d-%H%M%S)"
+: >"${LLAMA_PIDFILE}"
+
+setsid bash -c '
+  pidfile=$1; log=$2; tslog=$3; shift 3
+  { echo $BASHPID >"$pidfile"; exec "$@"; } </dev/null 2>&1 | tee "$log" >"$tslog"
+' _ "$LLAMA_PIDFILE" "$LLAMA_LOG" "$LLAMA_LOG.$log_ts.log" \
+  "$LLAMA_SERVER_BIN" "${ARGS[@]}" &
+
+for _ in {1..100}; do
+    [[ -s ${LLAMA_PIDFILE} ]] && break
+    sleep 0.05
+done
+pid="$(cat "${LLAMA_PIDFILE}")"
+if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "server failed to start; see ${LLAMA_LOG}" >&2
+    exit 1
+fi
+echo "pid: $pid"

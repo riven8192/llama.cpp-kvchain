@@ -10,7 +10,7 @@
 namespace fs = std::filesystem;
 
 static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
-static constexpr uint32_t KV_CHAIN_VERSION = 1;
+static constexpr uint32_t KV_CHAIN_VERSION = 2; // v2: per-chunk window (attn + recr), no full-prefix duplication
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size) :
     root_dir(std::move(root_dir)), limit_bytes(limit_bytes), batch_size_(batch_size > 0 ? batch_size : 512) {
@@ -72,26 +72,37 @@ std::string kv_chain_store::hash_str(uint64_t h) {
     return s;
 }
 
-// save one chunk. prefix_tokens = the full prompt prefix [0, pos) whose state
-// is dumped (self-consistent: rows + recurrent both as-of pos). chunk_tokens
-// are this chunk's own tokens, stored verbatim in the header for validation.
-bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_tokens & prefix_tokens,
+// dumps one seq-state blob for the window [pos_lo, pos_hi) with the given
+// part-selection flags (FULL_ONLY = attn rows, PARTIAL_ONLY = recurrent rows).
+// returns an empty vector on failure.
+static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id,
+                                        llama_pos pos_lo, llama_pos pos_hi, llama_state_seq_flags flags) {
+    const size_t size = llama_state_seq_get_size_window_ext(ctx, seq_id, flags, pos_lo, pos_hi);
+    if (size == 0) {
+        return {};
+    }
+    std::vector<uint8_t> blob(size);
+    const size_t got = llama_state_seq_get_data_window_ext(ctx, blob.data(), size, seq_id, flags, pos_lo, pos_hi);
+    if (got == 0 || got != size) {
+        SRV_WRN("kv-chain: failed to get window state (%zu of %zu bytes)\n", got, size);
+        return {};
+    }
+    return blob;
+}
+
+// save one chunk covering the window [pos_lo, pos_hi). dumps the attn rows and
+// the recurrent rows for exactly that window (no full-prefix duplication), and
+// stores both in the chunk file. chunk_tokens are the window's tokens.
+bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
                           uint32_t chunk_hash, const llama_tokens & chunk_tokens) {
-    if (!enabled() || ctx == nullptr || prefix_tokens.empty()) {
+    if (!enabled() || ctx == nullptr || chunk_tokens.empty() || pos_hi <= pos_lo) {
         return false;
     }
 
-    const size_t pos = prefix_tokens.size();
-    const size_t state_size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-    if (state_size == 0) {
-        return false;
-    }
-
-    std::vector<uint8_t> state(state_size);
-    const size_t got = llama_state_seq_get_data_prefix_ext(ctx, state.data(), state_size, seq_id,
-            LLAMA_STATE_SEQ_FLAGS_NONE, (llama_pos) pos);
-    if (got == 0 || got != state_size) {
-        SRV_WRN("kv-chain: failed to get state data (%zu of %zu bytes)\n", got, state_size);
+    std::vector<uint8_t> attn = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_FULL_ONLY);
+    std::vector<uint8_t> recr = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (attn.empty() || recr.empty()) {
+        SRV_WRN("kv-chain: failed to dump chunk window [%d, %d)\n", (int) pos_lo, (int) pos_hi);
         return false;
     }
 
@@ -103,32 +114,38 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_
         return false;
     }
 
-    return write_chunk(dir, chunk_hash, chunk_tokens, state, pos);
+    return write_chunk(dir, chunk_hash, chunk_tokens, attn, recr);
 }
 
 // writes the chunk file if not present; returns true if written
 bool kv_chain_store::write_chunk(const fs::path & dir, uint32_t chunk_hash, const llama_tokens & chunk_tokens,
-                                  const std::vector<uint8_t> & state, size_t pos) {
+                                  const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr) {
     const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
     if (fs::exists(file)) {
         return false;
     }
-    const uint64_t entry_bytes = state.size() + 32 + sizeof(llama_token) * chunk_tokens.size() + 8;
+    const uint64_t entry_bytes = attn.size() + recr.size()
+                               + 2 * sizeof(uint32_t)              // attn_size, recr_size
+                               + 4 * sizeof(uint32_t)              // magic, version, chunk_hash, n_tokens
+                               + sizeof(llama_token) * chunk_tokens.size()
+                               + sizeof(uint64_t);                 // checksum
     if (limit_bytes > 0 && total_bytes_cur + entry_bytes > limit_bytes) {
         evict_oldest(entry_bytes);
     }
     const fs::path tmp = dir / (hash_str(chunk_hash) + ".kvchunk.tmp");
-    if (!write_chunk_file(tmp, file, chunk_hash, chunk_tokens, state)) {
+    if (!write_chunk_file(tmp, file, chunk_hash, chunk_tokens, attn, recr)) {
         return false;
     }
     total_bytes_cur += entry_bytes;
-    SRV_INF("kv-chain: saved chunk (prefix %zu tokens, %zu chunk tokens) hash=%s (%.3f MiB)\n",
-            pos, chunk_tokens.size(), hash_str(chunk_hash).c_str(), (double) state.size() / (1024.0*1024.0));
+    SRV_INF("kv-chain: saved chunk (window %zu tokens) hash=%s (attn %.3f MiB, recr %.3f MiB)\n",
+            chunk_tokens.size(), hash_str(chunk_hash).c_str(),
+            (double) attn.size() / (1024.0*1024.0), (double) recr.size() / (1024.0*1024.0));
     return true;
 }
 
-bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & file, uint32_t chain_hash,
-                                      const llama_tokens & tokens, const std::vector<uint8_t> & state) {
+bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & file, uint32_t chunk_hash,
+                                      const llama_tokens & tokens, const std::vector<uint8_t> & attn,
+                                      const std::vector<uint8_t> & recr) {
     std::error_code ec;
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -136,15 +153,20 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
             SRV_ERR("kv-chain: failed to open '%s' for writing\n", tmp.string().c_str());
             return false;
         }
-        const uint32_t magic   = KV_CHAIN_MAGIC;
-        const uint32_t version = KV_CHAIN_VERSION;
-        const uint32_t n_tok   = static_cast<uint32_t>(tokens.size());
+        const uint32_t magic      = KV_CHAIN_MAGIC;
+        const uint32_t version    = KV_CHAIN_VERSION;
+        const uint32_t n_tok      = static_cast<uint32_t>(tokens.size());
+        const uint32_t attn_size  = static_cast<uint32_t>(attn.size());
+        const uint32_t recr_size  = static_cast<uint32_t>(recr.size());
         f.write(reinterpret_cast<const char *>(&magic),      sizeof(magic));
         f.write(reinterpret_cast<const char *>(&version),    sizeof(version));
-        f.write(reinterpret_cast<const char *>(&chain_hash), sizeof(chain_hash));
+        f.write(reinterpret_cast<const char *>(&chunk_hash), sizeof(chunk_hash));
         f.write(reinterpret_cast<const char *>(&n_tok),      sizeof(n_tok));
         f.write(reinterpret_cast<const char *>(tokens.data()), sizeof(llama_token) * tokens.size());
-        f.write(reinterpret_cast<const char *>(state.data()), state.size());
+        f.write(reinterpret_cast<const char *>(&attn_size),  sizeof(attn_size));
+        f.write(reinterpret_cast<const char *>(attn.data()),  attn.size());
+        f.write(reinterpret_cast<const char *>(&recr_size),  sizeof(recr_size));
+        f.write(reinterpret_cast<const char *>(recr.data()),  recr.size());
         if (!f) {
             SRV_ERR("kv-chain: write failed for '%s'\n", tmp.string().c_str());
             fs::remove(tmp, ec);
@@ -171,36 +193,58 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
     return true;
 }
 
-std::vector<uint8_t> kv_chain_store::read_chunk_blob(const fs::path & file) {
+// reads both blobs from a chunk file; returns false if missing/corrupt
+bool kv_chain_store::read_chunk(const fs::path & file, kv_chain_chunk & out) {
     std::ifstream f(file, std::ios::binary);
     if (!f) {
-        return {};
+        return false;
     }
     f.seekg(0, std::ios::end);
     const uint64_t file_size = static_cast<uint64_t>(f.tellg());
     const uint64_t min_size = sizeof(uint32_t) * 4 + sizeof(uint64_t);
     if (file_size < min_size) {
-        return {};
+        return false;
     }
     f.seekg(0, std::ios::beg);
     std::vector<uint8_t> buf(file_size);
     f.read(reinterpret_cast<char *>(buf.data()), file_size);
     f.close();
     if (!f) {
-        return {};
+        return false;
     }
     const uint64_t stored_sum = *reinterpret_cast<const uint64_t *>(buf.data() + file_size - sizeof(uint64_t));
     if (fnv1a64(buf.data(), file_size - sizeof(uint64_t)) != stored_sum) {
         SRV_WRN("kv-chain: checksum mismatch for %s, ignoring\n", file.string().c_str());
-        return {};
+        return false;
     }
-    // header: magic, version, chain_hash, n_tokens
-    const uint32_t n_tokens = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t) * 3);
-    const size_t hdr_len = sizeof(uint32_t) * 4 + sizeof(llama_token) * n_tokens;
-    if (file_size < hdr_len + sizeof(uint64_t)) {
-        return {};
+    // header: magic, version, chunk_hash, n_tokens
+    const uint32_t magic = *reinterpret_cast<const uint32_t *>(buf.data());
+    const uint32_t version = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t));
+    if (magic != KV_CHAIN_MAGIC || version != KV_CHAIN_VERSION) {
+        SRV_WRN("kv-chain: bad magic/version in %s (magic=%08x version=%u), ignoring\n",
+                file.string().c_str(), magic, version);
+        return false;
     }
-    return std::vector<uint8_t>(buf.begin() + hdr_len, buf.end() - sizeof(uint64_t));
+    const uint32_t n_tokens  = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t) * 3);
+    const size_t   hdr_len   = sizeof(uint32_t) * 4 + sizeof(llama_token) * n_tokens;
+    if (file_size < hdr_len + sizeof(uint32_t) * 2 + sizeof(uint64_t)) {
+        return false;
+    }
+    const uint32_t * p      = reinterpret_cast<const uint32_t *>(buf.data() + hdr_len);
+    const uint32_t   attn_size = p[0];
+    const uint8_t *  attn_ptr  = buf.data() + hdr_len + sizeof(uint32_t);
+    const uint32_t   recr_size = *reinterpret_cast<const uint32_t *>(attn_ptr + attn_size);
+    const uint8_t *  recr_ptr  = attn_ptr + attn_size + sizeof(uint32_t);
+    const size_t   expected = hdr_len + sizeof(uint32_t) + attn_size
+                             + sizeof(uint32_t) + recr_size + sizeof(uint64_t);
+    if (expected != file_size) {
+        SRV_WRN("kv-chain: size mismatch in %s (expected %zu, got %llu), ignoring\n",
+                file.string().c_str(), expected, (unsigned long long) file_size);
+        return false;
+    }
+    out.attn_blob.assign(attn_ptr, attn_ptr + attn_size);
+    out.recr_blob.assign(recr_ptr, recr_ptr + recr_size);
+    return true;
 }
 
 void kv_chain_store::evict_oldest(uint64_t need_bytes) {
@@ -227,17 +271,17 @@ void kv_chain_store::evict_oldest(uint64_t need_bytes) {
     }
 }
 
-std::vector<uint8_t> kv_chain_store::load_prefix(const llama_tokens & tokens, size_t * n_tokens) const {
-    std::vector<uint8_t> empty;
+std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tokens, size_t * n_tokens) const {
+    std::vector<kv_chain_chunk> chunks;
     *n_tokens = 0;
     if (!enabled() || tokens.empty()) {
-        return empty;
+        return chunks;
     }
 
     const fs::path dir = fs::path(root_dir);
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
-        return empty;
+        return chunks;
     }
 
     // walk the hash chain from the root. chunk k covers tokens[k*bs,(k+1)*bs)
@@ -249,8 +293,7 @@ std::vector<uint8_t> kv_chain_store::load_prefix(const llama_tokens & tokens, si
     const size_t n_chunks = tokens.size() / bs;
 
     uint32_t prev_hash = 0;
-    std::vector<uint8_t> best_blob;
-    size_t best_n = 0;
+    uint64_t total_loaded = 0;
     for (size_t k = 0; k < n_chunks; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
         const uint32_t chunk_hash = hash_chunk(block, prev_hash);
@@ -260,21 +303,20 @@ std::vector<uint8_t> kv_chain_store::load_prefix(const llama_tokens & tokens, si
             SRV_INF("kv-chain: load_prefix: chain stops at chunk %zu (no file)\n", k);
             break;
         }
-        std::vector<uint8_t> blob = read_chunk_blob(file);
-        if (blob.empty()) {
+        kv_chain_chunk chunk;
+        if (!read_chunk(file, chunk)) {
             SRV_INF("kv-chain: load_prefix: chain stops at chunk %zu (corrupt)\n", k);
             break;
         }
-        best_blob = std::move(blob);
-        best_n = (k + 1) * bs;
+        total_loaded += chunk.attn_blob.size() + chunk.recr_blob.size();
+        chunks.push_back(std::move(chunk));
         prev_hash = chunk_hash;
     }
 
-    if (best_n > 0) {
-        *n_tokens = best_n;
-        SRV_INF("kv-chain: loaded %zu tokens from %s (%.3f MiB)\n",
-                best_n, dir.string().c_str(), best_blob.size() / (1024.0*1024.0));
-        return best_blob;
+    if (!chunks.empty()) {
+        *n_tokens = chunks.size() * bs;
+        SRV_INF("kv-chain: loaded %zu chunks (%zu tokens) from %s (%.3f MiB)\n",
+                chunks.size(), *n_tokens, dir.string().c_str(), (double) total_loaded / (1024.0*1024.0));
     }
-    return empty;
+    return chunks;
 }

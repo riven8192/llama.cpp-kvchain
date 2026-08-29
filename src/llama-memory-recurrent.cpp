@@ -730,7 +730,7 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     return size_s_bytes;
 }
 
-void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) const {
+void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
     GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
@@ -742,7 +742,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     uint32_t cell_range_begin = size;
     for (uint32_t i = 0; i < size; ++i) {
         const auto & cell = cells[i];
-        if (cell.pos >= pos_limit) {
+        if (cell.pos < pos_lo || cell.pos >= pos_limit) {
             continue;
         }
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
@@ -813,8 +813,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     state_write_data(io, cell_ranges_data);
 }
 
-void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) {
+void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
     GGML_UNUSED(flags);
+    GGML_UNUSED(pos_lo);
+    GGML_UNUSED(pos_limit); // the blob already contains only cells in [pos_lo, pos_limit)
 
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));

@@ -159,6 +159,11 @@ struct llama_context {
     size_t state_seq_get_data_prefix(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos pos_limit);
     size_t state_seq_set_data_prefix(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_pos pos_limit);
 
+    size_t state_seq_get_data_window(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
+    size_t state_seq_set_data_window(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
+
+    size_t state_seq_get_size_window(llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
+
     bool state_load_file(
             const char * filepath,
            llama_token * tokens_out,
@@ -275,6 +280,9 @@ private:
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit = INT32_MAX);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit = INT32_MAX);
+
+    size_t state_seq_write_data_window(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
+    size_t state_seq_read_data_window (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
 
     //
     // members

@@ -932,7 +932,7 @@ private:
         if (pos > n) {
             return;
         }
-        // the chunk's own tokens are [chunk_n*bs, (chunk_n+1)*bs)
+        // the chunk's own tokens are [chunk_lo, pos) = [chunk_n*bs, (chunk_n+1)*bs)
         const size_t chunk_lo = (size_t) chunk_n * bs;
         llama_tokens chunk_tokens;
         chunk_tokens.reserve(bs);
@@ -943,14 +943,11 @@ private:
         const uint32_t chunk_hash = kv_chain->hash_chunk(chunk_tokens, kv_chain_cb_state.last_hash);
         kv_chain_cb_state.last_hash = chunk_hash;
 
-        // the state blob holds the full prefix [0, pos) so it is self-consistent
-        // (rows + recurrent state both as-of pos = chunk_n*bs)
-        llama_tokens prefix;
-        prefix.reserve(pos);
-        for (size_t i = 0; i < pos; ++i) {
-            prefix.push_back(slot.prompt.tokens[i]);
-        }
-        kv_chain->save(slot.ctx_tgt, slot.id, prefix, chunk_hash, chunk_tokens);
+        // dump only THIS chunk's window [chunk_lo, pos): the attn rows and the
+        // recurrent rows for exactly these bs positions. no full-prefix
+        // duplication - each chunk file is a constant size, and on restore the
+        // chunks are replayed in order (attn appends, recurrent overwrites).
+        kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens);
     }
 
     server_metrics metrics;
@@ -3442,20 +3439,52 @@ private:
                         if (kv_chain && n_past == 0 && slot.prompt.n_tokens() == 0 && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
                             // restore a saved prefix from the disk hash-chain cache
                             size_t n_saved = 0;
-                            const std::vector<uint8_t> blob = kv_chain->load_prefix(input_tokens.get_tokens(), &n_saved);
-                            if (!blob.empty() && n_saved > 0) {
-                                const size_t n = llama_state_seq_set_data_prefix_ext(ctx_tgt, blob.data(), blob.size(), slot.id,
-                                        LLAMA_STATE_SEQ_FLAGS_NONE, (llama_pos) n_saved);
-                                if (n == blob.size()) {
+                            const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(input_tokens.get_tokens(), &n_saved);
+                            if (!chunks.empty() && n_saved > 0) {
+                                // replay the matched chunks in order. each chunk holds the
+                                // attn rows and recurrent rows for its own window [k*bs,(k+1)*bs).
+                                // attn: chunk 0 wipes (APPEND cleared) any stale cells, later
+                                // chunks append (APPEND set) so all positions accumulate.
+                                // recurrent: each call wipes + rewrites; only the final call's
+                                // tail state is what the engine reads, so the last chunk wins.
+                                bool ok = true;
+                                const size_t bs = (size_t) kv_chain->batch_size();
+                                for (size_t k = 0; k < chunks.size() && ok; ++k) {
+                                    const llama_pos pos_lo    = (llama_pos) (k * bs);
+                                    const llama_pos pos_hi    = (llama_pos) ((k + 1) * bs);
+                                    const llama_state_seq_flags attn_flags =
+                                            (k == 0) ? LLAMA_STATE_SEQ_FLAGS_FULL_ONLY
+                                                    : (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
+                                    const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
+                                            chunks[k].attn_blob.data(), chunks[k].attn_blob.size(), slot.id,
+                                            attn_flags, pos_lo, pos_hi);
+                                    if (n_attn != chunks[k].attn_blob.size()) {
+                                        SLT_WRN(slot, "kv-chain: attn restore failed at chunk %zu (%zu of %zu bytes)\n",
+                                                k, n_attn, chunks[k].attn_blob.size());
+                                        ok = false;
+                                        break;
+                                    }
+                                    const size_t n_recr = llama_state_seq_set_data_window_ext(ctx_tgt,
+                                            chunks[k].recr_blob.data(), chunks[k].recr_blob.size(), slot.id,
+                                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, pos_lo, pos_hi);
+                                    if (n_recr != chunks[k].recr_blob.size()) {
+                                        SLT_WRN(slot, "kv-chain: recr restore failed at chunk %zu (%zu of %zu bytes)\n",
+                                                k, n_recr, chunks[k].recr_blob.size());
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                                if (ok) {
                                     for (size_t i = 0; i < n_saved && i < input_tokens.size(); ++i) {
                                         slot.prompt.tokens.push_back(input_tokens[i]);
                                     }
                                     n_past = (int) n_saved;
                                     slot.kv_chain_restored = true;
                                     slot.kv_chain_full_restore = (n_saved >= (size_t) slot.task->n_tokens());
-                                    SLT_INF(slot, "kv-chain: restored %d tokens from disk cache\n", n_past);
+                                    SLT_INF(slot, "kv-chain: restored %d tokens from disk cache (%zu chunks)\n",
+                                            n_past, chunks.size());
                                 } else {
-                                    SLT_WRN(slot, "kv-chain: failed to restore state (%zu of %zu bytes), falling back to prefill\n", n, blob.size());
+                                    SLT_WRN(slot, "kv-chain: failed to restore chain, falling back to prefill\n", (const char *) "");
                                 }
                             }
                         }

@@ -908,6 +908,15 @@ extern "C" {
 // work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
+// inverse of PARTIAL_ONLY: work only with the full (per-token KV) cache, skipping the recurrent state.
+// used by the kv-chain disk cache to snapshot the attn rows of a chunk separately from the recurrent rows.
+#define LLAMA_STATE_SEQ_FLAGS_FULL_ONLY 4
+
+// on restore (state_read), do NOT clear the destination seq's cells first; append the restored
+// cells to whatever is already present. used by the kv-chain disk cache to stream chunk files:
+// the first chunk is restored with this flag CLEAR (wipes any stale cells), later chunks with it SET.
+#define LLAMA_STATE_SEQ_FLAGS_APPEND 8
+
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
@@ -917,7 +926,16 @@ extern "C" {
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
-           llama_state_seq_flags   flags);
+            llama_state_seq_flags   flags);
+
+    // size of the seq state blob for the window [pos_lo, pos_limit) with the given
+    // part-selection flags (used to size the buffer before llama_state_seq_get_data_window_ext)
+    LLAMA_API size_t llama_state_seq_get_size_window_ext(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+            llama_state_seq_flags   flags,
+                    llama_pos      pos_lo,
+                    llama_pos      pos_limit);
 
     LLAMA_API size_t llama_state_seq_get_data_ext(
             struct llama_context * ctx,
@@ -932,6 +950,27 @@ extern "C" {
                            size_t   size,
                      llama_seq_id   dest_seq_id,
             llama_state_seq_flags   flags);
+
+    // [EXPERIMENTAL] like the _ext above, but only (de)serialize cells with pos_lo <= pos < pos_limit.
+    // used by the kv-chain disk cache to snapshot a single chunk's window at a ubatch boundary.
+    // pass pos_lo = 0, pos_limit = INT32_MAX for the full prefix (original _prefix_ext behavior).
+    LLAMA_API size_t llama_state_seq_get_data_window_ext(
+            struct llama_context * ctx,
+                          uint8_t * dst,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_lo,
+                          llama_pos pos_limit);
+
+    LLAMA_API size_t llama_state_seq_set_data_window_ext(
+            struct llama_context * ctx,
+                    const uint8_t * src,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_lo,
+                          llama_pos pos_limit);
 
     // [EXPERIMENTAL] like the _ext above, but only (de)serialize cells with pos < pos_limit.
     // used by the kv-chain disk cache to snapshot a prompt prefix at a ubatch boundary.

@@ -133,8 +133,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
-    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_limit = INT32_MAX) const override;
-    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_limit = INT32_MAX) override;
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX) const override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX) override;
 
     //
     // llama_kv_cache_dsv4 specific API
