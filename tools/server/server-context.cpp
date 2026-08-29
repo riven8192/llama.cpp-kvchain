@@ -3253,73 +3253,88 @@ private:
                             }
 
                             if (slot.task->params.cache_prompt) {
-                                // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                if (kv_chain) {
+                                    // the disk hash-chain cache is the only prefix cache: it is
+                                    // consulted below (load_prefix) and covers the whole prompt
+                                    // from position 0. the native in-memory common-prefix reuse
+                                    // would otherwise set n_past to the LCP with the previous
+                                    // prompt (e.g. a divergent re-run reusing a stale in-memory
+                                    // prefix that the disk chain does not have), which would
+                                    // desync n_past from the restored chain. keep n_past == 0
+                                    // here so the kv-chain restore path is the single source of
+                                    // truth. the UNEXPECTED warning below is the last-resort
+                                    // check that this branch is the only prefix-cache path.
+                                    SLT_WRN(slot, "%s", "kv-chain: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
+                                    n_past = 0;
+                                } else {
+                                    // reuse any previously computed tokens that are common with the new prompt
+                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                                // if there is an alora invoked, don't cache after the invocation start
-                                if (slot.alora_invocation_start > 0) {
-                                    SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
-                                    n_past = std::min(n_past, slot.alora_invocation_start - 1);
-                                }
-
-                                const auto n_cache_reuse = slot.task->params.n_cache_reuse;
-
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
-
-                                if (!can_cache_reuse && n_cache_reuse > 0) {
-                                    SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
-                                }
-
-                                // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
-                                    size_t head_c = n_past; // cache
-                                    size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
+                                    // if there is an alora invoked, don't cache after the invocation start
+                                    if (slot.alora_invocation_start > 0) {
+                                        SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
+                                        n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                     }
 
-                                    SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
+                                    const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                    while (head_c < slot.prompt.tokens.size() &&
-                                           head_p < input_tokens.size()) {
+                                    const bool can_cache_reuse =
+                                        llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                        !slot.prompt.tokens.has_mtmd;
 
-                                        size_t n_match = 0;
-                                        while (head_c + n_match < slot.prompt.tokens.size() &&
-                                               head_p + n_match < input_tokens.size()       &&
-                                               slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
-                                            n_match++;
+                                    if (!can_cache_reuse && n_cache_reuse > 0) {
+                                        SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    }
+
+                                    // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                    if (can_cache_reuse && n_cache_reuse > 0) {
+                                        GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+
+                                        size_t head_c = n_past; // cache
+                                        size_t head_p = n_past; // current prompt
+
+                                        if (mctx) {
+                                            // we should never reach this
+                                            GGML_ABORT("not supported by multimodal");
                                         }
 
-                                        if (n_match >= (size_t) n_cache_reuse) {
-                                            SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
-                                            //}
+                                        SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+                                        while (head_c < slot.prompt.tokens.size() &&
+                                               head_p < input_tokens.size()) {
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
-
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
+                                            size_t n_match = 0;
+                                            while (head_c + n_match < slot.prompt.tokens.size() &&
+                                                   head_p + n_match < input_tokens.size()       &&
+                                                   slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
+                                                n_match++;
                                             }
 
-                                            head_c += n_match;
-                                            head_p += n_match;
-                                        } else {
-                                            head_c += 1;
-                                        }
-                                    }
+                                            if (n_match >= (size_t) n_cache_reuse) {
+                                                SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
+                                                //for (size_t i = head_p; i < head_p + n_match; i++) {
+                                                //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
+                                                //}
 
-                                    SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                                const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+
+                                                slot.mem.seq_rm (slot.id, head_p, head_c);
+                                                slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+
+                                                for (size_t i = 0; i < n_match; i++) {
+                                                    slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
+                                                    n_past++;
+                                                }
+
+                                                head_c += n_match;
+                                                head_p += n_match;
+                                            } else {
+                                                head_c += 1;
+                                            }
+                                        }
+
+                                        SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
