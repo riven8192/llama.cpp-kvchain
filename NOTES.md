@@ -50,14 +50,15 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 
 - `<cache_dir>/<root_hash_hex>/<chunk_hash_hex>.kvchunk`:
   one directory per model/config identity (the root_hash dir), one file per chunk.
-  u32 magic `KVC1`, u32 version (=2), u32 chunk_hash, u32 n_tokens (=bs),
-  llama_token[bs] (this chunk's own tokens, for validation), u32 attn_size, attn_blob[attn_size],
-  u32 recr_size, recr_blob[recr_size], u64 fnv1a64 checksum of everything before it.
+  u32 magic `KVC1`, u32 version (=2), u32 chunk_hash (LOW 32 BITS of the 64-bit hash),
+  u32 n_tokens (=bs), llama_token[bs] (this chunk's own tokens, for validation),
+  u32 attn_size, attn_blob[attn_size], u32 recr_size, recr_blob[recr_size],
+  u64 fnv1a64 checksum of everything before it.
 - Both blobs are self-contained seq-state blobs (each carries io_magic, src_seq, module
   headers) so they feed straight to the `*_set_data_window_ext` API.
 - attn_blob dumped with `FULL_ONLY`, recr_blob with `PARTIAL_ONLY`, both for `[pos_lo,pos_hi)`.
-- Atomic `.tmp`+`rename`. `read_chunk` verifies magic+version+checksum; a bad version or
-  checksum = miss (chain stops).
+- Atomic `.tmp`+`rename`. `read_chunk` verifies magic+version+checksum and bounds n_tokens
+  against the file size; a bad version/checksum/size = miss (chain stops).
 
 ## 4. Hash chain (deterministic from the token list + model/config identity)
 
@@ -65,10 +66,12 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
   batch size). chunk k covers tokens `[k*bs,(k+1)*bs)`. Only COMPLETE chunks are persisted;
   the trailing partial block is never written, always re-prefilled.
 - `hash_0 = H(chunk_0_tokens, prev=0)`; `hash_k = H(chunk_k_tokens, prev=hash_{k-1})`,
-  H = FNV-1a over the chunk's own bs token ids seeded by the parent. A longer prompt reuses
-  identical early chunks. `load_prefix` walks from the root, stopping at the first
-  missing/corrupt file, returning the matched `kv_chain_chunk{attn_blob,recr_blob}` list
-  (in order) + `*n_tokens = n_chunks*bs`.
+  H = FNV-1a (FULL 64-bit) over the chunk's own bs token ids seeded by the parent.
+  A longer prompt reuses identical early chunks. `load_prefix` walks from the root,
+  stopping at the first missing/corrupt file, returning the matched
+  `kv_chain_chunk{attn_blob,recr_blob,tokens}` list (in order) + `*n_tokens = n_chunks*bs`.
+  It also VERIFIES each file's header token IDs against the prompt (mismatch = chain
+  stops, never a garbage restore).
 - **root_hash** = FNV-1a64 over a canonical metadata blob (length-prefixed fields, struct order):
   `KV_CHAIN_FORMAT_VERSION` (int32), `chunk_size` (int32), model file size (int64, stat only),
   model file mtime (int64 seconds, stat only), arch string (`llama_model_arch_name`),
@@ -110,9 +113,14 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 ## 7. Config
 
 - `--kv-chain-dir <path>` (empty = feature off, zero behavior change), `--kv-chain-limit-gb N`
-  (default 100, devops/env.sh). Eviction is LRU by mtime after each write; a file vanishing
-  mid-restore is a benign "cache ends here". On startup, stray `.tmp` files in the root_hash
-  dir are removed.
+  (default 16 in common.h; devops/env.sh passes 100 explicitly). Eviction is LRU by mtime
+  after each write; a file vanishing mid-restore is a benign "cache ends here". On startup,
+  stray `.tmp` files in the root_hash dir are removed.
+- KNOWN QUIRK: the model-file mtime in the metadata blob is std::filesystem's
+  last_write_time (a different clock epoch than unix time, so it logs as a negative
+  number). It is consistent across runs, so the root hash is stable; do not "fix" it
+  to time_since_epoch without bumping KV_CHAIN_FORMAT_VERSION (old caches would then
+  be orphaned).
 
 ## 8. Test status (all PASS, Qwen3.8-27B, -ub 32 -b 32)
 
@@ -131,11 +139,15 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 ## 9. Dev tooling (devops/)
 
 - env.sh (model, port 50081, paths), llama_build.sh (cmake+ninja, Vulkan; check EXIT=$?,
-  `| tail -1` masks the exit code), llama_run.sh (--keep-cache/--no-kv-chain/-- <args>),
-  llama_kill.sh, llama_wait.sh, llama_prompt.sh (sends /v1/completions cache_prompt:true,
-  prints `cached_tokens: N prompt_tokens: M` then the full text), llama_test.sh (--flush,
-  [restart] markers, trailing `-- <extra run args>`; the `--` tail must come LAST),
+  `| tail -1` masks the exit code), llama_run.sh (--keep-cache/--no-kv-chain/-- <args>;
+  also WAITS for "listening on" before returning - llama_wait.sh was merged into it),
+  llama_kill.sh, llama_prompt.sh (sends /v1/completions cache_prompt:true, prints
+  `cached_tokens: N prompt_tokens: M` then the full text), llama_test.sh ([restart]
+  markers, trailing `-- <extra run args>`; the `--` tail must come LAST),
   llama_unittest_1.sh (the full-chain fidelity test above).
+- llama_run.sh log handling: the server writes ONLY to $log.<ts>.log (never to stdout -
+  an inherited stdout pipe makes pipe-EOF-waiting callers hang forever). $log is a
+  SYMLINK to the newest tslog, so the readiness wait-loop always reads the current run.
 
 ## 10. Key constraints / gotchas
 
