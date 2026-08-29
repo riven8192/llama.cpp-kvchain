@@ -81,7 +81,7 @@ log_ts="$(date +%Y%m%d-%H%M%S)"
 
 setsid bash -c '
   pidfile=$1; log=$2; tslog=$3; shift 3
-  { echo $BASHPID >"$pidfile"; exec "$@"; } </dev/null 2>&1 | tee "$log" >"$tslog"
+  { echo $BASHPID >"$pidfile"; exec "$@"; } </dev/null 2>&1 | tee "$log" "$tslog"
 ' _ "$LLAMA_PIDFILE" "$LLAMA_LOG" "$LLAMA_LOG.$log_ts.log" \
   "$LLAMA_SERVER_BIN" "${ARGS[@]}" &
 
@@ -95,3 +95,35 @@ if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
     exit 1
 fi
 echo "pid: $pid"
+
+# wait until the server is ready (or it has crashed) - llama_run.sh is the
+# single entry point, so the wait lives here, not in a separate script
+TIMEOUT=300
+START=$(date +%s)
+
+while :; do
+  if grep -q "listening on" "${LLAMA_LOG}" 2>/dev/null; then
+    echo "ready: $(grep 'listening on' "${LLAMA_LOG}" | tail -1)"
+    exit 0
+  fi
+  if grep -q "exiting due to" "${LLAMA_LOG}" 2>/dev/null; then
+    echo "server exited:" >&2
+    tail -15 "${LLAMA_LOG}" >&2
+    exit 1
+  fi
+  if [[ -f "${LLAMA_PIDFILE}" ]]; then
+    pid=$(cat "${LLAMA_PIDFILE}" 2>/dev/null || true)
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      echo "server process ${pid} died:" >&2
+      tail -15 "${LLAMA_LOG}" >&2
+      exit 1
+    fi
+  fi
+  now=$(date +%s)
+  if (( now - START >= TIMEOUT )); then
+    echo "timed out after ${TIMEOUT}s waiting for server" >&2
+    tail -15 "${LLAMA_LOG}" >&2
+    exit 1
+  fi
+  sleep 2
+done

@@ -48,7 +48,8 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 
 ## 3. Chunk file format (tools/server/kv-chain-store.{h,cpp})
 
-- `<cache_dir>/<chunk_hash>.kvchunk`:
+- `<cache_dir>/<root_hash_hex>/<chunk_hash_hex>.kvchunk`:
+  one directory per model/config identity (the root_hash dir), one file per chunk.
   u32 magic `KVC1`, u32 version (=2), u32 chunk_hash, u32 n_tokens (=bs),
   llama_token[bs] (this chunk's own tokens, for validation), u32 attn_size, attn_blob[attn_size],
   u32 recr_size, recr_blob[recr_size], u64 fnv1a64 checksum of everything before it.
@@ -58,7 +59,7 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 - Atomic `.tmp`+`rename`. `read_chunk` verifies magic+version+checksum; a bad version or
   checksum = miss (chain stops).
 
-## 4. Hash chain (deterministic from the token list alone)
+## 4. Hash chain (deterministic from the token list + model/config identity)
 
 - `chunk_size` = `--ubatch` (bs), used PURELY as a boundary stride (NOT the runtime prefill
   batch size). chunk k covers tokens `[k*bs,(k+1)*bs)`. Only COMPLETE chunks are persisted;
@@ -68,6 +69,14 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
   identical early chunks. `load_prefix` walks from the root, stopping at the first
   missing/corrupt file, returning the matched `kv_chain_chunk{attn_blob,recr_blob}` list
   (in order) + `*n_tokens = n_chunks*bs`.
+- **root_hash** = FNV-1a64 over a canonical metadata blob (length-prefixed fields, struct order):
+  `KV_CHAIN_FORMAT_VERSION` (int32), `chunk_size` (int32), model file size (int64, stat only),
+  model file mtime (int64 seconds, stat only), arch string (`llama_model_arch_name`),
+  ftype string (`llama_ftype_name(llama_model_ftype)`), `type_k` (ggml_type), `type_v` (ggml_type),
+  `rope_scaling_type` (int32), `rope_freq_base` (float bits), `rope_freq_scale` (float bits),
+  model path (string). Gathering is cheap: one stat(), no file reads.
+  The root_hash dir isolates different models/configs so a stale cache for a different
+  model is never read (clean miss instead of garbage).
 
 ## 5. Write path (tools/server/server-context.cpp)
 
@@ -87,6 +96,9 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 ## 6. Restore path (server-context.cpp, SLOT_STATE_STARTED, n_past==0, slot empty, cache_prompt)
 
 - `kv_chain->load_prefix(tokens, &n_saved)` -> list of matched chunks.
+  - `load_prefix` walks `<cache_dir>/<root_hash_hex>/`, stopping at the first missing/corrupt file.
+  - On hit, it `utimensat`-touches every matched file (mtime=now) so LRU eviction keeps the
+    hottest chains alive (relatime mounts do not update mtime on read).
 - For each matched chunk k in order:
   - attn: `set_data_window_ext(ctx, attn_blob, seq, FULL_ONLY | (k>0 ? APPEND : 0), k*bs, (k+1)*bs)`
   - recr: `set_data_window_ext(ctx, recr_blob, seq, PARTIAL_ONLY, k*bs, (k+1)*bs)`
@@ -99,7 +111,8 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 
 - `--kv-chain-dir <path>` (empty = feature off, zero behavior change), `--kv-chain-limit-gb N`
   (default 100, devops/env.sh). Eviction is LRU by mtime after each write; a file vanishing
-  mid-restore is a benign "cache ends here".
+  mid-restore is a benign "cache ends here". On startup, stray `.tmp` files in the root_hash
+  dir are removed.
 
 ## 8. Test status (all PASS, Qwen3.8-27B, -ub 32 -b 32)
 

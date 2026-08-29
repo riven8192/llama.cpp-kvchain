@@ -26,12 +26,12 @@ done
 RUN_ARGS_STR="${RUN_ARGS[*]:-}"
 
 run_server() {
+    # llama_run.sh waits for the server to be ready before returning
     if [ -n "${RUN_ARGS_STR}" ]; then
         "${DEVS}/llama_run.sh" --keep-cache -- "${RUN_ARGS[@]}"
     else
         "${DEVS}/llama_run.sh" --keep-cache
     fi
-    "${DEVS}/llama_wait.sh" 300
 }
 
 echo "=== [1/4] flush kv-cache ==="
@@ -65,4 +65,4 @@ for prompt in "${PROMPTS[@]}"; do
 done
 
 echo "=== chunks on disk ==="
-ls -la "${KV_CACHE_DIR}" 2>/dev/null | grep kvchunk || echo "(none)"
+find "${KV_CACHE_DIR}" -name '*.kvchunk' 2>/dev/null -exec ls -la {} \; || echo "(none)"

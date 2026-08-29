@@ -18,17 +18,44 @@ namespace fs = std::filesystem;
 struct kv_chain_chunk {
     std::vector<uint8_t> attn_blob; // seq state blob for the attn (per-token KV) part
     std::vector<uint8_t> recr_blob; // seq state blob for the recurrent (R/S) part
+    llama_tokens        tokens;    // the chunk's token IDs, verbatim from the file header
 };
 
 // disk-backed, content-addressed KV state store
-// layout: <root_dir>/<chunk_hash>.kvchunk
+// layout: <root_dir>/<root_hash_hex>/<chunk_hash_hex>.kvchunk
+// the root_hash dir is the model/config identity (see metadata_blob); one
+// directory per model/config, one file per chunk.
 // chunk file: u32 magic, u32 version, u32 chunk_hash, u32 n_tokens,
 //             llama_token[n_tokens], u32 attn_size, attn_blob[attn_size],
 //             u32 recr_size, recr_blob[recr_size], u64 fnv1a checksum of everything before it
 // both blobs are self-contained seq-state blobs (each carries its own io_magic,
 // src_seq, module header) so they can be fed straight to the state_seq_set API.
+//
+// root_hash = FNV-1a64 over a canonical metadata blob. everything in the blob
+// must affect the numeric content or LAYOUT of cached KV values, so that any
+// change produces a fresh (clean-miss) directory instead of a silent garbage
+// read. gathering is deliberately cheap: one stat() on the model file, no
+// model-weight reads, no file parsing.
+struct kv_chain_metadata {
+    int32_t  format_version;              // KV_CHAIN_FORMAT_VERSION, bump on any layout change
+    uint32_t chunk_size;                  // == llama_n_batch(ctx) at store construction
+    int64_t  model_file_size;             // stat() of the model file (-1 if stat fails)
+    int64_t  model_file_mtime;            // stat() mtime seconds
+    std::string arch;                     // llama_model_arch_name(model) (architecture string)
+    std::string ftype;                    // llama_model_ftype_name(model) (quantization string)
+    uint32_t type_k;                      // ggml_type of the K cache
+    uint32_t type_v;                      // ggml_type of the V cache
+    int32_t  rope_scaling_type;           // llama_rope_scaling_type
+    uint32_t rope_freq_base_bits;         // float bits (0.0f = "from model")
+    uint32_t rope_freq_scale_bits;        // float bits (0.0f = "from model")
+};
+
 struct kv_chain_store {
-    kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size);
+    // root_dir: base cache dir (empty = feature disabled).
+    // params:   common_params of the loaded model (rope config, kv dtypes).
+    // model:    the loaded model (arch + quant string + file stat).
+    kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size,
+                   const common_params & params, const llama_model * model);
 
     // saves one chunk covering the window [pos_lo, pos_hi) of seq_id's state.
     // content-addressed by chunk_hash. chunk_tokens are this chunk's own tokens
@@ -46,13 +73,27 @@ struct kv_chain_store {
     // order (empty on miss) and sets *n_tokens = prefix length (= n_chunks*bs).
     std::vector<kv_chain_chunk> load_prefix(const llama_tokens & tokens, size_t * n_tokens) const;
 
+    // touches (utimensat) the files of the given chunk hashes so their mtime is
+    // "now". required because the default relatime mount does not update mtime
+    // on read; without this, LRU eviction would evict the hottest chains first.
+    // load_prefix() already touches on hit; this is for callers that restore
+    // via a different path and want the same LRU semantics.
+    void touch_chunks(const std::vector<uint32_t> & chunk_hashes) const;
+
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
     int32_t batch_size() const { return batch_size_; }
+    const std::string & root_hash_str() const { return root_hash_hex; }
+
+    static uint64_t fnv1a64(const uint8_t * data, size_t len);
+    static uint64_t fnv1a64(uint64_t h, const uint8_t * data, size_t len);
 
 private:
-    static uint64_t fnv1a64(const uint8_t * data, size_t len);
     static std::string hash_str(uint64_t h);
+
+    // computes the root hash from the metadata blob (see struct above).
+    // fills root_hash_hex. the model file is stat()ed only - never opened.
+    void compute_root_hash(const common_params & params, const llama_model * model);
 
     bool write_chunk(const fs::path & dir, uint32_t chunk_hash, const llama_tokens & chunk_tokens,
                      const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr);
@@ -65,8 +106,8 @@ private:
     static bool read_chunk(const fs::path & file, kv_chain_chunk & out);
 
     std::string root_dir;
+    std::string root_hash_hex; // 16 hex chars, identity of this model/config
     uint64_t    limit_bytes;
     int32_t     batch_size_; // chunk stride (boundary grid), not the runtime ubatch size
     uint64_t    total_bytes_cur = 0;
-    bool        index_loaded    = false;
 };

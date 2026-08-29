@@ -1423,7 +1423,8 @@ private:
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
                 : 0;
-            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes, llama_n_batch(ctx_tgt));
+            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes,
+                                                        llama_n_batch(ctx_tgt), params_base, model_tgt);
         }
 
         if (params_base.n_ctx_checkpoints > 0) {

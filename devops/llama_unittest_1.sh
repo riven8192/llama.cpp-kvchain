@@ -21,7 +21,31 @@ DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
 
 # --- the distinctive passage (Wikipedia, mind-body dualism / Aristotle) ---
-PASSAGE="In the philosophy of mind, mind–body dualism denotes either that mental phenomena are non-physical, or that the mind and body are distinct and separable. Thus, it encompasses a set of views about the relationship between mind and matter, as well as between subject and object, and is contrasted with other positions, such as physicalism and enactivism, in the mind–body problem. Aristotle shared Plato's view of multiple souls and further elaborated a hierarchical arrangement, corresponding to the distinctive functions of plants, animals, and humans: a nutritive soul of growth and metabolism that all three share; a perceptive soul of pain, pleasure, and desire that only humans and other animals share; and the faculty of reason that is unique to humans only. In this view, a soul is the hylomorphic form of a viable organism, wherein each level of the hierarchy formally supervenes upon the substance of the preceding level. For Aristotle, the first two souls, based on the body, perish when the living organism dies, whereas there remains an immortal and perpetual intellective part of mind. For Plato, however, the soul was not dependent on the physical body; he believed in metempsychosis, the migration of the soul to a new physical body. It has been considered a form of reductionism by some philosophers, since it enables the tendency to ignore very big groups of variables by its assumed association with the mind or the body, and not for its real value when it comes to explaining or predicting a studied phenomenon."
+PASSAGE=$( cat << 'EOF'
+-- sentence 1
+In the philosophy of mind, mind–body dualism denotes either that mental phenomena are non-physical, or that the mind and body are distinct and separable.
+
+-- sentence 2
+Thus, it encompasses a set of views about the relationship between mind and matter, as well as between subject and object, and is contrasted with other positions, such as physicalism and enactivism, in the mind–body problem.
+
+-- sentence 3
+Aristotle shared Plato's view of multiple souls and further elaborated a hierarchical arrangement, corresponding to the distinctive functions of plants, animals, and humans: a nutritive soul of growth and metabolism that all three share; a perceptive soul of pain, pleasure, and desire that only humans and other animals share; and the faculty of reason that is unique to humans only.
+
+-- sentence 4
+In this view, a soul is the hylomorphic form of a viable organism, wherein each level of the hierarchy formally supervenes upon the substance of the preceding level.
+
+-- sentence 5
+For Aristotle, the first two souls, based on the body, perish when the living organism dies, whereas there remains an immortal and perpetual intellective part of mind.
+
+-- sentence 6
+For Plato, however, the soul was not dependent on the physical body; he believed in metempsychosis, the migration of the soul to a new physical body.
+
+-- sentence 7
+It has been considered a form of reductionism by some philosophers, since it enables the tendency to ignore very big groups of variables by its assumed association with the mind or the body, and not for its real value when it comes to explaining or predicting a studied phenomenon.
+
+-- the end
+EOF
+)
 
 # distinctive phrases spread across the passage (avoid the bracketed citations,
 # which we stripped; each is long + unique enough to be unambiguous)
