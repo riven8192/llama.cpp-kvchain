@@ -1603,9 +1603,9 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
     }
 
-    csa_state->state_read(io, seq_id, flags, pos_limit);
-    hca_state->state_read(io, seq_id, flags, pos_limit);
-    lid_state->state_read(io, seq_id, flags, pos_limit);
+    csa_state->state_read(io, seq_id, flags);
+    hca_state->state_read(io, seq_id, flags);
+    lid_state->state_read(io, seq_id, flags);
 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);

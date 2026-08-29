@@ -13,7 +13,7 @@ static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
 static constexpr uint32_t KV_CHAIN_VERSION = 1;
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size) :
-    root_dir(std::move(root_dir)), limit_bytes(limit_bytes), batch_size(batch_size > 0 ? batch_size : 512) {
+    root_dir(std::move(root_dir)), limit_bytes(limit_bytes), batch_size_(batch_size > 0 ? batch_size : 512) {
     if (!enabled()) {
         return;
     }
@@ -49,10 +49,10 @@ uint64_t kv_chain_store::fnv1a64(const uint8_t * data, size_t len) {
     return h;
 }
 
-uint32_t kv_chain_store::hash_tokens(const llama_tokens & tokens, uint32_t prev) {
-    // FNV-1a over the token ids, chained with the parent hash
-    uint64_t h = 1469598103934665603ULL ^ prev;
-    for (auto t : tokens) {
+uint32_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint32_t prev_hash) const {
+    // FNV-1a over this chunk's token ids, seeded by the parent hash (chain step)
+    uint64_t h = 1469598103934665603ULL ^ prev_hash;
+    for (auto t : chunk_tokens) {
         const uint8_t * p = reinterpret_cast<const uint8_t *>(&t);
         for (int i = 0; i < (int) sizeof(t); ++i) {
             h ^= p[i];
@@ -72,16 +72,16 @@ std::string kv_chain_store::hash_str(uint64_t h) {
     return s;
 }
 
-// save a single chunk covering the prefix tokens[0..n). the state is dumped
-// truncated to pos < n (via the prefix API), so the chunk holds a
-// self-consistent (rows, recurrent) prefix that can be restored and resumed
-// from position n.
-bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_tokens & tokens) {
-    if (!enabled() || ctx == nullptr || tokens.empty()) {
+// save one chunk. prefix_tokens = the full prompt prefix [0, pos) whose state
+// is dumped (self-consistent: rows + recurrent both as-of pos). chunk_tokens
+// are this chunk's own tokens, stored verbatim in the header for validation.
+bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_tokens & prefix_tokens,
+                          uint32_t chunk_hash, const llama_tokens & chunk_tokens) {
+    if (!enabled() || ctx == nullptr || prefix_tokens.empty()) {
         return false;
     }
 
-    const size_t n = tokens.size();
+    const size_t pos = prefix_tokens.size();
     const size_t state_size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
     if (state_size == 0) {
         return false;
@@ -89,7 +89,7 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_
 
     std::vector<uint8_t> state(state_size);
     const size_t got = llama_state_seq_get_data_prefix_ext(ctx, state.data(), state_size, seq_id,
-            LLAMA_STATE_SEQ_FLAGS_NONE, (llama_pos) n);
+            LLAMA_STATE_SEQ_FLAGS_NONE, (llama_pos) pos);
     if (got == 0 || got != state_size) {
         SRV_WRN("kv-chain: failed to get state data (%zu of %zu bytes)\n", got, state_size);
         return false;
@@ -103,15 +103,13 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, const llama_
         return false;
     }
 
-    // hash over the cumulative prefix tokens (position-aware, self-describing)
-    const uint32_t chain_hash = hash_tokens(tokens, 0);
-    return write_chunk(dir, chain_hash, tokens, state, 0, n);
+    return write_chunk(dir, chunk_hash, chunk_tokens, state, pos);
 }
 
-// writes the chunk file for [lo, hi) if not present; returns true if written
-bool kv_chain_store::write_chunk(const fs::path & dir, uint32_t chain_hash, const llama_tokens & chunk_tokens,
-                                 const std::vector<uint8_t> & state, size_t lo, size_t hi) {
-    const fs::path file = dir / (hash_str(chain_hash) + ".kvchunk");
+// writes the chunk file if not present; returns true if written
+bool kv_chain_store::write_chunk(const fs::path & dir, uint32_t chunk_hash, const llama_tokens & chunk_tokens,
+                                  const std::vector<uint8_t> & state, size_t pos) {
+    const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
     if (fs::exists(file)) {
         return false;
     }
@@ -119,13 +117,13 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint32_t chain_hash, cons
     if (limit_bytes > 0 && total_bytes_cur + entry_bytes > limit_bytes) {
         evict_oldest(entry_bytes);
     }
-    const fs::path tmp = dir / (hash_str(chain_hash) + ".kvchunk.tmp");
-    if (!write_chunk_file(tmp, file, chain_hash, chunk_tokens, state)) {
+    const fs::path tmp = dir / (hash_str(chunk_hash) + ".kvchunk.tmp");
+    if (!write_chunk_file(tmp, file, chunk_hash, chunk_tokens, state)) {
         return false;
     }
     total_bytes_cur += entry_bytes;
-    SRV_INF("kv-chain: saved chunk [%zu, %zu) hash=%s (%.3f MiB)\n",
-            lo, hi, hash_str(chain_hash).c_str(), (double) state.size() / (1024.0*1024.0));
+    SRV_INF("kv-chain: saved chunk (prefix %zu tokens, %zu chunk tokens) hash=%s (%.3f MiB)\n",
+            pos, chunk_tokens.size(), hash_str(chunk_hash).c_str(), (double) state.size() / (1024.0*1024.0));
     return true;
 }
 
@@ -173,7 +171,7 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
     return true;
 }
 
-std::vector<uint8_t> kv_chain_store::read_chunk_blob(const fs::path & file, size_t n_tokens) {
+std::vector<uint8_t> kv_chain_store::read_chunk_blob(const fs::path & file) {
     std::ifstream f(file, std::ios::binary);
     if (!f) {
         return {};
@@ -196,6 +194,8 @@ std::vector<uint8_t> kv_chain_store::read_chunk_blob(const fs::path & file, size
         SRV_WRN("kv-chain: checksum mismatch for %s, ignoring\n", file.string().c_str());
         return {};
     }
+    // header: magic, version, chain_hash, n_tokens
+    const uint32_t n_tokens = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t) * 3);
     const size_t hdr_len = sizeof(uint32_t) * 4 + sizeof(llama_token) * n_tokens;
     if (file_size < hdr_len + sizeof(uint64_t)) {
         return {};
@@ -240,32 +240,34 @@ std::vector<uint8_t> kv_chain_store::load_prefix(const llama_tokens & tokens, si
         return empty;
     }
 
-    // enumerate the same chunk boundaries that save() used (full ubatches plus
-    // the final, possibly short chunk). each chunk's hash is over the cumulative
-    // tokens [0, hi), so a chunk exists iff that exact prefix was saved. the
-    // best restore is the largest hi whose chunk file is intact; the leftover
-    // tokens [hi, n) are re-prefilled by the caller.
-    const size_t bs = (size_t) batch_size;
-    size_t best_n = 0;
+    // walk the hash chain from the root. chunk k covers tokens[k*bs,(k+1)*bs)
+    // and hash_k = H(hash_{k-1} + chunk_k_tokens). stop at the first missing or
+    // corrupt file - that is where the cached prefix ends. the leftover tokens
+    // [best_n, n) are re-prefilled by the caller. only complete bs-blocks count
+    // (a trailing partial block is never cached).
+    const size_t bs = (size_t) batch_size_;
+    const size_t n_chunks = tokens.size() / bs;
+
+    uint32_t prev_hash = 0;
     std::vector<uint8_t> best_blob;
+    size_t best_n = 0;
+    for (size_t k = 0; k < n_chunks; ++k) {
+        const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
+        const uint32_t chunk_hash = hash_chunk(block, prev_hash);
 
-    size_t lo = 0;
-    while (lo < tokens.size()) {
-        const size_t hi = std::min(lo + bs, tokens.size());
-
-        llama_tokens cum_tokens(tokens.begin(), tokens.begin() + hi);
-        const uint32_t chain_hash = hash_tokens(cum_tokens, 0);
-
-        const fs::path file = dir / (hash_str(chain_hash) + ".kvchunk");
-        const bool exists = fs::exists(file);
-        std::vector<uint8_t> blob = read_chunk_blob(file, hi);
-        SRV_INF("kv-chain: load_prefix: boundary hi=%zu hash=%s exists=%d ok=%d\n",
-                hi, hash_str(chain_hash).c_str(), (int) exists, (int) !blob.empty());
-        if (!blob.empty()) {
-            best_blob = std::move(blob);
-            best_n = hi;
+        const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
+        if (!fs::exists(file)) {
+            SRV_INF("kv-chain: load_prefix: chain stops at chunk %zu (no file)\n", k);
+            break;
         }
-        lo = hi;
+        std::vector<uint8_t> blob = read_chunk_blob(file);
+        if (blob.empty()) {
+            SRV_INF("kv-chain: load_prefix: chain stops at chunk %zu (corrupt)\n", k);
+            break;
+        }
+        best_blob = std::move(blob);
+        best_n = (k + 1) * bs;
+        prev_hash = chunk_hash;
     }
 
     if (best_n > 0) {

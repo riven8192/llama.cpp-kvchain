@@ -22,7 +22,7 @@ fi
 : "${LLAMA_PARALLEL:=1}"
 
 : "${KV_CACHE_DIR:=${LLAMA_ROOT}/devops/.kv-cache}"
-: "${KV_CHAIN_LIMIT_GB:=2}"
+: "${KV_CHAIN_LIMIT_GB:=100}"
 : "${LLAMA_LOG:=${LLAMA_ROOT}/devops/.llama-server.log}"
 : "${LLAMA_PIDFILE:=${LLAMA_ROOT}/devops/.llama-server.pid}"
 

@@ -73,6 +73,7 @@ struct server_context_impl;
 struct kv_chain_ubatch_state {
     server_context_impl * ctx = nullptr;
     server_slot *         slot = nullptr;
+    uint32_t              last_hash = 0; // parent hash for the next chunk (0 = root)
 };
 
 // defined after server_context_impl (needs the full type)
@@ -895,7 +896,6 @@ private:
     // the slot whose prompt is currently being prefilled; the per-ubatch
     // callback snapshots its state. with --parallel 1 there is at most one.
     server_slot * kv_chain_prefill_slot = nullptr;
-    uint32_t      kv_chain_last_saved_pos = 0;
     kv_chain_ubatch_state kv_chain_cb_state;
 
     // snapshot the prefilling slot's state after a ubatch is committed. the
@@ -911,30 +911,46 @@ private:
         if (pos_max < 0) {
             return;
         }
-        // avoid re-saving the same boundary (the callback can fire more than once)
-        if ((uint32_t) pos_max <= kv_chain_last_saved_pos) {
+        const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
+        const size_t bs  = (size_t) kv_chain->batch_size();
+
+        // chunk boundaries are a fixed bs-grid (chunk k covers [k*bs, (k+1)*bs)).
+        // the hash chain is built from the token list alone, so it only works if
+        // both save and load agree on this grid. the runtime ubatch split does not
+        // always land on the grid (it is "chaotic" near the tail / for short
+        // prompts), so we only dump when pos is EXACTLY a bs-multiple - that is
+        // the only case where the model has computed state-as-of k*bs and the
+        // boundary is reproducible. off-grid edges are skipped.
+        if (pos % bs != 0) {
             return;
         }
-        const int n_ubatch = llama_n_ubatch(ctx_tgt);
-        const size_t n_prompt = slot.task->n_tokens();
-        const size_t pos = (size_t) pos_max + 1;
-        // only save at a ubatch boundary or at the end of the prompt
-        const bool at_boundary = (pos % (size_t) n_ubatch) == 0;
-        const bool at_end      = (pos >= n_prompt);
-        if (!at_boundary && !at_end) {
-            return;
-        }
-        kv_chain_last_saved_pos = (uint32_t) pos_max;
+        // the boundary at pos = k*bs completes chunk (k-1), which covers
+        // [(k-1)*bs, k*bs). e.g. pos=32 completes chunk 0 = [0,32).
+        const size_t chunk_n = pos / bs - 1;
+
         const size_t n = slot.prompt.n_tokens();
         if (pos > n) {
             return;
         }
+        // the chunk's own tokens are [chunk_n*bs, (chunk_n+1)*bs)
+        const size_t chunk_lo = (size_t) chunk_n * bs;
+        llama_tokens chunk_tokens;
+        chunk_tokens.reserve(bs);
+        for (size_t i = chunk_lo; i < pos; ++i) {
+            chunk_tokens.push_back(slot.prompt.tokens[i]);
+        }
+        // hash only this chunk's tokens, mixed with the parent hash (chain)
+        const uint32_t chunk_hash = kv_chain->hash_chunk(chunk_tokens, kv_chain_cb_state.last_hash);
+        kv_chain_cb_state.last_hash = chunk_hash;
+
+        // the state blob holds the full prefix [0, pos) so it is self-consistent
+        // (rows + recurrent state both as-of pos = chunk_n*bs)
         llama_tokens prefix;
         prefix.reserve(pos);
         for (size_t i = 0; i < pos; ++i) {
             prefix.push_back(slot.prompt.tokens[i]);
         }
-        kv_chain->save(slot.ctx_tgt, slot.id, prefix);
+        kv_chain->save(slot.ctx_tgt, slot.id, prefix, chunk_hash, chunk_tokens);
     }
 
     server_metrics metrics;
@@ -3163,9 +3179,9 @@ private:
 
                         // arm the per-ubatch kv-chain snapshot for this slot
                         if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
-                            kv_chain_prefill_slot    = &slot;
-                            kv_chain_last_saved_pos  = 0;
+                            kv_chain_prefill_slot      = &slot;
                             kv_chain_cb_state.slot   = &slot;
+                            kv_chain_cb_state.last_hash = 0;
                         }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
