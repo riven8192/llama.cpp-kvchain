@@ -98,6 +98,19 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 
 ## 6. Restore path (server-context.cpp, SLOT_STATE_STARTED, n_past==0, slot empty, cache_prompt)
 
+- **Native in-memory prefix caching is disabled when kv_chain is enabled**
+  (server-context.cpp:3255). When `kv_chain` is set and `cache_prompt` is true, the
+  whole native block - `slot.prompt.tokens.get_common_prefix(input_tokens)` (the LCP
+  reuse), the alora invocation-start clipping, and the `n_cache_reuse` KV-shifting
+  path - is bypassed and `n_past` is forced to 0. Reason: the disk chain is the
+  single source of truth for prefix reuse; the native LCP reuse could set n_past to
+  the LCP with the previous in-memory prompt (e.g. a divergent re-run reusing a
+  stale in-memory prefix the disk chain does not have), desyncing n_past from the
+  restored chain. A bypass notice is logged when skipped, and an UNEXPECTED
+  warning fires if the native block is ever entered while kv-chain is enabled
+  (last-resort fallback check - grep the run logs for "kv-chain: UNEXPECTED").
+  With kv-chain disabled the native block runs exactly as upstream (zero behavior
+  change; see llama_unittest_2.sh).
 - `kv_chain->load_prefix(tokens, &n_saved)` -> list of matched chunks.
   - `load_prefix` walks `<cache_dir>/<root_hash_hex>/`, stopping at the first missing/corrupt file.
   - On hit, it `utimensat`-touches every matched file (mtime=now) so LRU eviction keeps the
@@ -133,8 +146,14 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 - corruption (flip a payload byte): checksum mismatch -> chain stops -> prefill fallback,
   no crash.
 - `devops/llama_unittest_1.sh`: 250-word passage repeated verbatim. prime (cached_tokens:0)
-  and restart (cached_tokens:288, 9 chunks) BOTH reproduce 6/6 distinctive phrases ->
+  and restart (cached_tokens:320, 10 chunks) BOTH reproduce 6/6 distinctive phrases ->
   proves the full chain's attn+recurrent KV restores correctly.
+- `devops/llama_unittest_2.sh`: the zero-behavior-change counterpart. runs the server
+  WITHOUT --kv-chain-dir (native impl), sends the SAME passage twice in one session (no
+  restart - the in-memory KV cache does not survive a restart). prime (cached_tokens:0)
+  and repeat (cached_tokens:370 of 374, native get_common_prefix reuse) BOTH reproduce
+  6/6 phrases -> proves the native in-memory prefix cache is untouched when the feature
+  is disabled.
 
 ## 9. Dev tooling (devops/)
 
@@ -144,7 +163,8 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
   llama_kill.sh, llama_prompt.sh (sends /v1/completions cache_prompt:true, prints
   `cached_tokens: N prompt_tokens: M` then the full text), llama_test.sh ([restart]
   markers, trailing `-- <extra run args>`; the `--` tail must come LAST),
-  llama_unittest_1.sh (the full-chain fidelity test above).
+  llama_unittest_1.sh (the disk hash-chain restore fidelity test above),
+  llama_unittest_2.sh (the native in-memory prefix-cache check, no disk cache, no restart).
 - llama_run.sh log handling: the server writes ONLY to $log.<ts>.log (never to stdout -
   an inherited stdout pipe makes pipe-EOF-waiting callers hang forever). $log is a
   SYMLINK to the newest tslog, so the readiness wait-loop always reads the current run.
