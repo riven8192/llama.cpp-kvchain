@@ -1,5 +1,6 @@
 # runtime artifacts
 .llama-server.log
+.llama-server.log.*.log
 .llama-server.pid
 .llama-build.log
 .kv-cache/

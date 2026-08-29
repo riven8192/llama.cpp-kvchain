@@ -58,15 +58,17 @@ struct kv_chain_store {
                    const common_params & params, const llama_model * model);
 
     // saves one chunk covering the window [pos_lo, pos_hi) of seq_id's state.
-    // content-addressed by chunk_hash. chunk_tokens are this chunk's own tokens
-    // (pos_hi-pos_lo of them), stored verbatim in the header for validation.
+    // content-addressed by chunk_hash (the low 32 bits are stored in the header).
+    // chunk_tokens are this chunk's own tokens (pos_hi-pos_lo of them), stored
+    // verbatim in the header for validation.
     // returns false on failure (store disabled, io error, ...)
     bool save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
-              uint32_t chunk_hash, const llama_tokens & chunk_tokens);
+              uint64_t chunk_hash, const llama_tokens & chunk_tokens);
 
     // hash for one chunk: FNV-1a over the chunk's token ids, seeded by prev_hash
     // (prev_hash = 0 for the root chunk). this is the hash-chain step.
-    uint32_t hash_chunk(const llama_tokens & chunk_tokens, uint32_t prev_hash) const;
+    // uint64 to match the root hash (consistency); the header stores it as u32.
+    uint64_t hash_chunk(const llama_tokens & chunk_tokens, uint64_t prev_hash) const;
 
     // finds the longest saved prefix matching tokens[0..lcp). walks the chain,
     // stopping at the first missing/corrupt file. returns the matched chunks in
@@ -78,7 +80,7 @@ struct kv_chain_store {
     // on read; without this, LRU eviction would evict the hottest chains first.
     // load_prefix() already touches on hit; this is for callers that restore
     // via a different path and want the same LRU semantics.
-    void touch_chunks(const std::vector<uint32_t> & chunk_hashes) const;
+    void touch_chunks(const std::vector<uint64_t> & chunk_hashes) const;
 
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
@@ -95,9 +97,9 @@ private:
     // fills root_hash_hex. the model file is stat()ed only - never opened.
     void compute_root_hash(const common_params & params, const llama_model * model);
 
-    bool write_chunk(const fs::path & dir, uint32_t chunk_hash, const llama_tokens & chunk_tokens,
+    bool write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
                      const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr);
-    bool write_chunk_file(const fs::path & tmp, const fs::path & file, uint32_t chunk_hash,
+    bool write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
                           const llama_tokens & tokens, const std::vector<uint8_t> & attn,
                           const std::vector<uint8_t> & recr);
     void evict_oldest(uint64_t need_bytes);
@@ -106,7 +108,7 @@ private:
     static bool read_chunk(const fs::path & file, kv_chain_chunk & out);
 
     std::string root_dir;
-    std::string root_hash_hex; // 16 hex chars, identity of this model/config
+    std::string root_hash_hex; // 16 hex chars, identity of this model/config (the full u64 root hash)
     uint64_t    limit_bytes;
     int32_t     batch_size_; // chunk stride (boundary grid), not the runtime ubatch size
     uint64_t    total_bytes_cur = 0;

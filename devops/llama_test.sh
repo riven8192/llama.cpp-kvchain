@@ -58,8 +58,11 @@ for prompt in "${PROMPTS[@]}"; do
         echo "=== [4/4] llama_prompt.sh ==="
         echo "prompt: '${prompt}'"
         echo "log-file: ${DEVS}/prompt-${counter}.log"
+        PROMPT_START=$(date +%s)
         "${DEVS}/llama_prompt.sh" "${prompt}" 2>&1 | tee "${DEVS}/prompt-${counter}.log" || true
+        PROMPT_END=$(date +%s)
         echo ""
+        echo "Took: $(( PROMPT_END - PROMPT_START)) seconds"
         counter="$((counter + 1))"
     fi
 done

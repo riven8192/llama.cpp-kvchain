@@ -73,7 +73,7 @@ struct server_context_impl;
 struct kv_chain_ubatch_state {
     server_context_impl * ctx = nullptr;
     server_slot *         slot = nullptr;
-    uint32_t              last_hash = 0; // parent hash for the next chunk (0 = root)
+    uint64_t              last_hash = 0; // parent hash for the next chunk (0 = root)
 };
 
 // defined after server_context_impl (needs the full type)
@@ -940,7 +940,7 @@ private:
             chunk_tokens.push_back(slot.prompt.tokens[i]);
         }
         // hash only this chunk's tokens, mixed with the parent hash (chain)
-        const uint32_t chunk_hash = kv_chain->hash_chunk(chunk_tokens, kv_chain_cb_state.last_hash);
+        const uint64_t chunk_hash = kv_chain->hash_chunk(chunk_tokens, kv_chain_cb_state.last_hash);
         kv_chain_cb_state.last_hash = chunk_hash;
 
         // dump only THIS chunk's window [chunk_lo, pos): the attn rows and the

@@ -74,15 +74,25 @@ echo "  model : ${LLAMA_MODEL}"
 echo "  cache : ${CACHE_DESC}"
 echo "  log   : ${LLAMA_LOG}"
 
-# fully detach so the launcher shell does not wait on the server
-
+# fully detach so the launcher shell does not wait on the server.
+# IMPORTANT: the server's stdout/stderr must go to LOG FILES ONLY. if it inherited
+# this script's stdout (e.g. via `tee` or an open pipe to the caller), any caller
+# that waits for pipe-EOF (a pipeline, a tool that captures output) hangs forever
+# because the long-lived server keeps the write end open.
+#
+# each run appends to its own timestamped log ($log_ts.log); $log is a SYMLINK to
+# the newest one, so `tail -f $log` / the readiness wait-loop below always see the
+# CURRENT run's log (a restart must not be fooled by the previous run's
+# "listening on" line in a stale file).
 log_ts="$(date +%Y%m%d-%H%M%S)"
 : >"${LLAMA_PIDFILE}"
+: >"${LLAMA_LOG}.${log_ts}.log"
+ln -sf "${LLAMA_LOG}.${log_ts}.log" "${LLAMA_LOG}"
 
 setsid bash -c '
-  pidfile=$1; log=$2; tslog=$3; shift 3
-  { echo $BASHPID >"$pidfile"; exec "$@"; } </dev/null 2>&1 | tee "$log" "$tslog"
-' _ "$LLAMA_PIDFILE" "$LLAMA_LOG" "$LLAMA_LOG.$log_ts.log" \
+  pidfile=$1; tslog=$2; shift 2
+  { echo $BASHPID >"$pidfile"; exec "$@"; } </dev/null >>"$tslog" 2>&1
+' _ "$LLAMA_PIDFILE" "${LLAMA_LOG}.${log_ts}.log" \
   "$LLAMA_SERVER_BIN" "${ARGS[@]}" &
 
 for _ in {1..100}; do

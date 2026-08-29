@@ -78,8 +78,9 @@ uint64_t kv_chain_store::fnv1a64(uint64_t h, const uint8_t * data, size_t len) {
     return h;
 }
 
-uint32_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint32_t prev_hash) const {
-    // FNV-1a over this chunk's token ids, seeded by the parent hash (chain step)
+uint64_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint64_t prev_hash) const {
+    // FNV-1a over this chunk's token ids, seeded by the parent hash (chain step).
+    // the full 64-bit result is kept (the on-disk header stores its low 32 bits).
     uint64_t h = 1469598103934665603ULL ^ prev_hash;
     for (auto t : chunk_tokens) {
         const uint8_t * p = reinterpret_cast<const uint8_t *>(&t);
@@ -88,7 +89,7 @@ uint32_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint32_t 
             h *= 1099511628211ULL;
         }
     }
-    return static_cast<uint32_t>(h);
+    return h;
 }
 
 std::string kv_chain_store::hash_str(uint64_t h) {
@@ -218,7 +219,7 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
 // the recurrent rows for exactly that window (no full-prefix duplication), and
 // stores both in the chunk file. chunk_tokens are the window's tokens.
 bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
-                          uint32_t chunk_hash, const llama_tokens & chunk_tokens) {
+                          uint64_t chunk_hash, const llama_tokens & chunk_tokens) {
     if (!enabled() || ctx == nullptr || chunk_tokens.empty() || pos_hi <= pos_lo) {
         return false;
     }
@@ -242,7 +243,8 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
 }
 
 // writes the chunk file if not present; returns true if written
-bool kv_chain_store::write_chunk(const fs::path & dir, uint32_t chunk_hash, const llama_tokens & chunk_tokens,
+// (the on-disk header stores the low 32 bits of chunk_hash)
+bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
                                   const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr) {
     const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
     if (fs::exists(file)) {
@@ -267,7 +269,7 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint32_t chunk_hash, cons
     return true;
 }
 
-bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & file, uint32_t chunk_hash,
+bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
                                       const llama_tokens & tokens, const std::vector<uint8_t> & attn,
                                       const std::vector<uint8_t> & recr) {
     std::error_code ec;
@@ -279,13 +281,14 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
         }
         const uint32_t magic      = KV_CHAIN_MAGIC;
         const uint32_t version    = KV_CHAIN_VERSION;
+        const uint32_t hash32     = static_cast<uint32_t>(chunk_hash); // header field is 32-bit
         const uint32_t n_tok      = static_cast<uint32_t>(tokens.size());
         const uint32_t attn_size  = static_cast<uint32_t>(attn.size());
         const uint32_t recr_size  = static_cast<uint32_t>(recr.size());
-        f.write(reinterpret_cast<const char *>(&magic),      sizeof(magic));
-        f.write(reinterpret_cast<const char *>(&version),    sizeof(version));
-        f.write(reinterpret_cast<const char *>(&chunk_hash), sizeof(chunk_hash));
-        f.write(reinterpret_cast<const char *>(&n_tok),      sizeof(n_tok));
+        f.write(reinterpret_cast<const char *>(&magic),  sizeof(magic));
+        f.write(reinterpret_cast<const char *>(&version),sizeof(version));
+        f.write(reinterpret_cast<const char *>(&hash32), sizeof(hash32));
+        f.write(reinterpret_cast<const char *>(&n_tok),  sizeof(n_tok));
         f.write(reinterpret_cast<const char *>(tokens.data()), sizeof(llama_token) * tokens.size());
         f.write(reinterpret_cast<const char *>(&attn_size),  sizeof(attn_size));
         f.write(reinterpret_cast<const char *>(attn.data()),  attn.size());
@@ -439,12 +442,12 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     const size_t bs = (size_t) batch_size_;
     const size_t n_chunks = tokens.size() / bs;
 
-    uint32_t prev_hash = 0;
+    uint64_t prev_hash = 0;
     uint64_t total_loaded = 0;
     std::vector<fs::path> matched_files;
     for (size_t k = 0; k < n_chunks; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
-        const uint32_t chunk_hash = hash_chunk(block, prev_hash);
+        const uint64_t chunk_hash = hash_chunk(block, prev_hash);
 
         const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
         if (!fs::exists(file)) {
@@ -482,14 +485,14 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     return chunks;
 }
 
-void kv_chain_store::touch_chunks(const std::vector<uint32_t> & chunk_hashes) const {
+void kv_chain_store::touch_chunks(const std::vector<uint64_t> & chunk_hashes) const {
     if (!enabled() || chunk_hashes.empty()) {
         return;
     }
     const fs::path dir = fs::path(root_dir) / root_hash_hex;
     std::vector<fs::path> files;
     files.reserve(chunk_hashes.size());
-    for (uint32_t h : chunk_hashes) {
+    for (uint64_t h : chunk_hashes) {
         files.push_back(dir / (hash_str(h) + ".kvchunk"));
     }
     touch_chain_files(files);
