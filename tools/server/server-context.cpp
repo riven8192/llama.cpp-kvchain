@@ -1443,6 +1443,32 @@ private:
         SRV_INF("kv-chain: params kv_chain_dir='%s', kv_chain_limit_gb=%d\n",
                 params_base.kv_chain_dir.c_str(), params_base.kv_chain_limit_gb);
         if (!params_base.kv_chain_dir.empty()) {
+            // GRID-SAFETY GUARD (fatal): the hash chain only stays in sync if EVERY
+            // ubatch boundary is a multiple of the chunk stride (n_ubatch). two things
+            // can break that:
+            //  (1) a single llama_decode of n_batch tokens splits into n_batch/n_ubatch
+            //      ubatches - all on-grid only if n_batch is a multiple of n_ubatch;
+            //  (2) on KV-full the server RETRIES with n_batch /= 2 and re-slices the SAME
+            //      tokens - a mid-prompt retry re-decodes those tokens in a smaller slice,
+            //      so the halved size must ALSO be a multiple of n_ubatch, i.e.
+            //      n_batch/n_ubatch must survive arbitrary halvings => power of 2.
+            // an off-grid boundary would desync the hash chain (wrong chunk hashes,
+            // silent garbage restore), so we refuse to start instead.
+            const int32_t n_b  = (int32_t) llama_n_batch (ctx_tgt);
+            const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_tgt);
+            const int32_t ratio = (n_ub > 0) ? n_b / n_ub : 0;
+            const bool grid_safe = (n_ub > 0) && (n_b % n_ub == 0) && (ratio & (ratio - 1)) == 0;
+            if (!grid_safe) {
+                common_log_flush(common_log_main());
+                std::fprintf(stderr, "kv-chain: FATAL: -b %d / -ub %d is not grid-safe "
+                        "(n_batch must be a power-of-2 multiple of n_ubatch, so that every "
+                        "ubatch boundary - including KV-full retry halvings - lands on the "
+                        "chunk grid). use e.g. -b == -ub, or -b 2048 -ub 512. exiting.\n",
+                        n_b, n_ub);
+                std::fflush(stderr);
+                std::exit(1);
+            }
+            SRV_INF("kv-chain: grid-safe: -b %d / -ub %d = %d (power of 2)\n", n_b, n_ub, ratio);
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
                 : 0;
