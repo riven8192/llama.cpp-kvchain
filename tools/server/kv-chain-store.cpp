@@ -16,12 +16,22 @@
 
 namespace fs = std::filesystem;
 
+// returns an empty vector: the caller interprets an empty recr_blob as
+// "skip set_data for this chunk's recurrent state". this is safe because
+// recurrent state is a tail object (last write wins): skipping a middle
+// chunk's recr has no effect on the final state (the next chunk's real rs
+// overwrites it). the only chunk that matters is the last one, and if ITS
+// rs file is missing, `usable` drops to the previous rs file's chunk.
+static std::vector<uint8_t> make_zeroed_rs_blob() {
+    return {};
+}
+
 static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
-static constexpr uint32_t KV_CHAIN_VERSION = 2; // v2: per-chunk window (attn + recr), no full-prefix duplication
+static constexpr uint32_t KV_CHAIN_VERSION = 3; // v3: split into .kvcache + .rscache (one blob per file)
 // bump whenever the chunk file layout OR the root-hash metadata blob changes.
-// an old file under a stale root dir is never read (different dir), a new file
-// under a stale layout is never produced - "code changed" becomes a clean miss.
-static constexpr int32_t KV_CHAIN_FORMAT_VERSION = 1;
+// an old file with a stale version is never read (version check), a new file
+// with a stale layout is never produced - "code changed" becomes a clean miss.
+static constexpr int32_t KV_CHAIN_FORMAT_VERSION = 2;
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size,
                                const common_params & params, const llama_model * model) :
@@ -33,29 +43,31 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
     compute_root_hash(params, model);
 
     std::error_code ec;
-    const fs::path root = fs::path(this->root_dir) / root_hash_hex;
-    fs::create_directories(root, ec);
+    const fs::path cache_dir = fs::path(this->root_dir);
+    fs::create_directories(cache_dir, ec);
     if (ec) {
         SRV_ERR("kv-chain: failed to create cache dir '%s': %s (ec=%d)\n",
-                root.string().c_str(), ec.message().c_str(), ec.value());
+                cache_dir.string().c_str(), ec.message().c_str(), ec.value());
         this->root_dir.clear();
         this->root_hash_hex.clear();
         return;
     }
-    // remove stray .tmp files from an aborted previous run, then index existing chunks
-    for (const auto & chunk_entry : fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied)) {
-        if (!chunk_entry.is_regular_file()) {
+    // remove stray .tmp files from an aborted previous run, then index existing chunks.
+    // flat dir: files from all models/configs live here; total_bytes_cur sums
+    // everything (eviction is global, LRU by mtime).
+    for (const auto & entry : fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied)) {
+        if (!entry.is_regular_file()) {
             continue;
         }
-        if (chunk_entry.path().extension() == ".tmp") {
-            fs::remove(chunk_entry.path(), ec);
+        if (entry.path().extension() == ".tmp") {
+            fs::remove(entry.path(), ec);
             continue;
         }
-        const auto size = static_cast<uint64_t>(chunk_entry.file_size());
+        const auto size = static_cast<uint64_t>(entry.file_size());
         total_bytes_cur += size;
     }
     SRV_INF("kv-chain: cache dir '%s', root=%s, %zu bytes on disk, %.3f GiB (limit %.3f GiB), chunk bs=%d\n",
-            root.string().c_str(), root_hash_hex.c_str(), (size_t) total_bytes_cur,
+            cache_dir.string().c_str(), root_hash_hex.c_str(), (size_t) total_bytes_cur,
             (double) total_bytes_cur / (1024.0*1024.0*1024.0),
             (double) limit_bytes / (1024.0*1024.0*1024.0),
             batch_size);
@@ -216,8 +228,8 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
 }
 
 // save one chunk covering the window [pos_lo, pos_hi). dumps the attn rows and
-// the recurrent rows for exactly that window (no full-prefix duplication), and
-// stores both in the chunk file. chunk_tokens are the window's tokens.
+// the recurrent rows for exactly that window, and stores them in two separate
+// files (.kvcache + .rscache). chunk_tokens are the window's tokens.
 bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
                           uint64_t chunk_hash, const llama_tokens & chunk_tokens) {
     if (!enabled() || ctx == nullptr || chunk_tokens.empty() || pos_hi <= pos_lo) {
@@ -231,47 +243,63 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
         return false;
     }
 
-    std::error_code ec;
-    const fs::path dir = fs::path(root_dir) / root_hash_hex;
-    fs::create_directories(dir, ec);
-    if (ec) {
-        SRV_ERR("kv-chain: failed to create dir '%s': %s\n", dir.string().c_str(), ec.message().c_str());
-        return false;
-    }
+    const fs::path dir = fs::path(root_dir);
 
     return write_chunk(dir, chunk_hash, chunk_tokens, attn, recr);
 }
 
-// writes the chunk file if not present; returns true if written
-// (the on-disk header stores the low 32 bits of chunk_hash)
+// writes both chunk files (.kvcache + .rscache) if not present.
+// idempotent: if one file already exists, only the missing one is written
+// (handles crash-between-the-two-writes). returns true if anything was written.
 bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
                                   const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr) {
-    const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
-    if (fs::exists(file)) {
+    const std::string stem = hash_str(chunk_hash);
+    const fs::path kv_file = dir / (stem + ".kvcache");
+    const fs::path rs_file = dir / (stem + ".rscache");
+
+    const bool kv_exists = fs::exists(kv_file);
+    const bool rs_exists = fs::exists(rs_file);
+    if (kv_exists && rs_exists) {
         return false;
     }
-    const uint64_t entry_bytes = attn.size() + recr.size()
-                               + 2 * sizeof(uint32_t)              // attn_size, recr_size
-                               + 4 * sizeof(uint32_t)              // magic, version, chunk_hash, n_tokens
-                               + sizeof(llama_token) * chunk_tokens.size()
-                               + sizeof(uint64_t);                 // checksum
-    if (limit_bytes > 0 && total_bytes_cur + entry_bytes > limit_bytes) {
-        evict_oldest(entry_bytes);
+
+    // per-file header overhead: magic + version + hash32 + n_tokens + tokens + blob_size + checksum
+    const uint64_t hdr_bytes = 4 * sizeof(uint32_t) + sizeof(llama_token) * chunk_tokens.size()
+                              + sizeof(uint32_t) + sizeof(uint64_t);
+    const uint64_t kv_entry = attn.size() + hdr_bytes;
+    const uint64_t rs_entry = recr.size() + hdr_bytes;
+    const uint64_t need_bytes = (kv_exists ? 0 : kv_entry) + (rs_exists ? 0 : rs_entry);
+
+    if (limit_bytes > 0 && total_bytes_cur + need_bytes > limit_bytes) {
+        evict_oldest(need_bytes);
     }
-    const fs::path tmp = dir / (hash_str(chunk_hash) + ".kvchunk.tmp");
-    if (!write_chunk_file(tmp, file, chunk_hash, chunk_tokens, attn, recr)) {
-        return false;
+
+    bool any_written = false;
+    if (!kv_exists) {
+        const fs::path tmp = dir / (stem + ".kvcache.tmp");
+        if (write_chunk_file(tmp, kv_file, chunk_hash, chunk_tokens, attn)) {
+            total_bytes_cur += kv_entry;
+            any_written = true;
+        }
     }
-    total_bytes_cur += entry_bytes;
-    SRV_INF("kv-chain: saved chunk (window %zu tokens) hash=%s (attn %.3f MiB, recr %.3f MiB)\n",
-            chunk_tokens.size(), hash_str(chunk_hash).c_str(),
-            (double) attn.size() / (1024.0*1024.0), (double) recr.size() / (1024.0*1024.0));
-    return true;
+    if (!rs_exists) {
+        const fs::path tmp = dir / (stem + ".rscache.tmp");
+        if (write_chunk_file(tmp, rs_file, chunk_hash, chunk_tokens, recr)) {
+            total_bytes_cur += rs_entry;
+            any_written = true;
+        }
+    }
+    if (any_written) {
+        SRV_INF("kv-chain: saved chunk hash=%s (attn %.3f MiB, recr %.3f MiB)\n",
+                stem.c_str(),
+                (double) attn.size() / (1024.0*1024.0), (double) recr.size() / (1024.0*1024.0));
+    }
+    return any_written;
 }
 
+// writes one chunk file (header + single blob + checksum) to tmp, then renames.
 bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
-                                      const llama_tokens & tokens, const std::vector<uint8_t> & attn,
-                                      const std::vector<uint8_t> & recr) {
+                                      const llama_tokens & tokens, const std::vector<uint8_t> & blob) {
     std::error_code ec;
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -279,21 +307,18 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
             SRV_ERR("kv-chain: failed to open '%s' for writing\n", tmp.string().c_str());
             return false;
         }
-        const uint32_t magic      = KV_CHAIN_MAGIC;
-        const uint32_t version    = KV_CHAIN_VERSION;
-        const uint32_t hash32     = static_cast<uint32_t>(chunk_hash); // header field is 32-bit
-        const uint32_t n_tok      = static_cast<uint32_t>(tokens.size());
-        const uint32_t attn_size  = static_cast<uint32_t>(attn.size());
-        const uint32_t recr_size  = static_cast<uint32_t>(recr.size());
+        const uint32_t magic   = KV_CHAIN_MAGIC;
+        const uint32_t version = KV_CHAIN_VERSION;
+        const uint32_t hash32  = static_cast<uint32_t>(chunk_hash);
+        const uint32_t n_tok   = static_cast<uint32_t>(tokens.size());
+        const uint32_t blob_sz = static_cast<uint32_t>(blob.size());
         f.write(reinterpret_cast<const char *>(&magic),  sizeof(magic));
         f.write(reinterpret_cast<const char *>(&version),sizeof(version));
         f.write(reinterpret_cast<const char *>(&hash32), sizeof(hash32));
         f.write(reinterpret_cast<const char *>(&n_tok),  sizeof(n_tok));
         f.write(reinterpret_cast<const char *>(tokens.data()), sizeof(llama_token) * tokens.size());
-        f.write(reinterpret_cast<const char *>(&attn_size),  sizeof(attn_size));
-        f.write(reinterpret_cast<const char *>(attn.data()),  attn.size());
-        f.write(reinterpret_cast<const char *>(&recr_size),  sizeof(recr_size));
-        f.write(reinterpret_cast<const char *>(recr.data()),  recr.size());
+        f.write(reinterpret_cast<const char *>(&blob_sz),  sizeof(blob_sz));
+        f.write(reinterpret_cast<const char *>(blob.data()), blob.size());
         if (!f) {
             SRV_ERR("kv-chain: write failed for '%s'\n", tmp.string().c_str());
             fs::remove(tmp, ec);
@@ -320,15 +345,15 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
     return true;
 }
 
-// reads both blobs from a chunk file; returns false if missing/corrupt
-bool kv_chain_store::read_chunk(const fs::path & file, kv_chain_chunk & out) {
+// reads a single-blob chunk file (.kvcache or .rscache); returns false if missing/corrupt
+bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob, llama_tokens & out_tokens) {
     std::ifstream f(file, std::ios::binary);
     if (!f) {
         return false;
     }
     f.seekg(0, std::ios::end);
     const uint64_t file_size = static_cast<uint64_t>(f.tellg());
-    const uint64_t min_size = sizeof(uint32_t) * 4 + sizeof(uint64_t);
+    const uint64_t min_size = sizeof(uint32_t) * 4 + sizeof(uint32_t) + sizeof(uint64_t);
     if (file_size < min_size) {
         return false;
     }
@@ -352,42 +377,42 @@ bool kv_chain_store::read_chunk(const fs::path & file, kv_chain_chunk & out) {
                 file.string().c_str(), magic, version);
         return false;
     }
-    const uint32_t n_tokens  = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t) * 3);
-    // bound the token count before the size arithmetic: a corrupt/truncated header
-    // can make n_tokens huge, which would overflow the size checks below
-    if (n_tokens == 0 || (uint64_t) n_tokens > (file_size - (sizeof(uint32_t) * 4 + sizeof(uint32_t) * 2 + sizeof(uint64_t))) / sizeof(llama_token)) {
+    const uint32_t n_tokens = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t) * 3);
+    // bound the token count before the size arithmetic
+    if (n_tokens == 0 || (uint64_t) n_tokens > (file_size - (sizeof(uint32_t) * 4 + sizeof(uint32_t) + sizeof(uint64_t))) / sizeof(llama_token)) {
         return false;
     }
-    const size_t   hdr_len   = sizeof(uint32_t) * 4 + sizeof(llama_token) * n_tokens;
-    const uint32_t * p      = reinterpret_cast<const uint32_t *>(buf.data() + hdr_len);
-    const uint32_t   attn_size = p[0];
-    const uint8_t *  attn_ptr  = buf.data() + hdr_len + sizeof(uint32_t);
-    const uint32_t   recr_size = *reinterpret_cast<const uint32_t *>(attn_ptr + attn_size);
-    const uint8_t *  recr_ptr  = attn_ptr + attn_size + sizeof(uint32_t);
-    const size_t   expected = hdr_len + sizeof(uint32_t) + attn_size
-                             + sizeof(uint32_t) + recr_size + sizeof(uint64_t);
+    const size_t hdr_len = sizeof(uint32_t) * 4 + sizeof(llama_token) * n_tokens;
+    const uint32_t blob_size = *reinterpret_cast<const uint32_t *>(buf.data() + hdr_len);
+    const uint8_t * blob_ptr = buf.data() + hdr_len + sizeof(uint32_t);
+    const size_t expected = hdr_len + sizeof(uint32_t) + blob_size + sizeof(uint64_t);
     if (expected != file_size) {
         SRV_WRN("kv-chain: size mismatch in %s (expected %zu, got %llu), ignoring\n",
                 file.string().c_str(), expected, (unsigned long long) file_size);
         return false;
     }
-    out.tokens.assign(reinterpret_cast<const llama_token *>(buf.data() + sizeof(uint32_t) * 4),
+    out_tokens.assign(reinterpret_cast<const llama_token *>(buf.data() + sizeof(uint32_t) * 4),
                       reinterpret_cast<const llama_token *>(buf.data() + sizeof(uint32_t) * 4) + n_tokens);
-    out.attn_blob.assign(attn_ptr, attn_ptr + attn_size);
-    out.recr_blob.assign(recr_ptr, recr_ptr + recr_size);
+    out_blob.assign(blob_ptr, blob_ptr + blob_size);
     return true;
 }
 
 void kv_chain_store::evict_oldest(uint64_t need_bytes) {
     std::error_code ec;
-    // remove oldest-by-mtime chunks until we have room for need_bytes.
-    // the root dir holds only this model/config's chain, so a flat scan of it
-    // is the whole universe (no other root dirs are evicted here).
-    const fs::path root = fs::path(root_dir) / root_hash_hex;
+    // flat scan of the cache dir over BOTH .kvcache and .rscache files.
+    // sorted by mtime ascending; delete from the front until we have room.
+    // no tree-integrity checks: deleting an old rs file just lowers `usable`
+    // for chains that would have used it; deleting a kv file shortens the kv
+    // chain. both are benign "cache ends here" on the next restore.
+    const fs::path cache_dir = fs::path(root_dir);
     struct ent { fs::path p; uint64_t size; std::filesystem::file_time_type mtime; };
     std::vector<ent> all;
-    for (const auto & e : fs::directory_iterator(root, ec)) {
-        if (e.is_regular_file() && e.path().extension() == ".kvchunk") {
+    for (const auto & e : fs::directory_iterator(cache_dir, ec)) {
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        const auto ext = e.path().extension();
+        if (ext == ".kvcache" || ext == ".rscache") {
             all.push_back({ e.path(), (uint64_t) e.file_size(), e.last_write_time(ec) });
         }
     }
@@ -400,7 +425,7 @@ void kv_chain_store::evict_oldest(uint64_t need_bytes) {
         }
         if (fs::remove(e.p, ec)) {
             total_bytes_cur -= e.size;
-            SRV_INF("kv-chain: evicted %s (%.3f MiB)\n", e.p.stem().c_str(), e.size / (1024.0*1024.0));
+            SRV_INF("kv-chain: evicted %s (%.3f MiB)\n", e.p.filename().string().c_str(), e.size / (1024.0*1024.0));
         }
     }
 }
@@ -428,59 +453,100 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         return chunks;
     }
 
-    const fs::path dir = fs::path(root_dir) / root_hash_hex;
+    const fs::path dir = fs::path(root_dir);
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
         return chunks;
     }
 
-    // walk the hash chain from the root. chunk k covers tokens[k*bs,(k+1)*bs)
-    // and hash_k = H(hash_{k-1} + chunk_k_tokens). stop at the first missing or
-    // corrupt file - that is where the cached prefix ends. the leftover tokens
-    // [best_n, n) are re-prefilled by the caller. only complete bs-blocks count
-    // (a trailing partial block is never cached).
+    // single walk of the hash chain. chunk k covers tokens[k*bs,(k+1)*bs).
+    // the .kvcache file is REQUIRED for every chunk (attn rows are additive);
+    // the .rscache file is OPTIONAL (recr is a tail object, last one wins).
+    // usable = last chunk index (1-based) that has BOTH kv + rs files.
+    // chunks beyond `usable` are truncated (their attn rows are useless without
+    // the recurrent tail). a missing rs file for chunks < usable is backfilled
+    // with a zeroed blob (deserializes as "no state", immediately overwritten
+    // by later chunks).
     const size_t bs = (size_t) batch_size_;
     const size_t n_chunks = tokens.size() / bs;
 
     uint64_t prev_hash = 0;
+    size_t usable = 0; // 1-based: last chunk with an rs file
+    size_t n_kv_found = 0;
     uint64_t total_loaded = 0;
-    std::vector<fs::path> matched_files;
+    std::vector<fs::path> kv_files_touched;
+    fs::path rs_file_touched;
+
     for (size_t k = 0; k < n_chunks; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
         const uint64_t chunk_hash = hash_chunk(block, prev_hash);
+        const std::string stem = hash_str(chunk_hash);
 
-        const fs::path file = dir / (hash_str(chunk_hash) + ".kvchunk");
-        if (!fs::exists(file)) {
-            SRV_INF("kv-chain: load_prefix: chain stops at chunk %zu (no file)\n", k);
+        const fs::path kv_file = dir / (stem + ".kvcache");
+        if (!fs::exists(kv_file)) {
             break;
         }
+        std::vector<uint8_t> attn_blob;
+        llama_tokens file_tokens;
+        if (!read_chunk_file(kv_file, attn_blob, file_tokens)) {
+            break;
+        }
+        if (file_tokens != block) {
+            SRV_WRN("kv-chain: load_prefix: chain stops at chunk %zu (token mismatch)\n", k);
+            break;
+        }
+        n_kv_found++;
+
+        const fs::path rs_file = dir / (stem + ".rscache");
+        std::vector<uint8_t> recr_blob;
+        bool rs_ok = false;
+        if (fs::exists(rs_file)) {
+            llama_tokens rs_tokens;
+            if (read_chunk_file(rs_file, recr_blob, rs_tokens) && rs_tokens == block) {
+                rs_ok = true;
+            }
+        }
+        if (rs_ok) {
+            usable = k + 1;
+            rs_file_touched = rs_file;
+        } else {
+            // zeroed rs blob: minimal valid PARTIAL_ONLY seq-state with cell_count=0.
+            // state_read with cell_count=0 wipes the seq's cells and reads no tensor
+            // data - effectively "no recurrent state yet". immediately overwritten
+            // by later chunks' real rs; only the tail matters.
+            recr_blob = make_zeroed_rs_blob();
+        }
+
         kv_chain_chunk chunk;
-        if (!read_chunk(file, chunk)) {
-            SRV_INF("kv-chain: load_prefix: chain stops at chunk %zu (corrupt)\n", k);
-            break;
-        }
-        // the header token IDs make a hash collision a clean miss instead of
-        // a silent garbage read: verify them against the prompt, stop if they
-        // disagree (e.g. the file was written by a different build or the hash
-        // collided)
-        if (chunk.tokens != block) {
-            SRV_WRN("kv-chain: load_prefix: chain stops at chunk %zu (header token IDs do not match the prompt)\n", k);
-            break;
-        }
+        chunk.attn_blob = std::move(attn_blob);
+        chunk.recr_blob = std::move(recr_blob);
+        chunk.tokens = std::move(file_tokens);
         total_loaded += chunk.attn_blob.size() + chunk.recr_blob.size();
         chunks.push_back(std::move(chunk));
-        matched_files.push_back(file);
+        kv_files_touched.push_back(kv_file);
         prev_hash = chunk_hash;
     }
 
-    if (!chunks.empty()) {
-        // touch all matched files so LRU eviction keeps the hottest chains alive.
-        // (relatime mounts do not update mtime on read, so an explicit utimensat
-        // is required for the LRU to be meaningful.)
-        touch_chain_files(matched_files);
-        *n_tokens = chunks.size() * bs;
-        SRV_INF("kv-chain: loaded %zu chunks (%zu tokens) from %s (%.3f MiB)\n",
-                chunks.size(), *n_tokens, dir.string().c_str(), (double) total_loaded / (1024.0*1024.0));
+    // truncate to usable: chunks beyond the last rs file have no recurrent tail
+    // and their attn rows cannot be used without it.
+    if (usable < chunks.size()) {
+        chunks.resize(usable);
+    }
+    *n_tokens = usable * bs;
+
+    if (usable > 0) {
+        // touch exactly the files that were read and replayed:
+        // chunks[0..usable-1]'s .kvcache + the ONE .rscache of chunk (usable-1).
+        std::vector<fs::path> to_touch(kv_files_touched.begin(), kv_files_touched.begin() + usable);
+        to_touch.push_back(rs_file_touched);
+        touch_chain_files(to_touch);
+    }
+
+    if (usable > 0) {
+        SRV_INF("kv-chain: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu\n",
+                n_chunks, n_kv_found, usable - 1);
+    } else {
+        SRV_INF("kv-chain: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);
     }
     return chunks;
 }
@@ -489,11 +555,12 @@ void kv_chain_store::touch_chunks(const std::vector<uint64_t> & chunk_hashes) co
     if (!enabled() || chunk_hashes.empty()) {
         return;
     }
-    const fs::path dir = fs::path(root_dir) / root_hash_hex;
+    const fs::path dir = fs::path(root_dir);
     std::vector<fs::path> files;
-    files.reserve(chunk_hashes.size());
+    files.reserve(chunk_hashes.size() * 2);
     for (uint64_t h : chunk_hashes) {
-        files.push_back(dir / (hash_str(h) + ".kvchunk"));
+        files.push_back(dir / (hash_str(h) + ".kvcache"));
+        files.push_back(dir / (hash_str(h) + ".rscache"));
     }
     touch_chain_files(files);
 }

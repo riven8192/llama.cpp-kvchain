@@ -22,14 +22,17 @@ struct kv_chain_chunk {
 };
 
 // disk-backed, content-addressed KV state store
-// layout: <root_dir>/<root_hash_hex>/<chunk_hash_hex>.kvchunk
-// the root_hash dir is the model/config identity (see metadata_blob); one
-// directory per model/config, one file per chunk.
-// chunk file: u32 magic, u32 version, u32 chunk_hash, u32 n_tokens,
-//             llama_token[n_tokens], u32 attn_size, attn_blob[attn_size],
-//             u32 recr_size, recr_blob[recr_size], u64 fnv1a checksum of everything before it
-// both blobs are self-contained seq-state blobs (each carries its own io_magic,
-// src_seq, module header) so they can be fed straight to the state_seq_set API.
+// layout (v3): <cache_dir>/<chunk_hash_hex>.kvcache  (attn only)
+//              <cache_dir>/<chunk_hash_hex>.rscache  (recr only)
+// flat directory (no per-model subdirs). the root hash is still computed and
+// used to validate the metadata; files from different models/configs simply
+// never match because the chunk hashes differ (they are seeded by the root).
+//
+// each file: u32 magic KVC1, u32 version=3, u32 hash32, u32 n_tokens,
+//            llama_token[n_tokens], u32 blob_size, blob[blob_size],
+//            u64 fnv1a checksum of everything before it.
+// the blob is a self-contained seq-state blob (carries its own io_magic,
+// src_seq, module header) so it can be fed straight to the state_seq_set API.
 //
 // root_hash = FNV-1a64 over a canonical metadata blob. everything in the blob
 // must affect the numeric content or LAYOUT of cached KV values, so that any
@@ -100,12 +103,11 @@ private:
     bool write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
                      const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr);
     bool write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
-                          const llama_tokens & tokens, const std::vector<uint8_t> & attn,
-                          const std::vector<uint8_t> & recr);
+                          const llama_tokens & tokens, const std::vector<uint8_t> & blob);
     void evict_oldest(uint64_t need_bytes);
 
-    // reads both blobs from a chunk file; returns false if missing/corrupt
-    static bool read_chunk(const fs::path & file, kv_chain_chunk & out);
+    // reads a single-blob chunk file (.kvcache or .rscache); returns false if missing/corrupt
+    static bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob, llama_tokens & out_tokens);
 
     std::string root_dir;
     std::string root_hash_hex; // 16 hex chars, identity of this model/config (the full u64 root hash)

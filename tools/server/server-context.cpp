@@ -3541,14 +3541,20 @@ private:
                                         ok = false;
                                         break;
                                     }
-                                    const size_t n_recr = llama_state_seq_set_data_window_ext(ctx_tgt,
-                                            chunks[k].recr_blob.data(), chunks[k].recr_blob.size(), slot.id,
-                                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, pos_lo, pos_hi);
-                                    if (n_recr != chunks[k].recr_blob.size()) {
-                                        SLT_WRN(slot, "kv-chain: recr restore failed at chunk %zu (%zu of %zu bytes)\n",
-                                                k, n_recr, chunks[k].recr_blob.size());
-                                        ok = false;
-                                        break;
+                                    // empty recr_blob = "skip" (rs file was evicted for this
+                                    // chunk). safe: recurrent state is a tail object (last
+                                    // write wins), so skipping a middle chunk's recr has no
+                                    // effect on the final state (the last chunk's real rs wins).
+                                    if (!chunks[k].recr_blob.empty()) {
+                                        const size_t n_recr = llama_state_seq_set_data_window_ext(ctx_tgt,
+                                                chunks[k].recr_blob.data(), chunks[k].recr_blob.size(), slot.id,
+                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, pos_lo, pos_hi);
+                                        if (n_recr != chunks[k].recr_blob.size()) {
+                                            SLT_WRN(slot, "kv-chain: recr restore failed at chunk %zu (%zu of %zu bytes)\n",
+                                                    k, n_recr, chunks[k].recr_blob.size());
+                                            ok = false;
+                                            break;
+                                        }
                                     }
                                 }
                                 if (ok) {
