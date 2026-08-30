@@ -544,7 +544,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
 
     if (usable > 0) {
         SRV_INF("kv-chain: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu\n",
-                n_chunks, n_kv_found, usable - 1);
+                n_chunks, n_kv_found, usable);
     } else {
         SRV_INF("kv-chain: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);
     }

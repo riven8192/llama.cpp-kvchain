@@ -48,13 +48,15 @@ echo "=== [3/4] llama_run.sh ==="
 run_server
 echo ""
 
-counter=1
+counter=0
 for prompt in "${PROMPTS[@]}"; do
     if [ "${prompt}" = '[restart]' ]; then
         echo "=== [restart] ==="
         run_server
         echo ""
     else
+        counter="$((counter + 1))"
+
         echo "=== [4/4] llama_prompt.sh ==="
         echo "prompt: '${prompt}'"
         echo "log-file: ${DEVS}/prompt-${counter}.log"
@@ -63,9 +65,11 @@ for prompt in "${PROMPTS[@]}"; do
         PROMPT_END=$(date +%s)
         echo ""
         echo "Took: $(( PROMPT_END - PROMPT_START)) seconds"
-        counter="$((counter + 1))"
     fi
 done
 
 echo "=== chunks on disk ==="
 find "${KV_CACHE_DIR}" -name '*.kvchunk' 2>/dev/null -exec ls -la {} \; || echo "(none)"
+
+echo "=== distinct process log-files ==="
+ls -a | grep '\.llama-server\.log' | sort | tail -n "${counter}"

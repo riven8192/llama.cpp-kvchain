@@ -3513,10 +3513,27 @@ private:
                             }
                         }
 
-                        if (kv_chain && n_past == 0 && slot.prompt.n_tokens() == 0 && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
-                            // restore a saved prefix from the disk hash-chain cache
+                        if (kv_chain) {
+                            SLT_INF(slot, "kv-chain: restore check: n_past=%d prompt.n_tokens=%zu cache_prompt=%d has_mtmd=%d input_n=%zu\n",
+                                    n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
+                                    (int) input_tokens.has_mtmd, input_tokens.size());
+                        }
+                        if (kv_chain && n_past == 0 && slot.prompt.n_tokens() == 0 && slot.task->params.cache_prompt) {
+                            // restore a saved prefix from the disk hash-chain cache.
+                            // note: we do NOT guard on input_tokens.has_mtmd here because
+                            // it reflects the MODEL's capability (mctx != nullptr), not
+                            // whether THIS prompt actually contains media. a text-only
+                            // prompt to a multimodal-capable model has has_mtmd=true but
+                            // no actual media chunks, and the kv-chain restore is still
+                            // valid (all tokens are text, no image/audio rows in the KV).
                             size_t n_saved = 0;
-                            const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(input_tokens.get_tokens(), &n_saved);
+                            // get_text_tokens() (not get_tokens()): the latter asserts !has_mtmd,
+                            // but has_mtmd reflects the model's capability (mctx != nullptr, true
+                            // when an mmproj file is present), NOT whether this prompt has media.
+                            // a text-only prompt to a multimodal-capable model has has_mtmd=true
+                            // but no LLAMA_TOKEN_NULL entries, so get_text_tokens() returns all tokens.
+                            const llama_tokens text_tokens = input_tokens.get_text_tokens();
+                            const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
                             if (!chunks.empty() && n_saved > 0) {
                                 // replay the matched chunks in order. each chunk holds the
                                 // attn rows and recurrent rows for its own window [k*bs,(k+1)*bs).
