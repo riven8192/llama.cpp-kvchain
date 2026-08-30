@@ -12,8 +12,10 @@ fi
 : "${LLAMA_BUILD_DIR:=${LLAMA_ROOT}/build-vulkan}"
 : "${LLAMA_SERVER_BIN:=${LLAMA_BUILD_DIR}/bin/llama-server}"
 
-# : "${LLAMA_MODEL:=$(ls /home/riven/.cache/huggingface/hub/models--unsloth--Qwen3-4B-Instruct-2507-GGUF/snapshots/*/Qwen3-4B-Instruct-2507-Q8_0.gguf 2>/dev/null | head -1)}"
-: "${LLAMA_MODEL:=$(ls /home/riven/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/*/Qwen3.8-27B-UD-Q8_K_XL.gguf 2>/dev/null | head -1)}"
+# HF model ref "<user>/<repo>:<quant>" - llama-server resolves it to the exact
+# cached file (and downloads it if missing), picking the right snapshot revision
+# instead of guessing 'head -1' out of the snapshots dir.
+: "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
 
 
 : "${LLAMA_HOST:=127.0.0.1}"
@@ -29,8 +31,3 @@ fi
 : "${LLAMA_PIDFILE:=${LLAMA_ROOT}/devops/.llama-server.pid}"
 
 LLAMA_URL="http://${LLAMA_HOST}:${LLAMA_PORT}"
-
-# resolve a relative model path against $HOME if it starts with ~
-case "${LLAMA_MODEL}" in
-  "~"*) LLAMA_MODEL="${HOME}/${LLAMA_MODEL#\~/}" ;;
-esac

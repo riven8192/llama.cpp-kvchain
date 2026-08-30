@@ -29,8 +29,8 @@ if [[ ! -x "${LLAMA_SERVER_BIN}" ]]; then
   echo "server binary not found: ${LLAMA_SERVER_BIN} (run devops/build.sh first)" >&2
   exit 1
 fi
-if [[ -z "${LLAMA_MODEL}" || ! -f "${LLAMA_MODEL}" ]]; then
-  echo "model not found: '${LLAMA_MODEL}' (set LLAMA_MODEL)" >&2
+if [[ -z "${LLAMA_HF_REF}" ]]; then
+  echo "no HF model ref (set LLAMA_HF_REF, e.g. 'unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL')" >&2
   exit 1
 fi
 
@@ -48,7 +48,7 @@ if [[ ${NO_KV_CHAIN} -eq 0 ]]; then
 fi
 
 ARGS=(
-  -m "${LLAMA_MODEL}"
+  -hf "${LLAMA_HF_REF}"
   --host "${LLAMA_HOST}"
   --port "${LLAMA_PORT}"
   -c "${LLAMA_CTX}"
@@ -70,7 +70,7 @@ else
 fi
 
 echo "starting llama-server on ${LLAMA_URL}"
-echo "  model : ${LLAMA_MODEL}"
+echo "  model : ${LLAMA_HF_REF}"
 echo "  cache : ${CACHE_DESC}"
 echo "  log   : ${LLAMA_LOG}"
 
