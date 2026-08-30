@@ -231,6 +231,10 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
       i.e. n_batch/n_ubatch must survive arbitrary halvings => power of 2.
   `-b == -ub` (ratio 1 = 2^0) is the trivially-safe choice; `-b 2048 -ub 512` (ratio 4) is
   also fine. `-b 2048 -ub 300` is NOT (and the trailing N mod n_ubatch partial chunk is
-  re-prefilled either way). NOT enforced in code yet - a startup guard is a follow-up.
+   re-prefilled either way). ENFORCED in code: when --kv-chain-dir is set, the server
+   exits(1) at startup unless n_batch % n_ubatch == 0 AND n_batch/n_ubatch is a power of
+   2 (server-context.cpp, kv_chain_store construction). logs "kv-chain: grid-safe" on
+   success, a FATAL message + exit on failure. with kv-chain off, no check (zero
+   behavior change).
 - Each chunk is ~152 MiB at -ub 32 (constant). A 1000-tok prompt (~30 chunks) is ~4.5 GiB.
   `KV_CHAIN_LIMIT_GB` default 100.
