@@ -3,7 +3,11 @@
 Base: llama.cpp b10520, branch `hash-chain-kv`. Local hack, not upstream-grade
 (see `../docs/project-plan.md` for the design). The code is the source of truth
 for HOW things work; this file only holds what/where + test results + quirks.
-Model: Qwen3.8-27B (16 full-attn layers + 48 Gated DeltaNet recurrent layers).
+Model: Qwen3.8-27B (16 full-attn layers + 48 Gated DeltaNet recurrent layers),
+selected via `LLAMA_HF_REF` (devops/env.sh, default
+`unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL`) — passed to llama-server as `-hf`, which
+resolves the exact snapshot file (and downloads it if missing). The kv-chain
+root hash uses the resolved path, so cache identity follows the ref.
 
 ## 1. Where things live
 
@@ -63,6 +67,8 @@ version) so a different model/config is a clean miss, never garbage.
 - `devops/llama_unittest_2.sh`: zero-behavior-change counterpart (no
   --kv-chain-dir, same prompt twice in one session): native
   get_common_prefix reuse (cached_tokens:370 of 374) reproduces 6/6 phrases.
+- grid-safety guard: `-b 96 -ub 32` -> FATAL + exit(1); `-b 64 -ub 32` ->
+  starts, logs "grid-safe ... = 2 (power of 2)".
 - `devops/llama_ubatch_probe.sh` (29474-tok prompt, -b 2048 -ub 2048 -c 65536):
   with the checkpoint gate, prefill = 14x2048 ON-GRID + one 802 OFF-GRID tail
   (29474 = 14*2048 + 802). Before the gate the tail was ragged (802/2044/4).
