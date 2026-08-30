@@ -74,6 +74,12 @@ struct kv_chain_ubatch_state {
     server_context_impl * ctx = nullptr;
     server_slot *         slot = nullptr;
     uint64_t              last_hash = 0; // parent hash for the next chunk (0 = root)
+    // [DEBUG] per-ubatch info, filled by llama_decode's ubatch loop before the
+    // callback fires; lets the hook log the real ubatch boundary without
+    // re-deriving it from the memory module.
+    uint32_t              ub_n_tokens   = 0; // ubatch.n_tokens (tokens in this ubatch)
+    int32_t               ub_pos_first  = -1; // ubatch.pos[0] (position of the first token)
+    int32_t               ub_pos_last   = -1; // ubatch.pos[n_tokens-1] (position of the last token)
 };
 
 // defined after server_context_impl (needs the full type)
@@ -903,7 +909,7 @@ private:
     // n_ubatch-aligned boundaries (and the final position), so chunk k holds the
     // state of the prefix [0, k*n_ubatch]. the position is read from the memory
     // module (authoritative); the token list is sliced to match.
-    void kv_chain_save_prefill_ubatch(server_slot & slot) {
+    void kv_chain_save_prefill_ubatch(server_slot & slot, uint32_t n_pos_last) {
         if (!kv_chain || kv_chain_prefill_slot != &slot) {
             return;
         }
@@ -913,6 +919,23 @@ private:
         }
         const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
         const size_t bs  = (size_t) kv_chain->batch_size();
+
+        // [DEBUG] log every ubatch boundary during prefill so we can see the
+        // real ubatch split (n_tokens, pos range) and whether it lands on the
+        // bs-grid. this is the investigation for the mid-prompt ragged-ubatch
+        // problem: if a ubatch boundary falls off-grid mid-prompt, the hash
+        // chain desyncs. run with -ub 256 -b 256 and a long prompt.
+        //   pos            = seq_pos_max+1 = tokens committed so far (memory module, authoritative)
+        //   cb_n_pos_last  = ubatch.pos[last] passed by llama_decode (the boundary just completed)
+        //   ub_lo/ub_hi    = first/last position of this ubatch's tokens
+        const int32_t ub_lo = (kv_chain_cb_state.ub_n_tokens > 0)
+                            ? kv_chain_cb_state.ub_pos_first : -1;
+        const int32_t ub_hi = (kv_chain_cb_state.ub_n_tokens > 0)
+                            ? kv_chain_cb_state.ub_pos_last  : -1;
+        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d ub_n=%d ub_pos=[%d..%d] pos%%bs=%d %s\n",
+                (int) pos, (int) n_pos_last, (int) kv_chain_cb_state.ub_n_tokens,
+                ub_lo, ub_hi, (int) (pos % bs),
+                (pos % bs == 0) ? "ON-GRID" : "OFF-GRID");
 
         // chunk boundaries are a fixed bs-grid (chunk k covers [k*bs, (k+1)*bs)).
         // the hash chain is built from the token list alone, so it only works if
@@ -2904,6 +2927,18 @@ private:
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
+                // [DEBUG] log each highlevel decode() call that processes a
+                // PROMPT slice (n_tokens > 1). counting these shows whether ONE
+                // prompt is fed to llama_decode in a single call or sliced into
+                // many (n_batch = llama_n_batch, the -b value; off = running
+                // offset). the n_tokens > 1 guard skips the per-token decode
+                // calls (n_tokens == 1) that fire during generation, which would
+                // otherwise spam the console one line per output token.
+                if (n_tokens > 1) {
+                    SRV_INF("kv-chain[decode]: batch.size=%d off=%d n_tokens=%d n_batch=%d\n",
+                            (int) batch.size(), off, n_tokens, n_batch);
+                }
+
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
@@ -3573,6 +3608,22 @@ private:
                     }
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+
+                    // [kv-chain] context checkpoints are redundant AND harmful when the
+                    // disk hash-chain cache is enabled: (1) they are a weaker, in-memory,
+                    // single-session version of the same "save point" the disk chain
+                    // provides (and the chain survives restart + is shared across
+                    // sessions); (2) the checkpoint logic BREAKS the prompt batch early
+                    // (checkpoint_offsets = {4+n_ubatch, 4}), which fragments the tail
+                    // into ragged, off-grid ubatches (e.g. 1675/2044/4 instead of
+                    // 2048/2048) and desyncs the hash chain - we lose whole chunks of
+                    // reuse. for a 150K-token prompt the first checkpoint break can
+                    // strand most of the prefix. so when kv_chain is set, disable
+                    // checkpoints entirely (the disk chain is the source of truth for
+                    // prefix reuse). with kv-chain off this runs exactly as upstream.
+                    if (kv_chain) {
+                        do_checkpoint = false;
+                    }
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -4270,12 +4321,15 @@ private:
     }
 };
 
-static void kv_chain_cb_ubatch(void * user_data, uint32_t /*n_pos*/) {
+static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos_last) {
     auto * s = static_cast<kv_chain_ubatch_state *>(user_data);
     if (s == nullptr || s->ctx == nullptr || s->slot == nullptr) {
         return;
     }
-    s->ctx->kv_chain_save_prefill_ubatch(*s->slot);
+    // [DEBUG] n_pos_last = position of the last token of the ubatch that just
+    // committed (the boundary). the hook also reads the authoritative pos from
+    // the memory module; logging both lets us see if they ever disagree.
+    s->ctx->kv_chain_save_prefill_ubatch(*s->slot, n_pos_last);
 }
 
 //

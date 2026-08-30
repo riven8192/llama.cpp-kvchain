@@ -5,3 +5,6 @@
 .llama-build.log
 .kv-cache/
 prompt-*.log
+
+# large prompt fixtures (pasted in for the ubatch-grid probe; not source)
+prompt_30k.txt

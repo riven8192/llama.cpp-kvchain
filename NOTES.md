@@ -85,16 +85,41 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 
 - Per-ubatch hook: `llama_context_params.cb_ubatch(cb_ubatch_data)` (llama.h), copied into
   cparams (llama-cparams.h, llama-context.cpp), fired in `llama_decode`'s ubatch loop after
-  each ubatch commits (the server sees the whole prompt as ONE llama_decode call, so the
-  hook had to go inside it).
-- `kv_chain_save_prefill_ubatch` (server-context.cpp:906): arms during prefill (armed in
-  SLOT_STATE_STARTED, cleared at DONE_PROMPT->GENERATING - decode-generated state is
-  worthless to cache). Reads pos from `llama_memory_seq_pos_max` (authoritative; the
-  context-side ubatch.pos / seq_pos_max inside the callback were stale). Dumps a chunk ONLY
-  when `pos % bs == 0` (on-grid): the runtime ubatch split is "chaotic" near the tail / for
-  short prompts, so off-grid edges are skipped ("stop at the edge of the happy flow"). No
-  dedup state needed (pos is strictly increasing). Calls `kv_chain->save(ctx, seq,
-  pos_lo=chunk_lo, pos_hi=pos, chunk_hash, chunk_tokens)`.
+  each ubatch commits. the 2nd arg is `ubatch.pos[n_tokens-1]` (the boundary just
+  completed); the hook ALSO reads the authoritative pos from the memory module.
+- **How the server feeds the prompt (verified, not assumed):** the server does NOT send the
+  whole prompt as one `llama_decode`. `update_slots` fills a batch of <= `n_batch` tokens
+  (the `-b` value) per iteration, and the slice loop (server-context.cpp:2924) feeds each
+  batch to `llama_decode` in `min(n_batch, remaining)` views. with `-b == -ub == B` each
+  view is one `llama_decode` call -> one ubatch of B tokens. a prompt of N tokens therefore
+  becomes `floor(N/B)` full B-ubatches + one trailing `N mod B` partial ubatch. the
+  `print_timing` progress lines are printed in `post_decode` (AFTER each `llama_decode`),
+  so the diffs between consecutive `n_tokens =` values = the per-decode batch sizes.
+- **Context checkpoints are DISABLED when kv_chain is set** (server-context.cpp:3621,
+  `if (kv_chain) do_checkpoint = false;`). WHY: upstream checkpoints break the prompt batch
+  early at `checkpoint_offsets = {4+n_ubatch, 4}` to create a save point, which fragments
+  the tail into ragged, OFF-GRID ubatches (observed: a 29474-tok prompt at -b 2048 gave a
+  `802/2044/4` tail instead of one `802`). our chunk files ARE already superior checkpoints
+  (attn+recurrent state at every B-boundary, content-addressed, survive restart), so the
+  in-memory ones are redundant AND they desync the hash chain. with the gate, the tail is a
+  single `N mod B` partial chunk (verified: 29474 -> 14x2048 ON-GRID + one 802 OFF-GRID).
+  with kv-chain off, checkpoints run exactly as upstream (zero behavior change).
+- `kv_chain_save_prefill_ubatch` (server-context.cpp:912): arms during prefill (armed in
+  SLOT_STATE_STARTED, cleared at the transition to SLOT_STATE_GENERATING - decode-generated
+  state is worthless to cache, and the clearing is also what keeps the per-ubatch log from
+  spamming during generation). Reads pos from `llama_memory_seq_pos_max` (authoritative).
+  Dumps a chunk ONLY when `pos % bs == 0` (on-grid); off-grid edges (the trailing partial
+  chunk) are skipped. No dedup state needed (pos is strictly increasing). Calls
+  `kv_chain->save(ctx, seq, pos_lo=chunk_lo, pos_hi=pos, chunk_hash, chunk_tokens)`.
+- **Debug logging (INFO, kept for future debugging):**
+  - `kv-chain[decode]: batch.size off n_tokens n_batch` - one per highlevel `llama_decode`
+    call that processes a PROMPT slice (`n_tokens > 1` guard skips the per-token gen calls
+    that would otherwise spam one line per output token).
+  - `kv-chain[ubatch]: pos cb_n_pos_last ub_n ub_pos=[lo..hi] pos%bs ON/OFF-GRID` - one per
+    internal ubatch, PREFILL ONLY (the `kv_chain_prefill_slot` guard means it never fires
+    during generation). `pos` = memory-module seq_pos_max+1; `cb_n_pos_last` = ubatch.pos
+    last (always `pos-1`, verified); `ub_n`/`ub_pos` = the ubatch's own token count + range
+    (plumbed through `kv_chain_ubatch_state` from llama_decode's ubatch loop).
 
 ## 6. Restore path (server-context.cpp, SLOT_STATE_STARTED, n_past==0, slot empty, cache_prompt)
 
@@ -154,6 +179,13 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
   and repeat (cached_tokens:370 of 374, native get_common_prefix reuse) BOTH reproduce
   6/6 phrases -> proves the native in-memory prefix cache is untouched when the feature
   is disabled.
+- **ubatch-grid verification (`devops/llama_ubatch_probe.sh`, -ub 2048 -b 2048 -c 65536,
+  29474-tok prompt):** with the checkpoint gate ON, prefill produced 14x2048 ON-GRID
+  ubatches + ONE trailing 802 OFF-GRID partial chunk (29474 = 14*2048 + 802). BEFORE the
+  gate the same prompt gave a ragged `802/2044/4` tail (checkpoints breaking the batch
+  early). confirms the hash chain stays in sync for the whole prompt and only the single
+  trailing partial chunk is re-prefilled. the middle of the prompt is always clean (the
+  raggedness is tail-only, deterministic server behavior, not random).
 
 ## 9. Dev tooling (devops/)
 
@@ -164,7 +196,10 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
   `cached_tokens: N prompt_tokens: M` then the full text), llama_test.sh ([restart]
   markers, trailing `-- <extra run args>`; the `--` tail must come LAST),
   llama_unittest_1.sh (the disk hash-chain restore fidelity test above),
-  llama_unittest_2.sh (the native in-memory prefix-cache check, no disk cache, no restart).
+  llama_unittest_2.sh (the native in-memory prefix-cache check, no disk cache, no restart),
+  llama_ubatch_probe.sh (paste a long prompt into it; sends it to the dev server and greps
+  the `kv-chain[decode]`/`kv-chain[ubatch]` boundary lines out of the log - used to verify
+  the ubatch grid / the checkpoint-gate fix above).
 - llama_run.sh log handling: the server writes ONLY to $log.<ts>.log (never to stdout -
   an inherited stdout pipe makes pipe-EOF-waiting callers hang forever). $log is a
   SYMLINK to the newest tslog, so the readiness wait-loop always reads the current run.
@@ -174,9 +209,28 @@ recurrent layers). Local hack - public API changed freely, not upstream-grade.
 - Gated DeltaNet recurrent state is NON-INVERTIBLE: resume only FROM a boundary, never roll
   back to m<n. Never "strip the last token" from a chunk.
 - `-ub` has a lower bound of 32 (`-ub 8` is silently ignored -> 2048). Use `-ub 32` for tests.
-- `chunk_size` (--ubatch) is a BOUNDARY STRIDE, not the runtime prefill batch size. The hybrid
-  `split_equal` (llama-memory-hybrid.cpp:89) divides n_ubatch across n_seqs and is chaotic near
-  the tail / for short prompts. We only dump when `pos % bs == 0`; do not try to make chunk
-  edges match the runtime split.
+- `chunk_size` (--ubatch) is a BOUNDARY STRIDE. With `-b == -ub == B` the server feeds the
+  prompt in B-sized `llama_decode` slices, each becoming ONE on-grid B-ubatch; only the
+  trailing `N mod B` partial ubatch is off-grid (and skipped). The raggedness is TAIL-ONLY
+  and deterministic - it is NOT random mid-prompt chaos. The one thing that USED to break
+  the grid mid-tail was upstream context-checkpoints (batch breaks at {4+n_ubatch, 4});
+  that is now disabled when kv_chain is set (see section 5). We only dump when
+  `pos % bs == 0`.
+- **n_batch vs n_ubatch (why two knobs):** n_batch (logical) = how many tokens the SERVER
+  stages per llama_decode (outer slice loop, server-context.cpp:2924); n_ubatch (physical)
+  = how many tokens ONE ggml graph eval / ubatch processes (the GPU micro-batch, controls
+  peak prefill VRAM). invariant: n_ubatch = min(n_batch, n_ubatch) (llama-context.cpp:250),
+  so n_ubatch can never exceed n_batch. the chunk stride is n_ubatch, so the hash chain
+  stays in sync only if EVERY ubatch boundary is a multiple of n_ubatch.
+- **The grid-safety rule: n_batch / n_ubatch must be a power of 2.** two reasons:
+  (1) a single llama_decode of n_batch tokens splits into n_batch/n_ubatch ubatches - all
+      on-grid only if n_batch is a multiple of n_ubatch;
+  (2) on KV-full the server RETRIES with n_batch /= 2 and re-slices the SAME tokens
+      (server-context.cpp:3907, off does not advance) - a mid-prompt retry re-decodes those
+      tokens in a smaller slice, so the halved size must ALSO be a multiple of n_ubatch,
+      i.e. n_batch/n_ubatch must survive arbitrary halvings => power of 2.
+  `-b == -ub` (ratio 1 = 2^0) is the trivially-safe choice; `-b 2048 -ub 512` (ratio 4) is
+  also fine. `-b 2048 -ub 300` is NOT (and the trailing N mod n_ubatch partial chunk is
+  re-prefilled either way). NOT enforced in code yet - a startup guard is a follow-up.
 - Each chunk is ~152 MiB at -ub 32 (constant). A 1000-tok prompt (~30 chunks) is ~4.5 GiB.
   `KV_CHAIN_LIMIT_GB` default 100.

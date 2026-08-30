@@ -1968,9 +1968,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // [EXPERIMENTAL] kv-chain hook: notify after this ubatch is fully
         // committed so the caller can snapshot the state (the caller reads the
-        // position from the memory module, which is authoritative here)
+        // position from the memory module, which is authoritative here).
+        // the 2nd arg is the position of the last token of this ubatch (the
+        // boundary just completed). we also stash the ubatch's n_tokens + pos
+        // range into the user_data (a kv_chain_ubatch_state*) so the hook can
+        // log the real split.
         if (cparams.cb_ubatch) {
-            cparams.cb_ubatch(cparams.cb_ubatch_data, 0);
+            struct kv_chain_ubatch_state {
+                void * ctx = nullptr;
+                void * slot = nullptr;
+                uint64_t last_hash = 0;
+                uint32_t ub_n_tokens   = 0;
+                int32_t  ub_pos_first  = -1;
+                int32_t  ub_pos_last   = -1;
+            };
+            auto * s = reinterpret_cast<kv_chain_ubatch_state *>(cparams.cb_ubatch_data);
+            if (s) {
+                s->ub_n_tokens  = ubatch.n_tokens;
+                s->ub_pos_first = ubatch.n_tokens > 0 ? (int32_t) ubatch.pos[0] : -1;
+                s->ub_pos_last  = ubatch.n_tokens > 0 ? (int32_t) ubatch.pos[ubatch.n_tokens - 1] : -1;
+            }
+            const llama_pos ub_last_pos = ubatch.n_tokens > 0 ? ubatch.pos[ubatch.n_tokens - 1] : -1;
+            cparams.cb_ubatch(cparams.cb_ubatch_data, (uint32_t) ub_last_pos);
         }
     } while (mctx->next());
 
