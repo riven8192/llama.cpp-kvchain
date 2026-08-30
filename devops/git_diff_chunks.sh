@@ -5,6 +5,8 @@
 #
 set -euo pipefail
 
+cd /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp
+
 base=master
 max=500
 outdir=".diff-chunks"
@@ -99,7 +101,7 @@ fi
 
 for f in "$outdir"/part-*.diff; do
   size=$(wc -l < "$f")
-  printf '%s\n' "$f"
-  (( size > max )) && echo "  warning: $f is $size lines (one file's diff exceeds --max)" >&2
+  printf '%s\n' "./llama.cpp-kv-qwen/llama.cpp/$f"
+  # (( size > max )) && echo "  warning: $f is $size lines (one file's diff exceeds --max)" >&2
 done
 exit 0
