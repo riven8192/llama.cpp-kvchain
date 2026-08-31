@@ -16,6 +16,8 @@ fi
 # cached file (and downloads it if missing), picking the right snapshot revision
 # instead of guessing 'head -1' out of the snapshots dir.
 : "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
+# : "${LLAMA_HF_REF:=unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q8_K_XL}"
+# : "${LLAMA_HF_REF:=unsloth/Qwen3-4B-Instruct-2507-GGUF}"
 
 
 : "${LLAMA_HOST:=127.0.0.1}"

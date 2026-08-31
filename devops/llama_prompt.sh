@@ -14,27 +14,44 @@ if [[ "${PROMPT}" == "-" || -z "${PROMPT}" ]]; then
   PROMPT="$(cat)"
 fi
 
-USAGE_LINE=""
-
-while IFS= read -r line; do
-  [[ "${line}" != data:* ]] && continue
-  data="${line#data: }"
-  [[ "${data}" == "[DONE]" ]] && continue
-  # stream the text delta to stdout immediately (jq -j = raw, no added newline)
-  text=$(echo "${data}" | jq -j '.choices[0].text // empty' 2>/dev/null || true)
-  if [[ -n "${text}" ]]; then
-    printf '%s' "${text}"
-  fi
-  # capture usage from the final chunk
-  usage=$(echo "${data}" | jq -r 'if .usage then "cached_tokens: \(.usage.prompt_tokens_details.cached_tokens // 0)  prompt_tokens: \(.usage.prompt_tokens)" else empty end' 2>/dev/null || true)
-  if [[ -n "${usage}" ]]; then
-    USAGE_LINE="${usage}"
-  fi
-done < <(curl -s -N -X POST "${LLAMA_URL}/v1/completions" \
+# the SSE stream is parsed by python3 (native json lib), NOT by bash:
+# a streamed text delta like "red\n" must reach stdout byte-for-byte - any
+# bash string handling ($( ...), read, printf) risks mangling or stripping
+# the newlines. the python side:
+#   - writes each text delta to stdout IMMEDIATELY (flush per chunk), so the
+#     stream stays live for long generations
+#   - writes the final usage line to STDERR, so it never interleaves with
+#     the (newline-free-at-the-end) streamed text on stdout
+curl -s -N -X POST "${LLAMA_URL}/v1/completions" \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 512}')")
+  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 512}')" \
+| python3 -c '
+import json, sys
 
-echo ""
-if [[ -n "${USAGE_LINE}" ]]; then
-  echo "${USAGE_LINE}"
-fi
+usage = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("data:"):
+        continue
+    data = line[len("data:"):].strip()
+    if data == "[DONE]":
+        continue
+    try:
+        chunk = json.loads(data)
+    except json.JSONDecodeError:
+        continue
+    choice = (chunk.get("choices") or [{}])[0]
+    text = choice.get("text")
+    if text:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    if chunk.get("usage"):
+        usage = chunk["usage"]
+
+sys.stdout.write("\n")
+sys.stdout.flush()
+if usage:
+    d = usage.get("prompt_tokens_details", {})
+    sys.stderr.write("cached_tokens: %s  prompt_tokens: %s\n"
+                     % (d.get("cached_tokens", 0), usage.get("prompt_tokens", 0)))
+'
