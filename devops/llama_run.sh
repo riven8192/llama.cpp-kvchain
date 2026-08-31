@@ -55,6 +55,11 @@ ARGS=(
   -ngl "${LLAMA_NGL}"
   -t "${LLAMA_THREADS}"
   --parallel "${LLAMA_PARALLEL}"
+  # kill reasoning/thinking mode + zero its budget: reasoning models (e.g.
+  # Qwen3-4B) otherwise spend the whole n_ctx on thinking tokens, get capped
+  # mid-reasoning, and never emit the answer - tests then fail on a ctx issue,
+  # not a kv-chain issue. temperature is pinned to 0 in llama_prompt.sh.
+  --reasoning off --reasoning-budget 0
 )
 if [[ ${NO_KV_CHAIN} -eq 0 ]]; then
   ARGS+=(--kv-chain-dir "${KV_CACHE_DIR}" --kv-chain-limit-gb "${KV_CHAIN_LIMIT_GB}")

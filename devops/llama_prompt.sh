@@ -22,9 +22,11 @@ fi
 #     stream stays live for long generations
 #   - writes the final usage line to STDERR, so it never interleaves with
 #     the (newline-free-at-the-end) streamed text on stdout
+# temperature hardcoded to 0 in the body: deterministic output so the
+# restore-fidelity tests (byte-identical-vs-prefill) are not flaked by sampling
 curl -s -N -X POST "${LLAMA_URL}/v1/completions" \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 512}')" \
+  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 512, temperature: 0}')" \
 | python3 -c '
 import json, sys
 
