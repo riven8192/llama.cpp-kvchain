@@ -13,5 +13,6 @@ rm -f ./out-*.log
 ./llama_unittest_3a.sh >./out-3a.log 2>&1
 ./llama_unittest_3b.sh >./out-3b.log 2>&1
 ./llama_unittest_3c.sh >./out-3c.log 2>&1
+./llama_unittest_4.sh  >./out-4.log  2>&1
 
 echo 'results are written to ./devops/out-[id].log'
