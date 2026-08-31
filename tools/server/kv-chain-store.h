@@ -66,12 +66,20 @@ struct kv_chain_store {
     // verbatim in the header for validation.
     // returns false on failure (store disabled, io error, ...)
     bool save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
-              uint64_t chunk_hash, const llama_tokens & chunk_tokens);
+              uint64_t chunk_hash, const llama_tokens & chunk_tokens,
+              uint64_t parent_hash = 0); // parent_hash: [DEBUG] logging only
 
     // hash for one chunk: FNV-1a over the chunk's token ids, seeded by prev_hash
     // (prev_hash = 0 for the root chunk). this is the hash-chain step.
     // uint64 to match the root hash (consistency); the header stores it as u32.
     uint64_t hash_chunk(const llama_tokens & chunk_tokens, uint64_t prev_hash) const;
+
+    // the FULL hash chain for a prompt, computed ONCE at prompt arrival:
+    // hashes[k] = hash_chain step for chunk k (tokens [k*bs, (k+1)*bs)).
+    // hashes.size() = n_complete_chunks(tokens). the restore walk and the
+    // per-ubatch save hook both INDEX this vector - neither recomputes hashes,
+    // so save and restore can never disagree about a chunk's name.
+    std::vector<uint64_t> hash_chain(const llama_tokens & tokens) const;
 
     // finds the longest saved prefix matching tokens[0..lcp). walks the chain,
     // stopping at the first missing/corrupt file. returns the matched chunks in
@@ -88,7 +96,6 @@ struct kv_chain_store {
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
     int32_t batch_size() const { return batch_size_; }
-    const std::string & root_hash_str() const { return root_hash_hex; }
 
     static uint64_t fnv1a64(const uint8_t * data, size_t len);
     static uint64_t fnv1a64(uint64_t h, const uint8_t * data, size_t len);
@@ -97,7 +104,7 @@ private:
     static std::string hash_str(uint64_t h);
 
     // computes the root hash from the metadata blob (see struct above).
-    // fills root_hash_hex. the model file is stat()ed only - never opened.
+    // fills root_hash. the model file is stat()ed only - never opened.
     void compute_root_hash(const common_params & params, const llama_model * model);
 
     bool write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
@@ -110,7 +117,7 @@ private:
     static bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob, llama_tokens & out_tokens);
 
     std::string root_dir;
-    std::string root_hash_hex; // 16 hex chars, identity of this model/config (the full u64 root hash)
+    uint64_t    root_hash = 0; // identity of this model/config; the chain's parent for chunk 0
     uint64_t    limit_bytes;
     int32_t     batch_size_; // chunk stride (boundary grid), not the runtime ubatch size
     uint64_t    total_bytes_cur = 0;

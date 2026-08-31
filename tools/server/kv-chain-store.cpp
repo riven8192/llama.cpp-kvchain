@@ -40,7 +40,7 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
         SRV_ERR("kv-chain: failed to create cache dir '%s': %s (ec=%d)\n",
                 cache_dir.string().c_str(), ec.message().c_str(), ec.value());
         this->root_dir.clear();
-        this->root_hash_hex.clear();
+        this->root_hash = 0;
         return;
     }
     // remove stray .tmp files from an aborted previous run, then index existing chunks.
@@ -58,7 +58,7 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
         total_bytes_cur += size;
     }
     SRV_INF("kv-chain: cache dir '%s', root=%s, %zu bytes on disk, %.3f GiB (limit %.3f GiB), chunk bs=%d\n",
-            cache_dir.string().c_str(), root_hash_hex.c_str(), (size_t) total_bytes_cur,
+            cache_dir.string().c_str(), hash_str(root_hash).c_str(), (size_t) total_bytes_cur,
             (double) total_bytes_cur / (1024.0*1024.0*1024.0),
             (double) limit_bytes / (1024.0*1024.0*1024.0),
             batch_size);
@@ -93,6 +93,29 @@ uint64_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint64_t 
         }
     }
     return h;
+}
+
+std::vector<uint64_t> kv_chain_store::hash_chain(const llama_tokens & tokens) const {
+    // the whole chain in one pass: chunk k = tokens[k*bs, (k+1)*bs), chained
+    // off the previous chunk's hash (0 for the root). computed once at prompt
+    // arrival; restore and save both index the result.
+    std::vector<uint64_t> hashes;
+    const size_t bs = (size_t) batch_size_;
+    if (bs == 0 || tokens.empty()) {
+        return hashes;
+    }
+    const size_t n_chunks = tokens.size() / bs;
+    hashes.reserve(n_chunks);
+    // the root chunk chains off the ROOT hash (the metadata identity: model,
+    // config, version). this keeps different models/configs in disjoint hash
+    // namespaces even for identical leading tokens.
+    uint64_t prev = root_hash;
+    for (size_t k = 0; k < n_chunks; ++k) {
+        const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
+        prev = hash_chunk(block, prev);
+        hashes.push_back(prev);
+    }
+    return hashes;
 }
 
 std::string kv_chain_store::hash_str(uint64_t h) {
@@ -187,7 +210,7 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     h = hash_le(h, md.rope_freq_scale_bits, 4);
     h = hash_str_field(h, model_path);
 
-    root_hash_hex = hash_str(h);
+    root_hash = h;
     {
         const float rope_freq_base  = *reinterpret_cast<const float *>(&md.rope_freq_base_bits);
         const float rope_freq_scale = *reinterpret_cast<const float *>(&md.rope_freq_scale_bits);
@@ -222,7 +245,8 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
 // the recurrent rows for exactly that window, and stores them in two separate
 // files (.kvcache + .rscache). chunk_tokens are the window's tokens.
 bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
-                          uint64_t chunk_hash, const llama_tokens & chunk_tokens) {
+                          uint64_t chunk_hash, const llama_tokens & chunk_tokens,
+                          uint64_t parent_hash /* = 0, [DEBUG] logging only */) {
     if (!enabled() || ctx == nullptr || chunk_tokens.empty() || pos_hi <= pos_lo) {
         return false;
     }
@@ -235,6 +259,15 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
     }
 
     const fs::path dir = fs::path(root_dir);
+
+    // [DEBUG] every save attempt: the hash the file will be named by (and the
+    // parent it was computed from), plus whether both files already existed
+    // (idempotent skip) or were written.
+    SRV_INF("kv-chain[save]: chunk hash=%s parent=%s tokens=[%d..%d) existing=(kv=%d rs=%d)\n",
+            hash_str(chunk_hash).c_str(), hash_str(parent_hash).c_str(),
+            (int) pos_lo, (int) pos_hi,
+            (int) fs::exists(dir / (hash_str(chunk_hash) + ".kvcache")),
+            (int) fs::exists(dir / (hash_str(chunk_hash) + ".rscache")));
 
     return write_chunk(dir, chunk_hash, chunk_tokens, attn, recr);
 }
@@ -460,7 +493,11 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     const size_t bs = (size_t) batch_size_;
     const size_t n_chunks = tokens.size() / bs;
 
-    uint64_t prev_hash = 0;
+    // the chain was computed once at prompt arrival; this walk only LOOKS files
+    // up by the precomputed names. (recomputing here would be a second source of
+    // truth - the save hook indexes the same vector, so the two can never drift)
+    const std::vector<uint64_t> hashes = hash_chain(tokens);
+
     size_t usable = 0; // 1-based: last chunk with an rs file
     size_t n_kv_found = 0;
     uint64_t total_loaded = 0;
@@ -469,11 +506,17 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
 
     for (size_t k = 0; k < n_chunks; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
-        const uint64_t chunk_hash = hash_chunk(block, prev_hash);
+        const uint64_t chunk_hash = hashes[k];
         const std::string stem = hash_str(chunk_hash);
 
         const fs::path kv_file = dir / (stem + ".kvcache");
-        if (!fs::exists(kv_file)) {
+        const bool kv_exists = fs::exists(kv_file);
+        const bool rs_exists = fs::exists(dir / (stem + ".rscache"));
+        // [DEBUG] every find attempt: the precomputed name for chunk k and what
+        // is on disk for it. a 'kv=0' here means the walk stops.
+        SRV_INF("kv-chain[find]: chunk %zu hash=%s kv=%d rs=%d\n", k, stem.c_str(),
+                (int) kv_exists, (int) rs_exists);
+        if (!kv_exists) {
             break;
         }
         std::vector<uint8_t> attn_blob;
@@ -515,7 +558,6 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         total_loaded += chunk.attn_blob.size() + chunk.recr_blob.size();
         chunks.push_back(std::move(chunk));
         kv_files_touched.push_back(kv_file);
-        prev_hash = chunk_hash;
     }
 
     // truncate to usable: chunks beyond the last rs file have no recurrent tail

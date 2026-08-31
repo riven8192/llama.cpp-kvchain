@@ -73,7 +73,6 @@ struct server_context_impl;
 struct kv_chain_ubatch_state {
     server_context_impl * ctx = nullptr;
     server_slot *         slot = nullptr;
-    uint64_t              last_hash = 0; // parent hash for the next chunk (0 = root)
     // [DEBUG] per-ubatch info, filled by llama_decode's ubatch loop before the
     // callback fires; lets the hook log the real ubatch boundary without
     // re-deriving it from the memory module.
@@ -278,6 +277,13 @@ struct server_slot {
     // set when a disk restore covered the entire prompt (nothing left to
     // prefill); the slot starts decoding instead of going through DONE_PROMPT
     bool kv_chain_full_restore = false;
+
+    // the FULL hash chain of THIS prompt, computed once at prompt arrival
+    // (kv_chain_store::hash_chain). hashes[k] names the file for chunk k.
+    // both the restore walk and the per-ubatch save hook index this vector, so
+    // they can never disagree about a chunk's name. empty when kv-chain is off
+    // or the prompt has no complete chunk.
+    std::vector<uint64_t> kv_chain_hashes;
 
     server_prompt prompt;
 
@@ -962,15 +968,20 @@ private:
         for (size_t i = chunk_lo; i < pos; ++i) {
             chunk_tokens.push_back(slot.prompt.tokens[i]);
         }
-        // hash only this chunk's tokens, mixed with the parent hash (chain)
-        const uint64_t chunk_hash = kv_chain->hash_chunk(chunk_tokens, kv_chain_cb_state.last_hash);
-        kv_chain_cb_state.last_hash = chunk_hash;
+        // the chunk's file name comes from the chain computed at prompt
+        // arrival (slot.kv_chain_hashes). NO hashing here: the restore walk
+        // uses the same vector, so save and find can never diverge.
+        if (chunk_n >= slot.kv_chain_hashes.size()) {
+            return; // should not happen: chunk_n < prompt.n_tokens/bs == chain size
+        }
+        const uint64_t chunk_hash = slot.kv_chain_hashes[chunk_n];
 
         // dump only THIS chunk's window [chunk_lo, pos): the attn rows and the
         // recurrent rows for exactly these bs positions. no full-prefix
         // duplication - each chunk file is a constant size, and on restore the
         // chunks are replayed in order (attn appends, recurrent overwrites).
-        kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens);
+        kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
+                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : 0); // [DEBUG] parent for logging only
     }
 
     server_metrics metrics;
@@ -3236,11 +3247,16 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        // arm the per-ubatch kv-chain snapshot for this slot
+                        // arm the per-ubatch kv-chain snapshot for this slot.
+                        // the hash chain is computed ONCE here, at prompt
+                        // arrival, from the prompt tokens: the restore walk and
+                        // the save hook both index this vector (a chunk's file
+                        // name is a pure function of the prompt, so it must not
+                        // depend on runtime state).
                         if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
                             kv_chain_prefill_slot      = &slot;
                             kv_chain_cb_state.slot   = &slot;
-                            kv_chain_cb_state.last_hash = 0;
+                            slot.kv_chain_hashes = kv_chain->hash_chain(input_tokens.get_text_tokens());
                         }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
