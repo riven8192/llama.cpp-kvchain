@@ -92,4 +92,6 @@ echo "=== chunks on disk ==="
 find "${KV_CACHE_DIR}" \( -name '*.kvcache' -o -name '*.rscache' \) 2>/dev/null -exec ls -la {} \; || echo "(none)"
 
 echo "=== distinct process log-files ==="
-ls -a | grep '\.llama-server\.log' | sort | tail -n "${counter}"
+# list $DEVS (not the CWD): the log files live next to this script, and a
+# missing match would otherwise trip `set -euo pipefail` (grep exit 1)
+ls -a "${DEVS}" | grep '\.llama-server\.log' | sort | tail -n "${counter}" || true
