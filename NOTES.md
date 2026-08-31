@@ -63,7 +63,9 @@ so a different model/config is a clean miss, never garbage.
 - Eviction: LRU by mtime after each write; a file vanishing mid-restore is a
   benign "cache ends here". Stray `.tmp` files removed at startup.
 
-## 4. Test status (all PASS, Qwen3.8-27B, -ub 32 -b 32)
+## 4. Test status
+
+All 5 PASS on Qwen3.8-27B (the model the tests were written for), `-ub 32 -b 32`:
 
 - `devops/llama_unittest_1.sh`: full-chain restore with [restart] (v2-era,
   still passes with v3 files).
@@ -76,6 +78,18 @@ so a different model/config is a clean miss, never garbage.
   chain breaks at chunk 2, cached_tokens=64, 6/6 phrases.
 - grid-safety guard: `-b 96 -ub 32` -> FATAL + exit(1).
 
+**Qwen3-4B (pure full-attn, arch `qwen3`, no recurrent layers)**: the kv-chain
+mechanics work (restore loads, cached_tokens correct), but the passage-
+repetition test FAILS because the 4B doesn't follow the "repeat word for word"
+instruction reliably — it paraphrases/confirms instead. This is a model-
+capability issue, NOT a kv-chain bug. The arch fix (see quirks) is what makes
+the 4B not emit garbage; the test prompt is just too demanding for it.
+
+Tests run with `--reasoning off --reasoning-budget 0` (llama_run.sh) and
+`temperature: 0` (llama_prompt.sh): reasoning models otherwise burn the whole
+n_ctx on thinking tokens and get capped mid-reasoning; temperature=0 keeps
+output deterministic for the fidelity checks.
+
 ## 5. Quirks / gotchas
 
 - Chunk stride grid: every ubatch boundary must be a multiple of n_ubatch,
@@ -83,6 +97,13 @@ so a different model/config is a clean miss, never garbage.
   guard (section 1); `-b == -ub` is trivially safe.
 - Gated DeltaNet recurrent state is NON-INVERTIBLE: resume only FROM a
   boundary, never roll back.
+- Pure full-attn models (e.g. Qwen3-4B, arch `qwen3`) get a bare
+  `llama_kv_cache` (no recurrent part). `state_write` MUST honor the
+  PARTIAL_ONLY flag by serializing an empty state (real `n_stream` +
+  cell_count=0 per stream — NOT n_stream=0, which trips the read-side
+  "n_stream mismatch" assert). without this, PARTIAL_ONLY dumps the full attn
+  state into the .rscache file and the restore reads it back as recr,
+  wiping/desyncing the cache (garbage output). see llama-kv-cache.cpp.
 - No-restart restore requires `seq_rm(0, -1)` BEFORE the chunk replay: the
   recurrent module's `rs_idx`/`head`/`used` counters are NOT reset by
   `set_data_window_ext` alone. without the pre-wipe, the second prompt in a
