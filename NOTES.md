@@ -12,8 +12,10 @@ root hash uses the resolved path, so cache identity follows the ref.
 CURRENT STATE: v3 — chunk state is split into `<hash>.kvcache` (attn) +
 `<hash>.rscache` (recr) in a FLAT cache dir. Middle rs files can be evicted
 without breaking restore (recurrent state is a tail object, last write wins;
-missing rs chunks are simply skipped in the restore loop). See
-`kv-chain-store.cpp` for the full layout/algorithm.
+missing rs chunks are simply skipped in the restore loop). Restore works both
+after a restart AND in the same session (no-restart): the pre-restore
+`seq_rm(0, -1)` properly resets the recurrent module's internal state.
+See `kv-chain-store.cpp` for the full layout/algorithm.
 
 ## 1. Where things live
 
@@ -59,14 +61,15 @@ version) so a different model/config is a clean miss, never garbage.
 
 ## 4. Test status (all PASS, Qwen3.8-27B, -ub 32 -b 32)
 
-- `devops/llama_unittest_1.sh`: full-chain restore (v2-era, still passes).
+- `devops/llama_unittest_1.sh`: full-chain restore with [restart] (v2-era,
+  still passes with v3 files).
 - `devops/llama_unittest_2.sh`: zero-behavior-change (no --kv-chain-dir).
-- `devops/llama_unittest_3a.sh`: v3 full-chain restore — prime + restart,
-  cached_tokens=352, 6/6 phrases, 11 .kvcache + 11 .rscache on disk.
-- `devops/llama_unittest_3b.sh`: delete 9 of 11 .rscache (keep newest 2) ->
-  still full restore (352), 6/6 phrases. tail rs intact = full chain usable.
-- `devops/llama_unittest_3c.sh`: delete 3rd-oldest .kvcache -> chain breaks
-  at chunk 2, cached_tokens=64, 6/6 phrases (coherent re-prefill).
+- `devops/llama_unittest_3a.sh`: v3 full-chain restore, NO restart — prime +
+  resend same session, cached_tokens=352, 6/6 phrases.
+- `devops/llama_unittest_3b.sh`: delete 9 of 11 .rscache (keep newest 2),
+  NO restart -> still full restore (352), 6/6 phrases.
+- `devops/llama_unittest_3c.sh`: delete 3rd-oldest .kvcache, NO restart ->
+  chain breaks at chunk 2, cached_tokens=64, 6/6 phrases.
 - grid-safety guard: `-b 96 -ub 32` -> FATAL + exit(1).
 
 ## 5. Quirks / gotchas
@@ -76,12 +79,28 @@ version) so a different model/config is a clean miss, never garbage.
   guard (section 1); `-b == -ub` is trivially safe.
 - Gated DeltaNet recurrent state is NON-INVERTIBLE: resume only FROM a
   boundary, never roll back.
+- No-restart restore requires `seq_rm(0, -1)` BEFORE the chunk replay: the
+  recurrent module's `rs_idx`/`head`/`used` counters are NOT reset by
+  `set_data_window_ext` alone. without the pre-wipe, the second prompt in a
+  session produces garbled/repetitive output.
+- `slot.prompt.tokens` is NOT cleared by `slot.reset()` — after the first
+  prompt+response, `prompt.n_tokens()` is non-zero for the next task. the
+  restore condition must NOT guard on `n_tokens() == 0`.
+- `has_mtmd` reflects model capability (mmproj present), NOT whether the
+  prompt has media. use `get_text_tokens()` (not `get_tokens()`) to get the
+  token list without the `!has_mtmd` assert.
 - `-ub` has a floor of 32 (`-ub 8` is silently ignored -> 2048).
 - Model-file mtime in the metadata blob uses std::filesystem's
   last_write_time (different epoch than unix time, logs as a negative number).
   Consistent across runs so the root hash is stable; do not "fix" it without
   bumping KV_CHAIN_FORMAT_VERSION (would orphan old caches).
-- Each chunk ~152 MiB at -ub 32; a 1000-tok prompt (~30 chunks) ~4.5 GiB.
+- Each chunk ~152 MiB at -ub 32 (attn ~2 MiB + recr ~150 MiB); a 1000-tok
+  prompt (~30 chunks) ~4.5 GiB. with the split, evicting old rs files
+  reclaims ~92% of that for long chains.
 - devops/llama_run.sh: server stdout goes to log FILES ONLY (an inherited
   stdout pipe makes pipe-EOF-waiting callers hang); $log is a symlink to the
   newest timestamped log.
+- devops/llama_test.sh supports `[cmd:PATH]` directives (runs a bash script
+  with $KV_CACHE_DIR in env) for filesystem mutations between prompts.
+- devops/llama_prompt.sh uses stream mode with `max_tokens: 512` cap to
+  prevent infinite generation loops in tests.
