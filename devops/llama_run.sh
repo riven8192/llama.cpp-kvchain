@@ -51,7 +51,8 @@ ARGS=(
   -hf "${LLAMA_HF_REF}"
   --host "${LLAMA_HOST}"
   --port "${LLAMA_PORT}"
-  -c "${LLAMA_CTX}"
+  --timeout 86400
+  --ctx-size "${LLAMA_CTX}"
   -ngl "${LLAMA_NGL}"
   -t "${LLAMA_THREADS}"
   --parallel "${LLAMA_PARALLEL}"
@@ -59,7 +60,15 @@ ARGS=(
   # Qwen3-4B) otherwise spend the whole n_ctx on thinking tokens, get capped
   # mid-reasoning, and never emit the answer - tests then fail on a ctx issue,
   # not a kv-chain issue. temperature is pinned to 0 in llama_prompt.sh.
-  --reasoning off --reasoning-budget 0
+  --reasoning off
+  --reasoning-budget 0
+  --cache-ram 0
+  --no-cache-idle-slots
+  --fit off
+  --load-mode none
+  --no-mmproj
+  --flash-attn on
+  --jinja
 )
 if [[ ${NO_KV_CHAIN} -eq 0 ]]; then
   ARGS+=(--kv-chain-dir "${KV_CACHE_DIR}" --kv-chain-limit-gb "${KV_CHAIN_LIMIT_GB}")
@@ -117,6 +126,7 @@ TIMEOUT=300
 START=$(date +%s)
 
 while :; do
+  echo "waiting for http service..."
   if grep -q "listening on" "${LLAMA_LOG}" 2>/dev/null; then
     echo "ready: $(grep 'listening on' "${LLAMA_LOG}" | tail -1)"
     exit 0

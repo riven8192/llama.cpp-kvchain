@@ -54,9 +54,12 @@ echo "=== [3/4] llama_run.sh ==="
 run_server
 echo ""
 
-counter=0
+prompt_counter=0
+start_counter=1
 for step in "${PROMPTS[@]}"; do
     if [ "${step}" = '[restart]' ]; then
+        start_counter="$((start_counter + 1))"
+
         echo "=== [restart] ==="
         run_server
         echo ""
@@ -77,13 +80,13 @@ for step in "${PROMPTS[@]}"; do
         bash "${cmd_path}"
         echo ""
     else
-        counter="$((counter + 1))"
+        prompt_counter="$((prompt_counter + 1))"
 
-        echo "=== [prompt ${counter}] ==="
+        echo "=== [prompt ${prompt_counter}] ==="
         echo "prompt: '${step:0:100}'"
-        echo "log-file: ${DEVS}/prompt-${counter}.log"
+        echo "log-file: ${DEVS}/prompt-${prompt_counter}.log"
         PROMPT_START=$(date +%s)
-        "${DEVS}/llama_prompt.sh" "${step}" 2>&1 | tee "${DEVS}/prompt-${counter}.log" || true
+        "${DEVS}/llama_prompt.sh" "${step}" 2>&1 | tee "${DEVS}/prompt-${prompt_counter}.log" || true
         PROMPT_END=$(date +%s)
         echo ""
         echo "Took: $(( PROMPT_END - PROMPT_START)) seconds"
@@ -91,9 +94,9 @@ for step in "${PROMPTS[@]}"; do
 done
 
 echo "=== chunks on disk ==="
-find "${KV_CACHE_DIR}" \( -name '*.kvcache' -o -name '*.rscache' \) 2>/dev/null -exec ls -la {} \; || echo "(none)"
+find "${KV_CACHE_DIR}" \( -name '*.kvcache' -o -name '*.rscache' \) -printf "%f\n" 2>/dev/null
 
 echo "=== distinct process log-files ==="
 # list $DEVS (not the CWD): the log files live next to this script, and a
 # missing match would otherwise trip `set -euo pipefail` (grep exit 1)
-ls -a "${DEVS}" | grep '\.llama-server\.log' | sort | tail -n "${counter}" || true
+ls -a "${DEVS}" | grep '\.llama-server\.log' | sort | tail -n "${start_counter}" || true

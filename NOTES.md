@@ -76,6 +76,9 @@ All 5 PASS on Qwen3.8-27B (the model the tests were written for), `-ub 32 -b 32`
   NO restart -> still full restore (352), 6/6 phrases.
 - `devops/llama_unittest_3c.sh`: delete 3rd-oldest .kvcache, NO restart ->
   chain breaks at chunk 2, cached_tokens=64, 6/6 phrases.
+- `devops/llama_unittest_4.sh`: forked chains (PROMPT_A, PROMPT_A, PROMPT_B,
+  PROMPT_B, where B = A with a mid-insertion) -> 0/352/96/352: the 2nd B finds
+  A's trunk (3 chunks) + B's own branch (8 chunks) saved by the 1st B.
 - grid-safety guard: `-b 96 -ub 32` -> FATAL + exit(1).
 
 **Qwen3-4B (pure full-attn, arch `qwen3`, no recurrent layers)**: the kv-chain

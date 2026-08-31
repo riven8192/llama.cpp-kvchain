@@ -17,17 +17,17 @@ fi
 # instead of guessing 'head -1' out of the snapshots dir.
 
 # when picking a model, only change the comment '#' to enable/disable -- leave all models in place, for future switching
-# : "${LLAMA_HF_REF:=LLAMACPP_MODEL=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_XXS}"
-# : "${LLAMA_HF_REF:=LLAMACPP_MODEL=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ1_S}"
-# : "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
+# : "${LLAMA_HF_REF:=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_XXS}"
+# : "${LLAMA_HF_REF:=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ1_S}"
+: "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
 # : "${LLAMA_HF_REF:=unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q8_K_XL}"
-: "${LLAMA_HF_REF:=unsloth/Qwen3-4B-Instruct-2507-GGUF}"
+# : "${LLAMA_HF_REF:=unsloth/Qwen3-4B-Instruct-2507-GGUF}"
 
 
-: "${LLAMA_HOST:=127.0.0.1}"
+: "${LLAMA_HOST:=0.0.0.0}"
 : "${LLAMA_PORT:=50081}"
 : "${LLAMA_CTX:=4096}"
-: "${LLAMA_NGL:=99}"
+: "${LLAMA_NGL:=999}"
 : "${LLAMA_THREADS:=16}"
 : "${LLAMA_PARALLEL:=1}"
 
