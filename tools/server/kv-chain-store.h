@@ -96,6 +96,7 @@ struct kv_chain_store {
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
     int32_t batch_size() const { return batch_size_; }
+    uint64_t root_hash() const { return root_hash_; }
 
     static uint64_t fnv1a64(const uint8_t * data, size_t len);
     static uint64_t fnv1a64(uint64_t h, const uint8_t * data, size_t len);
@@ -104,7 +105,7 @@ private:
     static std::string hash_str(uint64_t h);
 
     // computes the root hash from the metadata blob (see struct above).
-    // fills root_hash. the model file is stat()ed only - never opened.
+    // fills root_hash_. the model file is stat()ed only - never opened.
     void compute_root_hash(const common_params & params, const llama_model * model);
 
     bool write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
@@ -117,7 +118,7 @@ private:
     static bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob, llama_tokens & out_tokens);
 
     std::string root_dir;
-    uint64_t    root_hash = 0; // identity of this model/config; the chain's parent for chunk 0
+    uint64_t    root_hash_ = 0; // identity of this model/config; the chain's parent for chunk 0
     uint64_t    limit_bytes;
     int32_t     batch_size_; // chunk stride (boundary grid), not the runtime ubatch size
     uint64_t    total_bytes_cur = 0;

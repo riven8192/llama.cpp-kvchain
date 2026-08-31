@@ -40,7 +40,7 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
         SRV_ERR("kv-chain: failed to create cache dir '%s': %s (ec=%d)\n",
                 cache_dir.string().c_str(), ec.message().c_str(), ec.value());
         this->root_dir.clear();
-        this->root_hash = 0;
+        this->root_hash_ = 0;
         return;
     }
     // remove stray .tmp files from an aborted previous run, then index existing chunks.
@@ -58,7 +58,7 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
         total_bytes_cur += size;
     }
     SRV_INF("kv-chain: cache dir '%s', root=%s, %zu bytes on disk, %.3f GiB (limit %.3f GiB), chunk bs=%d\n",
-            cache_dir.string().c_str(), hash_str(root_hash).c_str(), (size_t) total_bytes_cur,
+            cache_dir.string().c_str(), hash_str(root_hash_).c_str(), (size_t) total_bytes_cur,
             (double) total_bytes_cur / (1024.0*1024.0*1024.0),
             (double) limit_bytes / (1024.0*1024.0*1024.0),
             batch_size);
@@ -109,7 +109,7 @@ std::vector<uint64_t> kv_chain_store::hash_chain(const llama_tokens & tokens) co
     // the root chunk chains off the ROOT hash (the metadata identity: model,
     // config, version). this keeps different models/configs in disjoint hash
     // namespaces even for identical leading tokens.
-    uint64_t prev = root_hash;
+    uint64_t prev = root_hash_;
     for (size_t k = 0; k < n_chunks; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
         prev = hash_chunk(block, prev);
@@ -210,7 +210,7 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     h = hash_le(h, md.rope_freq_scale_bits, 4);
     h = hash_str_field(h, model_path);
 
-    root_hash = h;
+    root_hash_ = h;
     {
         const float rope_freq_base  = *reinterpret_cast<const float *>(&md.rope_freq_base_bits);
         const float rope_freq_scale = *reinterpret_cast<const float *>(&md.rope_freq_scale_bits);

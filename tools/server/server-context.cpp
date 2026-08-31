@@ -981,7 +981,7 @@ private:
         // duplication - each chunk file is a constant size, and on restore the
         // chunks are replayed in order (attn appends, recurrent overwrites).
         kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
-                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : 0); // [DEBUG] parent for logging only
+                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // [DEBUG] parent for logging only
     }
 
     server_metrics metrics;
