@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Unit test 3b: rs-eviction resilience.
+# Unit test 3b: rs-eviction resilience (no restart).
 #
-# prime, delete all but the last 2 .rscache files, restart, resend.
+# prime, delete all but the last 2 .rscache files, resend in the same session.
 # expect: full restore (tail rs intact -> usable = last kv chunk), 6/6 phrases.
 #
 # Usage:  devops/llama_unittest_3b.sh
@@ -26,7 +26,6 @@ echo "=== unittest_3b: rs-eviction resilience ==="
 "${DEVS}/llama_test.sh" \
     "${PROMPT}" \
     "[cmd:cmd_del_rs_middle.sh]" \
-    "[restart]" \
     "${PROMPT}" \
     -- -ub 32 -b 32
 

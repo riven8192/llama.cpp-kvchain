@@ -3518,7 +3518,12 @@ private:
                                     n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
                                     (int) input_tokens.has_mtmd, input_tokens.size());
                         }
-                        if (kv_chain && n_past == 0 && slot.prompt.n_tokens() == 0 && slot.task->params.cache_prompt) {
+                        // note: we do NOT require slot.prompt.n_tokens() == 0 here.
+                        // in the no-restart case, the slot's prompt.tokens still
+                        // holds the previous prompt+response (reset() doesn't
+                        // clear it). the pre-restore seq_rm(0, -1) wipes the KV
+                        // cache regardless, so the stale tokens are irrelevant.
+                        if (kv_chain && n_past == 0 && slot.task->params.cache_prompt) {
                             // restore a saved prefix from the disk hash-chain cache.
                             // note: we do NOT guard on input_tokens.has_mtmd here because
                             // it reflects the MODEL's capability (mctx != nullptr), not
@@ -3535,6 +3540,13 @@ private:
                             const llama_tokens text_tokens = input_tokens.get_text_tokens();
                             const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
                             if (!chunks.empty() && n_saved > 0) {
+                                // wipe ALL existing state for this seq before restoring.
+                                // in the no-restart case the cache still holds the previous
+                                // prompt+response tokens; seq_rm(0, -1) resets both the
+                                // per-token KV cells AND the recurrent state (rs_idx -> 0,
+                                // cells freed, head updated). this makes the no-restart
+                                // case equivalent to a fresh context (restart).
+                                slot.mem.seq_rm(slot.id, 0, -1);
                                 // replay the matched chunks in order. each chunk holds the
                                 // attn rows and recurrent rows for its own window [k*bs,(k+1)*bs).
                                 // attn: chunk 0 wipes (APPEND cleared) any stale cells, later
@@ -3633,18 +3645,15 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    if (slot.kv_chain_restored) {
-                        // the restored state already contains exactly the cached
-                        // prefix; the recurrent state cannot be rolled back to an
-                        // arbitrary position, so skip the truncating seq_rm.
-                        // note: this is only safe when the cache was empty before
-                        // the restore (i.e. after a server restart). the no-restart
-                        // case (stale prompt+response in the same session) is NOT
-                        // supported - use [restart] in tests.
-                        slot.kv_chain_restored = false;
-                    } else {
-                        slot.mem.seq_rm(slot.id, p0, -1);
-                    }
+                    // truncate any data at [p0, end). in the kv-chain-restored case,
+                    // p0 == n_saved (the restored prefix length). the pre-restore
+                    // seq_rm(0, -1) already cleared everything, so this is typically
+                    // a no-op. but if the restore wrote to [0, n_saved) and there
+                    // was data beyond that (shouldn't happen after the pre-wipe),
+                    // this cleans it up. safe: seq_rm only touches cells in [p0, -1),
+                    // never the recurrent tail at position n_saved.
+                    slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.kv_chain_restored = false;
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the

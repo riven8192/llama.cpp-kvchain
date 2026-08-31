@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Unit test 3a: split-file full-chain restore.
+# Unit test 3a: split-file full-chain restore (no restart).
 #
-# prime, restart, resend the same prompt -> expect full chain restore from disk
-# (all kv+rs files present), 6/6 phrases, cached_tokens >= 256.
+# prime, then resend the same prompt in the same session -> expect full chain
+# restore from disk (all kv+rs files present), 6/6 phrases, cached_tokens >= 256.
 #
 # Usage:  devops/llama_unittest_3a.sh
 set -euo pipefail
@@ -23,7 +23,7 @@ CHECKS=(
 PROMPT="please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
 
 echo "=== unittest_3a: full-chain restore (.kvcache + .rscache) ==="
-"${DEVS}/llama_test.sh" "${PROMPT}" "[restart]" "${PROMPT}" -- -ub 32 -b 32
+"${DEVS}/llama_test.sh" "${PROMPT}" "${PROMPT}" -- -ub 32 -b 32
 
 echo ""
 echo "=== analysis ==="
@@ -55,10 +55,10 @@ check_passage() {
 }
 
 check_passage "${DEVS}/prompt-1.log" "prime"
-check_passage "${DEVS}/prompt-2.log" "restart/restore"
+check_passage "${DEVS}/prompt-2.log" "restore"
 
 RESTORED=$(grep -oE 'cached_tokens: [0-9]+' "${DEVS}/prompt-2.log" | head -1 | grep -oE '[0-9]+' || echo 0)
-echo "restart restored cached_tokens: ${RESTORED}"
+echo "restored cached_tokens: ${RESTORED}"
 if [[ "${RESTORED}" -lt 256 ]]; then
   echo "FAIL restored fewer than 256 tokens (expected full chain)"
   PASS=0
