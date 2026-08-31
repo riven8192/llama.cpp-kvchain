@@ -16,22 +16,13 @@
 
 namespace fs = std::filesystem;
 
-// returns an empty vector: the caller interprets an empty recr_blob as
-// "skip set_data for this chunk's recurrent state". this is safe because
-// recurrent state is a tail object (last write wins): skipping a middle
-// chunk's recr has no effect on the final state (the next chunk's real rs
-// overwrites it). the only chunk that matters is the last one, and if ITS
-// rs file is missing, `usable` drops to the previous rs file's chunk.
-static std::vector<uint8_t> make_zeroed_rs_blob() {
-    return {};
-}
-
 static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
-static constexpr uint32_t KV_CHAIN_VERSION = 3; // v3: split into .kvcache + .rscache (one blob per file)
-// bump whenever the chunk file layout OR the root-hash metadata blob changes.
-// an old file with a stale version is never read (version check), a new file
-// with a stale layout is never produced - "code changed" becomes a clean miss.
-static constexpr int32_t KV_CHAIN_FORMAT_VERSION = 2;
+// the single version number for the kv-chain format: the chunk FILE layout AND
+// the root-hash metadata blob (both are fed into / checked against it).
+// v3: split into .kvcache + .rscache (one blob per file)
+// bump whenever EITHER changes: an old file with a stale version is never read
+// (version check), and the root hash changes, so old chunks are a clean miss.
+static constexpr uint32_t KV_CHAIN_VERSION = 3;
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size,
                                const common_params & params, const llama_model * model) :
@@ -138,7 +129,7 @@ static uint64_t hash_str_field(uint64_t h, const std::string & s) {
 
 void kv_chain_store::compute_root_hash(const common_params & params, const llama_model * model) {
     kv_chain_metadata md;
-    md.format_version    = KV_CHAIN_FORMAT_VERSION;
+    md.format_version    = KV_CHAIN_VERSION;
     md.chunk_size        = batch_size_;
     md.model_file_size   = -1;
     md.model_file_mtime  = -1;
@@ -464,9 +455,8 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // the .rscache file is OPTIONAL (recr is a tail object, last one wins).
     // usable = last chunk index (1-based) that has BOTH kv + rs files.
     // chunks beyond `usable` are truncated (their attn rows are useless without
-    // the recurrent tail). a missing rs file for chunks < usable is backfilled
-    // with a zeroed blob (deserializes as "no state", immediately overwritten
-    // by later chunks).
+    // the recurrent tail). a missing rs file for chunks < usable is simply
+    // skipped (empty recr_blob, no set_data) - later chunks' real rs overwrite it.
     const size_t bs = (size_t) batch_size_;
     const size_t n_chunks = tokens.size() / bs;
 
@@ -510,11 +500,12 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
             usable = k + 1;
             rs_file_touched = rs_file;
         } else {
-            // zeroed rs blob: minimal valid PARTIAL_ONLY seq-state with cell_count=0.
-            // state_read with cell_count=0 wipes the seq's cells and reads no tensor
-            // data - effectively "no recurrent state yet". immediately overwritten
-            // by later chunks' real rs; only the tail matters.
-            recr_blob = make_zeroed_rs_blob();
+            // empty recr_blob = "skip set_data for this chunk". safe because the
+            // recurrent state is a tail object (last write wins): skipping a
+            // middle chunk's recr has no effect on the final state (the next
+            // chunk's real rs overwrites it). the only chunk that matters is the
+            // last one, and if ITS rs file is missing, `usable` drops to the
+            // previous rs file's chunk.
         }
 
         kv_chain_chunk chunk;

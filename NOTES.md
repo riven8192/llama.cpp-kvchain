@@ -47,10 +47,14 @@ ONLY its own window (attn rows + recurrent rows for exactly bs positions) —
 constant file size, no duplication. attn is additive across chunks (restore:
 chunk 0 wipes, later chunks APPEND); the recurrent state is one tail object per
 position (restore: each chunk overwrites, the last wins — it cannot roll back
-mid-chunk, hence partial-chunk reuse is descoped). Hash chain: FNV-1a64,
-`hash_k = H(hash_{k-1} + chunk_k_tokens)`; root dir = FNV-1a64 over a
-metadata blob (stat-only model identity, chunk size, dtypes, rope, format
-version) so a different model/config is a clean miss, never garbage.
+mid-chunk, hence partial-chunk reuse is descoped). A missing middle .rscache is
+simply skipped on restore (empty recr_blob, no set_data); the chain is
+truncated at `usable` = last chunk that has BOTH files. One version number,
+`KV_CHAIN_VERSION`, covers both the file layout and the root-hash metadata
+blob (bump on any change to either; see kv-chain-store.cpp). Hash chain:
+FNV-1a64, `hash_k = H(hash_{k-1} + chunk_k_tokens)`; root dir = FNV-1a64 over a
+metadata blob (stat-only model identity, chunk size, dtypes, rope, version)
+so a different model/config is a clean miss, never garbage.
 
 ## 3. Config
 
@@ -93,7 +97,7 @@ version) so a different model/config is a clean miss, never garbage.
 - Model-file mtime in the metadata blob uses std::filesystem's
   last_write_time (different epoch than unix time, logs as a negative number).
   Consistent across runs so the root hash is stable; do not "fix" it without
-  bumping KV_CHAIN_FORMAT_VERSION (would orphan old caches).
+  bumping KV_CHAIN_VERSION (would orphan old caches).
 - Each chunk ~152 MiB at -ub 32 (attn ~2 MiB + recr ~150 MiB); a 1000-tok
   prompt (~30 chunks) ~4.5 GiB. with the split, evicting old rs files
   reclaims ~92% of that for long chains.

@@ -40,7 +40,7 @@ struct kv_chain_chunk {
 // read. gathering is deliberately cheap: one stat() on the model file, no
 // model-weight reads, no file parsing.
 struct kv_chain_metadata {
-    int32_t  format_version;              // KV_CHAIN_FORMAT_VERSION, bump on any layout change
+    int32_t  format_version;              // KV_CHAIN_VERSION (single version: file layout + this blob)
     uint32_t chunk_size;                  // == llama_n_batch(ctx) at store construction
     int64_t  model_file_size;             // stat() of the model file (-1 if stat fails)
     int64_t  model_file_mtime;            // stat() mtime seconds
