@@ -15,9 +15,12 @@ fi
 # HF model ref "<user>/<repo>:<quant>" - llama-server resolves it to the exact
 # cached file (and downloads it if missing), picking the right snapshot revision
 # instead of guessing 'head -1' out of the snapshots dir.
-: "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
+
+# when picking a model, only change the comment -- '#' -- leave all models in place, for future switching
+# : "${LLAMA_HF_REF:=LLAMACPP_MODEL=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_XXS}"
+# : "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
 # : "${LLAMA_HF_REF:=unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q8_K_XL}"
-# : "${LLAMA_HF_REF:=unsloth/Qwen3-4B-Instruct-2507-GGUF}"
+: "${LLAMA_HF_REF:=unsloth/Qwen3-4B-Instruct-2507-GGUF}"
 
 
 : "${LLAMA_HOST:=127.0.0.1}"

@@ -39,7 +39,9 @@ run_server() {
 }
 
 echo "=== [1/4] flush kv-cache ==="
-du -h "${KV_CACHE_DIR}"
+# the dir may not exist yet (first run / manually cleared); du would trip
+# `set -euo pipefail`, so guard it
+du -h "${KV_CACHE_DIR}" 2>/dev/null || echo "(no cache dir yet)"
 rm -rf "${KV_CACHE_DIR}"
 rm -f "${DEVS}"/prompt-*.log
 echo ""

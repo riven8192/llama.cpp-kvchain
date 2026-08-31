@@ -1970,9 +1970,29 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    // a plain (non-hybrid) kv cache has NO recurrent part. the kv-chain disk
+    // cache snapshots attn and recr separately via FULL_ONLY / PARTIAL_ONLY;
+    // for this cache PARTIAL_ONLY must serialize as an EMPTY state so the
+    // .rscache file is a valid "no recurrent state" blob - mirroring the
+    // part-selection the hybrid memory classes apply to their mem_attn.
+    // without this, PARTIAL_ONLY would dump the full attn state again and the
+    // restore (which reads it as the recr part) would wipe/desync the cache.
+    //
+    // IMPORTANT: state_read() asserts n_stream_cur == n_stream (the LIVE count),
+    // so we must write the real n_stream - NOT 0 - followed by a cell_count=0
+    // for each stream (the read loop skips zero-cell streams). writing 0 would
+    // trip the "n_stream mismatch" throw and the whole restore fails.
+    const bool partial_only = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0;
 
     io.write(&n_stream, sizeof(n_stream));
+
+    if (partial_only) {
+        const uint32_t cell_count_empty = 0;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            io.write(&cell_count_empty, sizeof(cell_count_empty));
+        }
+        return;
+    }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         cell_ranges_t cr { s, {} };
