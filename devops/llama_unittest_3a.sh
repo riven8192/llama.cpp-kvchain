@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Unit test 3a: split-file full-chain restore.
 #
-# prime + restart -> expect full chain restore (all kv+rs files present),
-# 6/6 phrases, cached_tokens >= 256.
+# prime, restart, resend the same prompt -> expect full chain restore from disk
+# (all kv+rs files present), 6/6 phrases, cached_tokens >= 256.
 #
 # Usage:  devops/llama_unittest_3a.sh
 set -euo pipefail

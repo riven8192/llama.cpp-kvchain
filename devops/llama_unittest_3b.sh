@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Unit test 3b: rs-eviction resilience.
 #
-# prime, then delete all but the last 2 .rscache files, restart, resend.
-# expect: partial restore (cached_tokens < full), still coherent output
-# (>= 2 distinctive phrases). the chain's usable tail drops to the last
-# surviving rs file; attn for chunks beyond that is dropped.
+# prime, delete all but the last 2 .rscache files, restart, resend.
+# expect: full restore (tail rs intact -> usable = last kv chunk), 6/6 phrases.
 #
 # Usage:  devops/llama_unittest_3b.sh
 set -euo pipefail

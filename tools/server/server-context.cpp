@@ -3636,7 +3636,11 @@ private:
                     if (slot.kv_chain_restored) {
                         // the restored state already contains exactly the cached
                         // prefix; the recurrent state cannot be rolled back to an
-                        // arbitrary position, so skip the truncating seq_rm
+                        // arbitrary position, so skip the truncating seq_rm.
+                        // note: this is only safe when the cache was empty before
+                        // the restore (i.e. after a server restart). the no-restart
+                        // case (stale prompt+response in the same session) is NOT
+                        // supported - use [restart] in tests.
                         slot.kv_chain_restored = false;
                     } else {
                         slot.mem.seq_rm(slot.id, p0, -1);

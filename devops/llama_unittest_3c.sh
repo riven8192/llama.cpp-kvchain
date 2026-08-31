@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Unit test 3c: kv-chain break (delete a middle .kvcache file).
 #
-# prime, delete the 3rd .kvcache file (chain breaks at chunk 2), restart, resend.
-# expect: cached_tokens ~ 64 (2 chunks x 32), coherent output.
+# prime, delete the 3rd-oldest .kvcache file (chain breaks at chunk 2),
+# restart, resend. expect: cached_tokens ~ 64, coherent output.
 #
 # Usage:  devops/llama_unittest_3c.sh
 set -euo pipefail

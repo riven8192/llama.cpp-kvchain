@@ -1,0 +1,87 @@
+=== unittest_3b: rs-eviction resilience ===
+=== [1/4] flush kv-cache ===
+1.7G	/home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache
+
+=== [2/4] llama_build.sh ===
+CMAKE_BUILD_TYPE=Release
+CMake Warning at CMakeLists.txt:181 (message):
+  LLAMA_CURL is deprecated and will be ignored
+Call Stack (most recent call first):
+  CMakeLists.txt:195 (llama_option_depr)
+
+
+-- UI: gzip compression applied (/home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/build-vulkan/tools/ui/dist/_gzip)
+[5/7] Building CXX object app/CMakeFiles/llama-app.dir/__/license.cpp.o
+[6/7] Linking CXX executable bin/llama
+
+=== [3/4] llama_run.sh ===
+killing pid 275019
+port 50081 is free
+starting llama-server on http://127.0.0.1:50081
+  model : unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL
+  cache : /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache (limit 100 GiB)
+  log   : /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.llama-server.log
+pid: 277829
+ready: 0.06.433.326 I srv  llama_server: listening on http://127.0.0.1:50081
+
+=== [prompt 1] ===
+prompt: 'please repeat this entire passage exactly, word for word, with no additions or omissions: '-- senten'
+log-file: /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/prompt-1.log
+Here is the exact passage you provided:-- sentence 1In the philosophy of mind, mind–body dualism denotes either that mental phenomena are non-physical, or that the mind and body are distinct and separable.-- sentence 2Thus, it encompasses a set of views about the relationship between mind and matter, as well as between subject and object, and is contrasted with other positions, such as physicalism and enactivism, in the mind–body problem.-- sentence 3Aristotle shared Plato's view of multiple souls and further elaborated a hierarchical arrangement, corresponding to the distinctive functions of plants, animals, and humans: a nutritive soul of growth and metabolism that all three share; a perceptive soul of pain, pleasure, and desire that only humans and other animals share; and the faculty of reason that is unique to humans only.-- sentence 4In this view, a soul is the hylomorphic form of a viable organism, wherein each level of the hierarchy formally supervenes upon the substance of the preceding level.-- sentence 5For Aristotle, the first two souls, based on the body, perish when the living organism dies, whereas there remains an immortal and perpetual intellective part of mind.-- sentence 6For Plato, however, the soul was not dependent on the physical body; he believed in metempsychosis, the migration of the soul to a new physical body.-- sentence 7It has been considered a form of reductionism by some philosophers, since it enables the tendency to ignore very big groups of variables by its assumed association with the mind or the body, and not for its real value when it comes to explaining or predicting a studied phenomenon.-- the end'
+cached_tokens: 0  prompt_tokens: 374
+
+Took: 66 seconds
+=== [cmd:cmd_del_rs_middle.sh] ===
+del_rs: deleting 9 oldest of 11 rscache files (keeping newest 2)
+  deleted: 899d53e02061e38f.rscache
+  deleted: fd66773e3e60ddc5.rscache
+  deleted: 2980cd08830bee2e.rscache
+  deleted: c1318cee76ae61fe.rscache
+  deleted: 87de29de87462518.rscache
+  deleted: 25d4fee60d8ffff5.rscache
+  deleted: 8cfa65f9e8c14e00.rscache
+  deleted: 2c269d2974ff1f2b.rscache
+  deleted: edfd184356367b0e.rscache
+
+=== [restart] ===
+killing pid 277829
+port 50081 is free
+starting llama-server on http://127.0.0.1:50081
+  model : unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL
+  cache : /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache (limit 100 GiB)
+  log   : /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.llama-server.log
+pid: 280232
+ready: 0.07.465.574 I srv  llama_server: listening on http://127.0.0.1:50081
+
+=== [prompt 2] ===
+prompt: 'please repeat this entire passage exactly, word for word, with no additions or omissions: '-- senten'
+log-file: /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/prompt-2.log
+'-- sentence 1In the philosophy of mind, mind–body dualism denotes either that mental phenomena are non-physical, or that the mind and body are distinct and separable.-- sentence 2Thus, it encompasses a set of views about the relationship between mind and matter, as well as between subject and object, and is contrasted with other positions, such as physicalism and enactivism, in the mind–body problem.-- sentence 3Aristotle shared Plato's view of multiple souls and further elaborated a hierarchical arrangement, corresponding to the distinctive functions of plants, animals, and humans: a nutritive soul of growth and metabolism that all three share; a perceptive soul of pain, pleasure, and desire that only humans and other animals share; and the faculty of reason that is unique to humans only.-- sentence 4In this view, a soul is the hylomorphic form of a viable organism, wherein each level of the hierarchy formally supervenes upon the substance of the preceding level.-- sentence 5For Aristotle, the first two souls, based on the body, perish when the living organism dies, whereas there remains an immortal and perpetual intellective part of mind.-- sentence 6For Plato, however, the soul was not dependent on the physical body; he believed in metempsychosis, the migration of the soul to a new physical body.-- sentence 7It has been considered a form of reductionism by some philosophers, since it enables the tendency to ignore very big groups of variables by its assumed association with the mind or the body, and not for its real value when it comes to explaining or predicting a studied phenomenon.-- the end'
+cached_tokens: 352  prompt_tokens: 374
+
+Took: 53 seconds
+=== chunks on disk ===
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/899d53e02061e38f.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/fd66773e3e60ddc5.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/2980cd08830bee2e.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/c1318cee76ae61fe.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/87de29de87462518.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/25d4fee60d8ffff5.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/8cfa65f9e8c14e00.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/2c269d2974ff1f2b.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/edfd184356367b0e.kvcache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/3eb9b1e3f55e05c7.kvcache
+-rw-r--r--. 1 riven riven 156894520 Aug 31 03:39 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/3eb9b1e3f55e05c7.rscache
+-rw-r--r--. 1 riven riven 2098356 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/e8975d4a0c9383d2.kvcache
+-rw-r--r--. 1 riven riven 156894520 Aug 31 03:40 /home/riven/opencode/kv-cache-qwen/llama.cpp-kv-qwen/llama.cpp/devops/.kv-cache/e8975d4a0c9383d2.rscache
+=== distinct process log-files ===
+.llama-server.log.20260831-033920.log
+.llama-server.log.20260831-034035.log
+
+=== analysis ===
+partial restore: cached_tokens=352
+PASS full restore despite missing middle rs files (tail rs intact)
+coherence: 6/6 phrases in partial-restore output
+PASS output is coherent
+
+=== RESULT: PASS ===
