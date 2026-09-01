@@ -258,11 +258,15 @@ rs part — PARTIAL_ONLY is a fixed tail object.
   trade-off). The size/magic/version/token checks in `read_chunk_file` still
   catch layout corruption. BUMP KV_CHAIN_VERSION if you ever re-add it (old
   no-checksum files would otherwise be mis-parsed).
-- Two-phase restore reads the .rscache of the TAIL chunk only. if that tail rs
-  read fails (eviction race between phase 1 and 2), `load_prefix` walks back to
-  the previous chunk that has an rs file — note that chunk's rs was NOT read,
-  so its recr_blob is empty (the prefill from that boundary recomputes the
-  recurrent state; the attn rows are still valid).
+- Two-phase restore reads the .rscache of the TAIL chunk only. a FAILED ATTN
+  (.kvcache) read at chunk k is a benign "cache ends here": walk back to the
+  last fully-loaded chunk that has a valid rs file (its recr IS the tail we
+  already read) and prefill the rest. a FAILED TAIL .rscache read is different:
+  the recurrent tail is a single fixed-size object and we only ever read the
+  LAST one, so there is no earlier rs to fall back to. `load_prefix` then
+  DISCARDS the ENTIRE restore (n_loaded=0 -> 100% prefill) and, if the file is
+  still on disk, DELETES it (corrupt/stale) so the re-prefill re-saves a clean
+  one instead of re-reading + re-deleting it every request.
 - devops/llama_run.sh: server stdout goes to log FILES ONLY (an inherited
   stdout pipe makes pipe-EOF-waiting callers hang); $log is a symlink to the
   newest timestamped log.

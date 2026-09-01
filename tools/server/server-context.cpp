@@ -3609,8 +3609,10 @@ private:
                                     n_past = (int) n_saved;
                                     slot.kv_chain_restored = true;
                                     slot.kv_chain_full_restore = (n_saved >= (size_t) slot.task->n_tokens());
-                                    SLT_INF(slot, "kv-chain: restored %d tokens from disk cache (%zu chunks)\n",
-                                            n_past, chunks.size());
+                                    const size_t n_left = (input_tokens.size() > (size_t) n_past)
+                                                       ? (input_tokens.size() - (size_t) n_past) : 0;
+                                    SLT_INF(slot, "kv-chain: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
+                                            n_past, chunks.size(), n_left);
                                 } else {
                                     SLT_WRN(slot, "kv-chain: failed to restore chain, falling back to prefill\n", (const char *) "");
                                 }

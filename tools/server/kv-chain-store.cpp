@@ -530,21 +530,27 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
 
     // ---- phase 2: read only what will be replayed --------------------------
     // read the .kvcache of every chunk in [0, usable) and the .rscache of the
-    // TAIL chunk (usable-1) alone. a failed/mismatching read at chunk k is a
-    // benign "cache ends here" (eviction race, manual deletion): the prefix is
-    // walked back to the last fully-loaded chunk that ALSO has a valid rs
-    // file, and everything after is left to prefill.
+    // TAIL chunk (usable-1) alone. two distinct failure modes:
+    //   * an ATTN (.kvcache) read fails/mismatches at chunk k -> benign "cache
+    //     ends here" (eviction race, manual deletion): the attn rows of the
+    //     chunks BEFORE k are still valid, so we walk back to the last fully-
+    //     loaded chunk that ALSO has a valid rs file and prefill the rest.
+    //   * the TAIL .rscache read fails/mismatches -> the recurrent tail is a
+    //     single fixed-size object and we only ever read the LAST one; there is
+    //     no earlier rs to fall back to (the middle ones are superseded and
+    //     were never read). resuming on a chunk whose recr_blob is empty would
+    //     be wrong, so we discard the ENTIRE restore (100% prefill) and, if the
+    //     file is still there, DELETE it (it is corrupt / stale).
     stems.resize(usable);
     rs_present.resize(usable);
     std::vector<kv_chain_chunk> loaded;   // chunks read so far, in order
     std::vector<fs::path> kv_files_touched;
     uint64_t total_loaded = 0;
 
-    // walk back to the last chunk < usable whose rs file is present: that is
-    // the deepest boundary we can resume from if the tail rs read fails.
+    // walk back to the last chunk < usable whose rs file is present: the deepest
+    // boundary we can resume from if an ATTN read fails (that chunk's rs IS the
+    // tail we already read successfully, so its recr state is valid).
     auto last_rs_before = [this, &stems, &rs_present, dir, usable](size_t upper) -> size_t {
-        // returns the number of leading chunks (of the first `upper`) that we
-        // keep: the largest n <= upper with rs_present[n-1] == true, or 0.
         for (size_t n = upper; n > 0; --n) {
             if (rs_present[n - 1]) {
                 return n;
@@ -553,7 +559,8 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         return 0;
     };
 
-    bool ok = true;
+    bool kv_failed = false;   // an attn read failed -> walk back to last rs boundary
+    bool rs_failed = false;   // the tail rs read failed -> discard the whole restore
     for (size_t k = 0; k < usable; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
 
@@ -563,7 +570,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         llama_tokens file_tokens;
         if (!read_chunk_file(kv_file, attn_blob, file_tokens) || file_tokens != block) {
             SRV_WRN("kv-chain: load_prefix: kv read failed/mismatch at chunk %zu, cache ends here\n", k);
-            ok = false;
+            kv_failed = true;
             break;
         }
         kv_files_touched.push_back(kv_file);
@@ -576,8 +583,14 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
             const fs::path rs_file = dir / (stems[k] + ".rscache");
             llama_tokens rs_tokens;
             if (!read_chunk_file(rs_file, recr_blob, rs_tokens) || rs_tokens != block) {
-                SRV_WRN("kv-chain: load_prefix: rs read failed/mismatch at tail chunk %zu, cache ends here\n", k);
-                ok = false;
+                SRV_WRN("kv-chain: load_prefix: rs read failed/mismatch at tail chunk %zu, discarding entire restore\n", k);
+                // if the file is still on disk it is corrupt/stale: delete it so
+                // it is not re-read (and re-deleted) on the next restore.
+                std::error_code dec;
+                if (fs::exists(rs_file, dec) && fs::remove(rs_file, dec)) {
+                    SRV_WRN("kv-chain: load_prefix: deleted corrupt rs file %s\n", rs_file.filename().string().c_str());
+                }
+                rs_failed = true;
                 break;
             }
         }
@@ -590,15 +603,18 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         loaded.push_back(std::move(chunk));
     }
 
-    size_t n_loaded = loaded.size();
-    if (!ok) {
-        // walk back to the deepest loaded chunk that has a valid rs file
-        n_loaded = last_rs_before(n_loaded);
+    size_t n_loaded;
+    if (rs_failed) {
+        // no valid recurrent tail -> the whole restore is unusable. 100% prefill.
+        n_loaded = 0;
+    } else if (kv_failed) {
+        // attn broke mid-chain -> resume at the deepest loaded chunk with a valid
+        // rs file (its recr_blob was read as the tail, so it is correct).
+        n_loaded = last_rs_before(loaded.size());
         loaded.resize(n_loaded);
         kv_files_touched.resize(n_loaded);
     } else {
-        // tail rs read succeeded (or the tail chunk had no rs file, in which
-        // case phase 1 would not have counted it in `usable`): n_loaded == usable
+        // full success: n_loaded == usable
         n_loaded = usable;
     }
 
