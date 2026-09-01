@@ -1,28 +1,16 @@
 #!/usr/bin/env bash
 # Configure + build llama-server (Vulkan, Release).
 # Usage:
-#   llama_build.sh            # incremental build
-#   llama_build.sh --clean    # remove the build dir first
-#   llama_build.sh -j N       # override parallelism
+#   llama_build.sh
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/env.sh"
 
-CLEAN=0
 JOBS="$(nproc)"
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --clean) CLEAN=1; shift ;;
-    -j)      JOBS="${2:?-j needs a value}"; shift 2 ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
-  esac
-done
 
 cd "${LLAMA_ROOT}"
 
-if [[ ${CLEAN} -eq 1 ]]; then
-  echo "removing ${LLAMA_BUILD_DIR}"
-  rm -rf "${LLAMA_BUILD_DIR}"
-fi
+echo "removing ${LLAMA_BUILD_DIR}"
+rm -rf "${LLAMA_BUILD_DIR}"
 
 echo "configuring (build dir: ${LLAMA_BUILD_DIR})"
 cmake -S . -B "${LLAMA_BUILD_DIR}" -G Ninja \

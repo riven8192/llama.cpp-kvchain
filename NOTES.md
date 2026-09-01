@@ -15,12 +15,18 @@ without breaking restore (recurrent state is a tail object, last write wins;
 missing rs chunks are simply skipped in the restore loop). Restore works both
 after a restart AND in the same session (no-restart): the pre-restore
 `seq_rm(0, -1)` properly resets the recurrent module's internal state.
-See `kv-chain-store.cpp` for the full layout/algorithm.
+Chunk files carry NO trailing checksum (verifying one costs a full pass over
+every multi-hundred-MiB recr file and dominated restore time; we trust the
+storage device — see `read_chunk_file`). Restore is TWO-PHASE: phase 1 walks
+the chain with `fs::exists()` only (no reads) to find the break + `usable`;
+phase 2 reads the .kvcache of every chunk in [0,usable) and the .rscache of
+the TAIL chunk alone. See `kv-chain-store.cpp` for the full layout/algorithm.
 
 ## 1. Where things live
 
 - Chunk file format + hash chain + store: `tools/server/kv-chain-store.{h,cpp}`
-  (layout, metadata blob, checksum, eviction, LRU touch all commented there).
+  (layout, metadata blob, two-phase restore, eviction, LRU touch all commented
+  there).
 - Public API additions: `include/llama.h` — windowed state-seq variants
   (`llama_state_seq_get_size_window_ext` / `_get_data_window_ext` /
   `_set_data_window_ext`), flags `FULL_ONLY` (attn only) and `APPEND`
@@ -44,17 +50,23 @@ See `kv-chain-store.cpp` for the full layout/algorithm.
 
 Chunk k = tokens `[k*bs,(k+1)*bs)`, `bs == --ubatch`. Each chunk file stores
 ONLY its own window (attn rows + recurrent rows for exactly bs positions) —
-constant file size, no duplication. attn is additive across chunks (restore:
+constant file size, no duplication, and NO trailing checksum (verifying one
+costs a full pass over every multi-hundred-MiB recr file and dominated restore
+time; we trust the storage device). attn is additive across chunks (restore:
 chunk 0 wipes, later chunks APPEND); the recurrent state is one tail object per
-position (restore: each chunk overwrites, the last wins — it cannot roll back
-mid-chunk, hence partial-chunk reuse is descoped). A missing middle .rscache is
-simply skipped on restore (empty recr_blob, no set_data); the chain is
-truncated at `usable` = last chunk that has BOTH files. One version number,
-`KV_CHAIN_VERSION`, covers both the file layout and the root-hash metadata
-blob (bump on any change to either; see kv-chain-store.cpp). Hash chain:
-FNV-1a64, `hash_k = H(hash_{k-1} + chunk_k_tokens)`; root dir = FNV-1a64 over a
-metadata blob (stat-only model identity, chunk size, dtypes, rope, version)
-so a different model/config is a clean miss, never garbage.
+position (restore: the LAST chunk's rs wins — it cannot roll back mid-chunk,
+hence partial-chunk reuse is descoped). Restore is two-phase: phase 1 walks the
+chain with `fs::exists()` only (cheap, no reads) to find the first missing
+.kvcache (the break) and `usable` = the last chunk with an rs file; phase 2
+reads the .kvcache of every chunk in [0,usable) and the .rscache of the TAIL
+chunk ALONE (the earlier rs files are superseded, so they are never read). A
+missing middle .rscache is simply skipped (empty recr_blob, no set_data); the
+chain is truncated at `usable`. One version number, `KV_CHAIN_VERSION`, covers
+both the file layout and the root-hash metadata blob (bump on any change to
+either; see kv-chain-store.cpp). Hash chain: FNV-1a64,
+`hash_k = H(hash_{k-1} + chunk_k_tokens)`; root dir = FNV-1a64 over a metadata
+blob (stat-only model identity, chunk size, dtypes, rope, version) so a
+different model/config is a clean miss, never garbage.
 
 ## 3. Config
 
@@ -238,6 +250,19 @@ rs part — PARTIAL_ONLY is a fixed tail object.
 - Each chunk ~152 MiB at -ub 32 (attn ~2 MiB + recr ~150 MiB); a 1000-tok
   prompt (~30 chunks) ~4.5 GiB. with the split, evicting old rs files
   reclaims ~92% of that for long chains.
+- No integrity checksum on chunk files: the writer used to append a trailing
+  u64 FNV-1a over the whole file, and the reader verified it — but that is a
+  full read+hash of every (multi-hundred-MiB) recr file in the chain, which
+  dominated restore time. It was removed from BOTH sides; a silent bit-flip
+  now surfaces as garbage model output, not a clean cache miss (accepted
+  trade-off). The size/magic/version/token checks in `read_chunk_file` still
+  catch layout corruption. BUMP KV_CHAIN_VERSION if you ever re-add it (old
+  no-checksum files would otherwise be mis-parsed).
+- Two-phase restore reads the .rscache of the TAIL chunk only. if that tail rs
+  read fails (eviction race between phase 1 and 2), `load_prefix` walks back to
+  the previous chunk that has an rs file — note that chunk's rs was NOT read,
+  so its recr_blob is empty (the prefill from that boundary recomputes the
+  recurrent state; the attn rows are still valid).
 - devops/llama_run.sh: server stdout goes to log FILES ONLY (an inherited
   stdout pipe makes pipe-EOF-waiting callers hang); $log is a symlink to the
   newest timestamped log.

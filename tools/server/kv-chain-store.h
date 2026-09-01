@@ -29,8 +29,10 @@ struct kv_chain_chunk {
 // never match because the chunk hashes differ (they are seeded by the root).
 //
 // each file: u32 magic KVC1, u32 version=3, u32 hash32, u32 n_tokens,
-//            llama_token[n_tokens], u32 blob_size, blob[blob_size],
-//            u64 fnv1a checksum of everything before it.
+//            llama_token[n_tokens], u32 blob_size, blob[blob_size].
+// there is NO trailing checksum: verifying one costs a full pass over every
+// (multi-hundred-MiB) recr file in the chain, which dominated restore time.
+// we trust the storage device (see read_chunk_file in the .cpp).
 // the blob is a self-contained seq-state blob (carries its own io_magic,
 // src_seq, module header) so it can be fed straight to the state_seq_set API.
 //

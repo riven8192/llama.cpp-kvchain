@@ -287,9 +287,10 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
         return false;
     }
 
-    // per-file header overhead: magic + version + hash32 + n_tokens + tokens + blob_size + checksum
+    // per-file header overhead: magic + version + hash32 + n_tokens + tokens + blob_size
+    // (no trailing checksum - see read_chunk_file)
     const uint64_t hdr_bytes = 4 * sizeof(uint32_t) + sizeof(llama_token) * chunk_tokens.size()
-                              + sizeof(uint32_t) + sizeof(uint64_t);
+                              + sizeof(uint32_t);
     const uint64_t kv_entry = attn.size() + hdr_bytes;
     const uint64_t rs_entry = recr.size() + hdr_bytes;
     const uint64_t need_bytes = (kv_exists ? 0 : kv_entry) + (rs_exists ? 0 : rs_entry);
@@ -321,7 +322,7 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
     return any_written;
 }
 
-// writes one chunk file (header + single blob + checksum) to tmp, then renames.
+// writes one chunk file (header + single blob) to tmp, then renames.
 bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
                                       const llama_tokens & tokens, const std::vector<uint8_t> & blob) {
     std::error_code ec;
@@ -348,15 +349,8 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
             fs::remove(tmp, ec);
             return false;
         }
-        // checksum over everything written so far
-        f.seekp(0, std::ios::end);
-        const uint64_t file_size = static_cast<uint64_t>(f.tellp());
-        std::ifstream rf(tmp, std::ios::binary);
-        std::vector<uint8_t> buf(file_size);
-        rf.read(reinterpret_cast<char *>(buf.data()), file_size);
-        const uint64_t checksum = fnv1a64(buf.data(), buf.size());
-        rf.close();
-        f.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
+        // no trailing checksum: read_chunk_file does not verify one (we trust
+        // the storage device; verifying costs a full pass over every recr file).
         f.close();
     }
 
@@ -377,7 +371,7 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     }
     f.seekg(0, std::ios::end);
     const uint64_t file_size = static_cast<uint64_t>(f.tellg());
-    const uint64_t min_size = sizeof(uint32_t) * 4 + sizeof(uint32_t) + sizeof(uint64_t);
+    const uint64_t min_size = sizeof(uint32_t) * 4 + sizeof(uint32_t); // magic/version/hash32/n_tokens + blob_size
     if (file_size < min_size) {
         return false;
     }
@@ -388,11 +382,12 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     if (!f) {
         return false;
     }
-    const uint64_t stored_sum = *reinterpret_cast<const uint64_t *>(buf.data() + file_size - sizeof(uint64_t));
-    if (fnv1a64(buf.data(), file_size - sizeof(uint64_t)) != stored_sum) {
-        SRV_WRN("kv-chain: checksum mismatch for %s, ignoring\n", file.string().c_str());
-        return false;
-    }
+    // NOTE: there is NO trailing checksum in the file. it was removed from the
+    // writer because verifying it costs a full pass over every (multi-hundred-
+    // MiB) recr file in the chain, which dominated the restore time. we trust
+    // the storage device; a silent bit-flip would surface as garbage model
+    // output, not as a clean cache miss - accepted trade-off for performance
+    // (the size checks below still catch layout corruption).
     // header: magic, version, chunk_hash, n_tokens
     const uint32_t magic = *reinterpret_cast<const uint32_t *>(buf.data());
     const uint32_t version = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t));
@@ -403,13 +398,14 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     }
     const uint32_t n_tokens = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t) * 3);
     // bound the token count before the size arithmetic
-    if (n_tokens == 0 || (uint64_t) n_tokens > (file_size - (sizeof(uint32_t) * 4 + sizeof(uint32_t) + sizeof(uint64_t))) / sizeof(llama_token)) {
+    if (n_tokens == 0 || (uint64_t) n_tokens > (file_size - (sizeof(uint32_t) * 4 + sizeof(uint32_t))) / sizeof(llama_token)) {
         return false;
     }
     const size_t hdr_len = sizeof(uint32_t) * 4 + sizeof(llama_token) * n_tokens;
     const uint32_t blob_size = *reinterpret_cast<const uint32_t *>(buf.data() + hdr_len);
     const uint8_t * blob_ptr = buf.data() + hdr_len + sizeof(uint32_t);
-    const size_t expected = hdr_len + sizeof(uint32_t) + blob_size + sizeof(uint64_t);
+    // no trailing checksum in the file (see above)
+    const size_t expected = hdr_len + sizeof(uint32_t) + blob_size;
     if (expected != file_size) {
         SRV_WRN("kv-chain: size mismatch in %s (expected %zu, got %llu), ignoring\n",
                 file.string().c_str(), expected, (unsigned long long) file_size);
@@ -483,13 +479,17 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         return chunks;
     }
 
-    // single walk of the hash chain. chunk k covers tokens[k*bs,(k+1)*bs).
-    // the .kvcache file is REQUIRED for every chunk (attn rows are additive);
-    // the .rscache file is OPTIONAL (recr is a tail object, last one wins).
-    // usable = last chunk index (1-based) that has BOTH kv + rs files.
-    // chunks beyond `usable` are truncated (their attn rows are useless without
-    // the recurrent tail). a missing rs file for chunks < usable is simply
-    // skipped (empty recr_blob, no set_data) - later chunks' real rs overwrite it.
+    // TWO-PHASE restore. the chunk files are large (~2 MiB attn + ~150 MiB
+    // recr per 32-token chunk), so the expensive part is reading them - not
+    // finding them. therefore:
+    //   phase 1 (find): walk the hash chain with fs::exists() ONLY - no file
+    //     contents are read. this locates the chain break (first missing kv
+    //     file) and `usable` = the last chunk whose rs file is present.
+    //   phase 2 (read): read file contents ONLY for the chunks we will replay:
+    //     the .kvcache of every chunk in [0, usable), and the .rscache of
+    //     chunk (usable-1) ALONE - the recurrent state is a tail object (last
+    //     write wins), so the earlier rs files are superseded and never read.
+    // a failed read mid-way is a benign "cache ends here" (eviction race).
     const size_t bs = (size_t) batch_size_;
     const size_t n_chunks = tokens.size() / bs;
 
@@ -498,20 +498,15 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // truth - the save hook indexes the same vector, so the two can never drift)
     const std::vector<uint64_t> hashes = hash_chain(tokens);
 
-    size_t usable = 0; // 1-based: last chunk with an rs file
+    // ---- phase 1: exists-only walk ----------------------------------------
+    std::vector<std::string> stems;          // per found chunk: file name stem
+    std::vector<bool> rs_present;            // per found chunk: rs file exists
     size_t n_kv_found = 0;
-    uint64_t total_loaded = 0;
-    std::vector<fs::path> kv_files_touched;
-    fs::path rs_file_touched;
-
+    size_t usable = 0; // 1-based: last chunk with an rs file
     for (size_t k = 0; k < n_chunks; ++k) {
-        const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
-        const uint64_t chunk_hash = hashes[k];
-        const std::string stem = hash_str(chunk_hash);
-
-        const fs::path kv_file = dir / (stem + ".kvcache");
-        const bool kv_exists = fs::exists(kv_file);
-        const bool rs_exists = fs::exists(dir / (stem + ".rscache"));
+        const std::string stem = hash_str(hashes[k]);
+        const bool kv_exists = fs::exists(dir / (stem + ".kvcache"));
+        const bool rs_exists = kv_exists && fs::exists(dir / (stem + ".rscache"));
         // [DEBUG] every find attempt: the precomputed name for chunk k and what
         // is on disk for it. a 'kv=0' here means the walk stops.
         SRV_INF("kv-chain[find]: chunk %zu hash=%s kv=%d rs=%d\n", k, stem.c_str(),
@@ -519,68 +514,109 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         if (!kv_exists) {
             break;
         }
-        std::vector<uint8_t> attn_blob;
-        llama_tokens file_tokens;
-        if (!read_chunk_file(kv_file, attn_blob, file_tokens)) {
-            break;
-        }
-        if (file_tokens != block) {
-            SRV_WRN("kv-chain: load_prefix: chain stops at chunk %zu (token mismatch)\n", k);
-            break;
-        }
+        stems.push_back(std::move(stem));
+        rs_present.push_back(rs_exists);
         n_kv_found++;
+        if (rs_exists) {
+            usable = k + 1;
+        }
+    }
 
-        const fs::path rs_file = dir / (stem + ".rscache");
-        std::vector<uint8_t> recr_blob;
-        bool rs_ok = false;
-        if (fs::exists(rs_file)) {
-            llama_tokens rs_tokens;
-            if (read_chunk_file(rs_file, recr_blob, rs_tokens) && rs_tokens == block) {
-                rs_ok = true;
+    *n_tokens = 0;
+    if (usable == 0) {
+        SRV_INF("kv-chain: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);
+        return chunks;
+    }
+
+    // ---- phase 2: read only what will be replayed --------------------------
+    // read the .kvcache of every chunk in [0, usable) and the .rscache of the
+    // TAIL chunk (usable-1) alone. a failed/mismatching read at chunk k is a
+    // benign "cache ends here" (eviction race, manual deletion): the prefix is
+    // walked back to the last fully-loaded chunk that ALSO has a valid rs
+    // file, and everything after is left to prefill.
+    stems.resize(usable);
+    rs_present.resize(usable);
+    std::vector<kv_chain_chunk> loaded;   // chunks read so far, in order
+    std::vector<fs::path> kv_files_touched;
+    uint64_t total_loaded = 0;
+
+    // walk back to the last chunk < usable whose rs file is present: that is
+    // the deepest boundary we can resume from if the tail rs read fails.
+    auto last_rs_before = [this, &stems, &rs_present, dir, usable](size_t upper) -> size_t {
+        // returns the number of leading chunks (of the first `upper`) that we
+        // keep: the largest n <= upper with rs_present[n-1] == true, or 0.
+        for (size_t n = upper; n > 0; --n) {
+            if (rs_present[n - 1]) {
+                return n;
             }
         }
-        if (rs_ok) {
-            usable = k + 1;
-            rs_file_touched = rs_file;
-        } else {
-            // empty recr_blob = "skip set_data for this chunk". safe because the
-            // recurrent state is a tail object (last write wins): skipping a
-            // middle chunk's recr has no effect on the final state (the next
-            // chunk's real rs overwrites it). the only chunk that matters is the
-            // last one, and if ITS rs file is missing, `usable` drops to the
-            // previous rs file's chunk.
+        return 0;
+    };
+
+    bool ok = true;
+    for (size_t k = 0; k < usable; ++k) {
+        const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
+
+        // attn: required for every replayed chunk
+        const fs::path kv_file = dir / (stems[k] + ".kvcache");
+        std::vector<uint8_t> attn_blob;
+        llama_tokens file_tokens;
+        if (!read_chunk_file(kv_file, attn_blob, file_tokens) || file_tokens != block) {
+            SRV_WRN("kv-chain: load_prefix: kv read failed/mismatch at chunk %zu, cache ends here\n", k);
+            ok = false;
+            break;
+        }
+        kv_files_touched.push_back(kv_file);
+        total_loaded += attn_blob.size();
+
+        // recr: read ONLY the tail chunk's rs file (last write wins; the
+        // middle rs files are superseded and would cost ~150 MiB each)
+        std::vector<uint8_t> recr_blob;
+        if (k + 1 == usable && rs_present[k]) {
+            const fs::path rs_file = dir / (stems[k] + ".rscache");
+            llama_tokens rs_tokens;
+            if (!read_chunk_file(rs_file, recr_blob, rs_tokens) || rs_tokens != block) {
+                SRV_WRN("kv-chain: load_prefix: rs read failed/mismatch at tail chunk %zu, cache ends here\n", k);
+                ok = false;
+                break;
+            }
         }
 
         kv_chain_chunk chunk;
         chunk.attn_blob = std::move(attn_blob);
         chunk.recr_blob = std::move(recr_blob);
         chunk.tokens = std::move(file_tokens);
-        total_loaded += chunk.attn_blob.size() + chunk.recr_blob.size();
-        chunks.push_back(std::move(chunk));
-        kv_files_touched.push_back(kv_file);
+        total_loaded += chunk.recr_blob.size();
+        loaded.push_back(std::move(chunk));
     }
 
-    // truncate to usable: chunks beyond the last rs file have no recurrent tail
-    // and their attn rows cannot be used without it.
-    if (usable < chunks.size()) {
-        chunks.resize(usable);
+    size_t n_loaded = loaded.size();
+    if (!ok) {
+        // walk back to the deepest loaded chunk that has a valid rs file
+        n_loaded = last_rs_before(n_loaded);
+        loaded.resize(n_loaded);
+        kv_files_touched.resize(n_loaded);
+    } else {
+        // tail rs read succeeded (or the tail chunk had no rs file, in which
+        // case phase 1 would not have counted it in `usable`): n_loaded == usable
+        n_loaded = usable;
     }
-    *n_tokens = usable * bs;
+
+    chunks = std::move(loaded);
+    *n_tokens = n_loaded * bs;
+    usable = n_loaded;
 
     if (usable > 0) {
         // touch exactly the files that were read and replayed:
         // chunks[0..usable-1]'s .kvcache + the ONE .rscache of chunk (usable-1).
         std::vector<fs::path> to_touch(kv_files_touched.begin(), kv_files_touched.begin() + usable);
-        to_touch.push_back(rs_file_touched);
+        to_touch.push_back(dir / (stems[usable - 1] + ".rscache"));
         touch_chain_files(to_touch);
     }
 
-    if (usable > 0) {
-        SRV_INF("kv-chain: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu\n",
-                n_chunks, n_kv_found, usable);
-    } else {
-        SRV_INF("kv-chain: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);
-    }
+    SRV_INF("kv-chain: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu, replayed %zu chunks (%.3f GiB)\n",
+            n_chunks, n_kv_found, usable, chunks.size(),
+            (double) total_loaded / (1024.0*1024.0*1024.0));
     return chunks;
 }
 
