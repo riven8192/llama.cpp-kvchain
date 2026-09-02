@@ -38,21 +38,19 @@ run_server() {
     fi
 }
 
-echo "=== [1/4] flush kv-cache ==="
-# the dir may not exist yet (first run / manually cleared); du would trip
-# `set -euo pipefail`, so guard it
-du -h "${KV_CACHE_DIR}" 2>/dev/null || echo "(no cache dir yet)"
+echo "=== [1/3] llama_run.sh ==="
+run_server
+echo ""
+
+# we do this **after** the spawn, so that we are sure no (prev) instances are still writing into the dir
+echo "=== [2/3] flush kv-cache ==="
+mkdir -p "${KV_CACHE_DIR}"
+du -h "${KV_CACHE_DIR}" 2>/dev/null
 rm -rf "${KV_CACHE_DIR}"
+mkdir -p "${KV_CACHE_DIR}"
 rm -f "${DEVS}"/prompt-*.log
 echo ""
 
-echo "=== [2/4] llama_build.sh ==="
-"${DEVS}/llama_build.sh" | tail -3
-echo ""
-
-echo "=== [3/4] llama_run.sh ==="
-run_server
-echo ""
 
 prompt_counter=0
 start_counter=1

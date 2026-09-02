@@ -73,12 +73,6 @@ struct server_context_impl;
 struct kv_chain_ubatch_state {
     server_context_impl * ctx = nullptr;
     server_slot *         slot = nullptr;
-    // [DEBUG] per-ubatch info, filled by llama_decode's ubatch loop before the
-    // callback fires; lets the hook log the real ubatch boundary without
-    // re-deriving it from the memory module.
-    uint32_t              ub_n_tokens   = 0; // ubatch.n_tokens (tokens in this ubatch)
-    int32_t               ub_pos_first  = -1; // ubatch.pos[0] (position of the first token)
-    int32_t               ub_pos_last   = -1; // ubatch.pos[n_tokens-1] (position of the last token)
 };
 
 // defined after server_context_impl (needs the full type)
@@ -924,23 +918,22 @@ private:
             return;
         }
         const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
-        const size_t bs  = (size_t) kv_chain->batch_size();
+        const size_t bs  = (size_t) kv_chain->ubatch_size();
 
         // [DEBUG] log every ubatch boundary during prefill so we can see the
-        // real ubatch split (n_tokens, pos range) and whether it lands on the
-        // bs-grid. this is the investigation for the mid-prompt ragged-ubatch
-        // problem: if a ubatch boundary falls off-grid mid-prompt, the hash
-        // chain desyncs. run with -ub 256 -b 256 and a long prompt.
+        // real ubatch split and whether it lands on the bs-grid. this is the
+        // investigation for the mid-prompt ragged-ubatch problem: if a ubatch
+        // boundary falls off-grid mid-prompt, the hash chain desyncs. run with
+        // -ub 256 -b 256 and a long prompt.
         //   pos            = seq_pos_max+1 = tokens committed so far (memory module, authoritative)
         //   cb_n_pos_last  = ubatch.pos[last] passed by llama_decode (the boundary just completed)
-        //   ub_lo/ub_hi    = first/last position of this ubatch's tokens
-        const int32_t ub_lo = (kv_chain_cb_state.ub_n_tokens > 0)
-                            ? kv_chain_cb_state.ub_pos_first : -1;
-        const int32_t ub_hi = (kv_chain_cb_state.ub_n_tokens > 0)
-                            ? kv_chain_cb_state.ub_pos_last  : -1;
-        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d ub_n=%d ub_pos=[%d..%d] pos%%bs=%d %s\n",
-                (int) pos, (int) n_pos_last, (int) kv_chain_cb_state.ub_n_tokens,
-                ub_lo, ub_hi, (int) (pos % bs),
+        // NOTE: the per-ubatch n_tokens/pos-range used to be stashed in
+        // kv_chain_cb_state by llama_decode's hook, but the struct layout in
+        // llama-context.cpp does not match this one (different leading fields),
+        // so those reads were always 0/-1. the authoritative signal is `pos`
+        // (from the memory module) and `cb_n_pos_last` (the boundary arg).
+        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d pos%%bs=%d %s\n",
+                (int) pos, (int) n_pos_last, (int) (pos % bs),
                 (pos % bs == 0) ? "ON-GRID" : "OFF-GRID");
 
         // chunk boundaries are a fixed bs-grid (chunk k covers [k*bs, (k+1)*bs)).
@@ -1483,8 +1476,18 @@ private:
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
                 : 0;
+            // the chunk stride MUST be n_ubatch (NOT n_batch): the per-ubatch
+            // snapshot fires at every UBatch boundary, and those boundaries land
+            // on the n_ubatch grid - not the n_batch grid. using n_batch as the
+            // stride would desync the chain whenever -b != -ub (e.g. -b 2048
+            // -ub 1024: a boundary at pos=1024 is on-grid for the ubatches but
+            // 1024 % 2048 != 0, so the save hook would skip it and the chunk
+            // hash grid would not match the files written). the grid-safety
+            // guard above (n_b/n_ub power of 2) is exactly what keeps every
+            // ubatch boundary on the n_ubatch chunk grid, including the KV-full
+            // retry halvings.
             kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes,
-                                                        llama_n_batch(ctx_tgt), params_base, model_tgt);
+                                                        n_ub, params_base, model_tgt);
         }
 
         if (params_base.n_ctx_checkpoints > 0) {
@@ -2970,8 +2973,13 @@ private:
                 // many (n_batch = llama_n_batch, the -b value; off = running
                 // offset). the n_tokens > 1 guard skips the per-token decode
                 // calls (n_tokens == 1) that fire during generation, which would
-                // otherwise spam the console one line per output token.
-                if (n_tokens > 1) {
+                // otherwise spam the console one line per output token. the
+                // batch.size == n_batch guard skips the small multi-token decode
+                // batches (speculative / n_batch < batch.size) that are not
+                // whole-batch prefill slices - those are not interesting for the
+                // ubatch-grid investigation and would otherwise spam one line per
+                // decode step.
+                if (n_tokens > 1 && batch.size() == n_batch) {
                     SRV_INF("kv-chain[decode]: batch.size=%d off=%d n_tokens=%d n_batch=%d\n",
                             (int) batch.size(), off, n_tokens, n_batch);
                 }
@@ -3563,20 +3571,28 @@ private:
                                 // cells freed, head updated). this makes the no-restart
                                 // case equivalent to a fresh context (restart).
                                 slot.mem.seq_rm(slot.id, 0, -1);
-                                // replay the matched chunks in order. each chunk holds the
-                                // attn rows and recurrent rows for its own window [k*bs,(k+1)*bs).
+                                // replay the matched chunks in order. each chunk's .kvcache
+                                // holds the ATTN_ONLY rows for its own window [k*bs,(k+1)*bs).
                                 // attn: chunk 0 wipes (APPEND cleared) any stale cells, later
                                 // chunks append (APPEND set) so all positions accumulate.
-                                // recurrent: each call wipes + rewrites; only the final call's
-                                // tail state is what the engine reads, so the last chunk wins.
+                                // the recurrent / compressor-ring tail is a single fixed-size
+                                // "last write wins" object, so it is loaded ONCE, from the TAIL
+                                // chunk's .rscache, via the PLAIN set_data_ext(PARTIAL_ONLY)
+                                // (the same call the in-memory context-checkpoint restore uses).
+                                // it is NOT replayed per chunk: the earlier rs files are
+                                // superseded, and the tail object cannot be windowed mid-chunk.
                                 bool ok = true;
-                                const size_t bs = (size_t) kv_chain->batch_size();
+                                const size_t bs = (size_t) kv_chain->ubatch_size();
                                 for (size_t k = 0; k < chunks.size() && ok; ++k) {
                                     const llama_pos pos_lo    = (llama_pos) (k * bs);
                                     const llama_pos pos_hi    = (llama_pos) ((k + 1) * bs);
+                                    // ATTN_ONLY (not FULL_ONLY): the .kvcache blob was written
+                                    // with ATTN_ONLY, so the read must use the same flag. on a
+                                    // DSV4 cache FULL_ONLY would try to read ring bytes that are
+                                    // not in the blob.
                                     const llama_state_seq_flags attn_flags =
-                                            (k == 0) ? LLAMA_STATE_SEQ_FLAGS_FULL_ONLY
-                                                    : (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
+                                            (k == 0) ? LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY
+                                                    : (LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
                                     const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
                                             chunks[k].attn_blob.data(), chunks[k].attn_blob.size(), slot.id,
                                             attn_flags, pos_lo, pos_hi);
@@ -3586,19 +3602,28 @@ private:
                                         ok = false;
                                         break;
                                     }
-                                    // empty recr_blob = "skip" (rs file was evicted for this
-                                    // chunk). safe: recurrent state is a tail object (last
-                                    // write wins), so skipping a middle chunk's recr has no
-                                    // effect on the final state (the last chunk's real rs wins).
-                                    if (!chunks[k].recr_blob.empty()) {
-                                        const size_t n_recr = llama_state_seq_set_data_window_ext(ctx_tgt,
-                                                chunks[k].recr_blob.data(), chunks[k].recr_blob.size(), slot.id,
-                                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, pos_lo, pos_hi);
-                                        if (n_recr != chunks[k].recr_blob.size()) {
-                                            SLT_WRN(slot, "kv-chain: recr restore failed at chunk %zu (%zu of %zu bytes)\n",
-                                                    k, n_recr, chunks[k].recr_blob.size());
+                                }
+                                // load the recurrent tail from the LAST matched chunk's .rscache.
+                                // empty recr_blob = "skip" (rs file was evicted for the tail
+                                // chunk) - but load_prefix() already discards the whole restore
+                                // in that case (no valid recurrent tail), so we only reach here
+                                // with a non-empty tail recr_blob.
+                                // TAIL_ONLY (not PARTIAL_ONLY): the .rscache blob was dumped
+                                // with TAIL_ONLY. on a DSV4 cache that is the compressed K
+                                // caches + the rings, WITHOUT kv_raw - loading it with
+                                // PARTIAL_ONLY would make state_read expect kv_raw bytes and
+                                // mis-parse (silent garbage). the plain set_data_ext (no
+                                // window) is what the blob was serialized with.
+                                if (ok && !chunks.empty()) {
+                                    const auto & tail_recr = chunks.back().recr_blob;
+                                    if (!tail_recr.empty()) {
+                                        const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
+                                                tail_recr.data(), tail_recr.size(), slot.id,
+                                                LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
+                                        if (n_recr != tail_recr.size()) {
+                                            SLT_WRN(slot, "kv-chain: recr restore failed at tail chunk (%zu of %zu bytes)\n",
+                                                    n_recr, tail_recr.size());
                                             ok = false;
-                                            break;
                                         }
                                     }
                                 }

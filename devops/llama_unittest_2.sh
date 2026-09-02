@@ -46,15 +46,11 @@ echo ""
 # --- prompt-2.log = native in-memory prefix reuse of the same prompt.
 rm -f "${DEVS}"/prompt-*.log
 
-echo "=== [1/4] llama_build.sh ==="
-"${DEVS}/llama_build.sh" | tail -3
-echo ""
-
-echo "=== [2/4] llama_run.sh --no-kv-chain ==="
+echo "=== [1/3] llama_run.sh --no-kv-chain ==="
 "${DEVS}/llama_run.sh" --no-kv-chain -- -ub 32 -b 32
 echo ""
 
-echo "=== [3/4] llama_prompt.sh (prime) ==="
+echo "=== [2/3] llama_prompt.sh (prime) ==="
 PROMPT_START=$(date +%s)
 "${DEVS}/llama_prompt.sh" "${PROMPT}" 2>&1 | tee "${DEVS}/prompt-1.log" || true
 PROMPT_END=$(date +%s)
@@ -62,7 +58,7 @@ echo ""
 echo "Took: $(( PROMPT_END - PROMPT_START )) seconds"
 echo ""
 
-echo "=== [4/4] llama_prompt.sh (repeat, same session, native reuse) ==="
+echo "=== [3/3] llama_prompt.sh (repeat, same session, native reuse) ==="
 PROMPT_START=$(date +%s)
 "${DEVS}/llama_prompt.sh" "${PROMPT}" 2>&1 | tee "${DEVS}/prompt-2.log" || true
 PROMPT_END=$(date +%s)

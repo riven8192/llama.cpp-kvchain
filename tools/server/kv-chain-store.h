@@ -56,10 +56,14 @@ struct kv_chain_metadata {
 };
 
 struct kv_chain_store {
-    // root_dir: base cache dir (empty = feature disabled).
-    // params:   common_params of the loaded model (rope config, kv dtypes).
-    // model:    the loaded model (arch + quant string + file stat).
-    kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t batch_size,
+    // root_dir:    base cache dir (empty = feature disabled).
+    // params:      common_params of the loaded model (rope config, kv dtypes).
+    // model:       the loaded model (arch + quant string + file stat).
+    // ubatch_size: the chunk stride == llama's n_ubatch (--ubatch). the chunk
+    //              boundaries are the UBatch boundaries (where state snapshots
+    //              fire), NOT the n_batch (--batch) size. see the server-context
+    //              construction for why -b != -ub desyncs if this is wrong.
+    kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t ubatch_size,
                    const common_params & params, const llama_model * model);
 
     // saves one chunk covering the window [pos_lo, pos_hi) of seq_id's state.
@@ -97,7 +101,7 @@ struct kv_chain_store {
 
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
-    int32_t batch_size() const { return batch_size_; }
+    int32_t ubatch_size() const { return ubatch_size_; }
     uint64_t root_hash() const { return root_hash_; }
 
     static uint64_t fnv1a64(const uint8_t * data, size_t len);
@@ -122,6 +126,6 @@ private:
     std::string root_dir;
     uint64_t    root_hash_ = 0; // identity of this model/config; the chain's parent for chunk 0
     uint64_t    limit_bytes;
-    int32_t     batch_size_; // chunk stride (boundary grid), not the runtime ubatch size
+    int32_t     ubatch_size_; // chunk stride == n_ubatch (the ubatch boundary grid)
     uint64_t    total_bytes_cur = 0;
 };

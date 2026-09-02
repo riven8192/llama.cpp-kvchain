@@ -193,8 +193,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_br
 }
 
 void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
-    const bool write_attn = (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
-    const bool write_recr = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) == 0;
+    // ATTN_ONLY behaves like FULL_ONLY; TAIL_ONLY behaves like PARTIAL_ONLY: on
+    // this hybrid the recurrent part is a separate mem_recr, so "attn only" /
+    // "full only" select mem_attn alone and "tail only" / "partial only" select
+    // mem_recr alone. (they diverge only on caches like llama_kv_cache_dsv4,
+    // where the rings are bundled into the "full" part.)
+    const bool write_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool write_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (write_attn) {
         mem_attn->state_write(io, seq_id, flags, pos_lo, pos_limit);
     }
@@ -204,8 +209,10 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
 }
 
 void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
-    const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
-    const bool read_recr = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) == 0;
+    // mirror of state_write: on this hybrid ATTN_ONLY == FULL_ONLY and
+    // TAIL_ONLY == PARTIAL_ONLY (the recurrent part is a separate mem_recr).
+    const bool read_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool read_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (read_attn) {
         mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit);
     }

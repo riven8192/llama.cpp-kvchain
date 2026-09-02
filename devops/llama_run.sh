@@ -125,8 +125,8 @@ echo "pid: $pid"
 TIMEOUT=300
 START=$(date +%s)
 
+echo "waiting for http service..."
 while :; do
-  echo "waiting for http service..."
   if grep -q "listening on" "${LLAMA_LOG}" 2>/dev/null; then
     echo "ready: $(grep 'listening on' "${LLAMA_LOG}" | tail -1)"
     exit 0

@@ -188,9 +188,15 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
-    // FULL_ONLY: only the attn (per-token KV) part; PARTIAL_ONLY: only the recurrent part
-    const bool write_attn = (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
-    const bool write_recr = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) == 0;
+    // FULL_ONLY / ATTN_ONLY: write ONLY the attn (per-token KV) part; PARTIAL_ONLY /
+    // TAIL_ONLY: write ONLY the recurrent part. on this hybrid the recurrent part is
+    // a separate mem_recr (not bundled into mem_attn), so "attn only" and "full
+    // only" both select mem_attn alone, and "tail only" and "partial only" both
+    // select mem_recr alone. (ATTN_ONLY/TAIL_ONLY diverge from FULL_ONLY/PARTIAL_ONLY
+    // only on caches like llama_kv_cache_dsv4, where the ring states are bundled
+    // into the "full" part.)
+    const bool write_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool write_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (write_attn) {
         mem_attn->state_write(io, seq_id, flags, pos_lo, pos_limit);
     }
@@ -200,8 +206,10 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
-    const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
-    const bool read_recr = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) == 0;
+    // mirror of state_write: on this hybrid ATTN_ONLY == FULL_ONLY and
+    // TAIL_ONLY == PARTIAL_ONLY (the recurrent part is a separate mem_recr).
+    const bool read_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool read_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (read_attn) {
         mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit);
     }

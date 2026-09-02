@@ -912,6 +912,26 @@ extern "C" {
 // used by the kv-chain disk cache to snapshot the attn rows of a chunk separately from the recurrent rows.
 #define LLAMA_STATE_SEQ_FLAGS_FULL_ONLY 4
 
+// like FULL_ONLY, but for hybrid / multi-group caches that bundle a per-token KV
+// cache TOGETHER WITH a fixed-size recurrent / compressor ring state in a single
+// state_write (e.g. llama_kv_cache_dsv4, where FULL_ONLY would otherwise emit
+// kv_raw + the ring states), ATTN_ONLY serializes ONLY the per-token KV part
+// (kv_raw on dsv4), never the rings. the rings are the "tail object" the kv-chain
+// disk cache stores separately in the .rscache file. on the plain hybrid (Qwen)
+// and pure-attn caches, ATTN_ONLY behaves exactly like FULL_ONLY. used by the
+// kv-chain disk cache to build the per-chunk .kvcache file.
+#define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY 16
+
+// inverse of ATTN_ONLY: everything EXCEPT the per-token KV part. on
+// llama_kv_cache_dsv4 this is the three compressor K caches (prefix rows) + the
+// compressor ring states - the complete "tail object" the kv-chain disk cache
+// stores in the .rscache file (the .kvcache chunk files already hold the
+// per-token kv_raw rows, so this blob must NOT repeat them). the restore loads
+// it with the SAME flag (plain set_data_ext), so the compressed prefix rows are
+// restored verbatim instead of being left to recompute. on the plain hybrid
+// (Qwen) and pure-attn caches TAIL_ONLY behaves exactly like PARTIAL_ONLY.
+#define LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY 32
+
 // on restore (state_read), do NOT clear the destination seq's cells first; append the restored
 // cells to whatever is already present. used by the kv-chain disk cache to stream chunk files:
 // the first chunk is restored with this flag CLEAR (wipes any stale cells), later chunks with it SET.

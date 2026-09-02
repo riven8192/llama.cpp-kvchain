@@ -48,7 +48,10 @@ echo ""
 # --- run: prime, restart, resend the identical prompt ---
 # prompt-1.log = prime (cold cache, generates the repetition)
 # prompt-2.log = restart + restore from disk, re-generates the repetition
-"${DEVS}/llama_test.sh" "${PROMPT}" "[restart]" "${PROMPT}" -- -ub 32 -b 32
+# -ub 32 -b 64: the chunk grid is the UBATCH stride (32), not the batch size
+# (64). with -b != -ub this verifies the hash chain stays in sync when a single
+# -b decode slices into two -ub ubatches (the off-grid regression).
+"${DEVS}/llama_test.sh" "${PROMPT}" "[restart]" "${PROMPT}" -- -ub 32 -b 64
 
 echo ""
 echo "=== analysis ==="
