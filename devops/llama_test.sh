@@ -38,24 +38,32 @@ run_server() {
     fi
 }
 
+flush_cache() {
+    mkdir -p "${KV_CACHE_DIR}"
+    du -h "${KV_CACHE_DIR}" 2>/dev/null
+    rm -rf "${KV_CACHE_DIR}"
+    mkdir -p "${KV_CACHE_DIR}"
+}
+
+rm -f "${DEVS}"/prompt-*.log
 echo "=== [1/3] llama_run.sh ==="
 run_server
 echo ""
 
+echo "=== [2/3] flush cache ==="
 # we do this **after** the spawn, so that we are sure no (prev) instances are still writing into the dir
-echo "=== [2/3] flush kv-cache ==="
-mkdir -p "${KV_CACHE_DIR}"
-du -h "${KV_CACHE_DIR}" 2>/dev/null
-rm -rf "${KV_CACHE_DIR}"
-mkdir -p "${KV_CACHE_DIR}"
-rm -f "${DEVS}"/prompt-*.log
+flush_cache
 echo ""
 
 
 prompt_counter=0
 start_counter=1
 for step in "${PROMPTS[@]}"; do
-    if [ "${step}" = '[restart]' ]; then
+    if [ "${step}" = '[flush]' ]; then
+        echo "=== [flush] ==="
+        flush_cache
+        echo ""
+    elif [ "${step}" = '[restart]' ]; then
         start_counter="$((start_counter + 1))"
 
         echo "=== [restart] ==="

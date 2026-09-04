@@ -87,6 +87,7 @@ echo "starting llama-server on ${LLAMA_URL}"
 echo "  model : ${LLAMA_HF_REF}"
 echo "  cache : ${CACHE_DESC}"
 echo "  log   : ${LLAMA_LOG}"
+echo "  exec  : [${LLAMA_SERVER_BIN} ${ARGS[@]}]"
 
 # fully detach so the launcher shell does not wait on the server.
 # IMPORTANT: the server's stdout/stderr must go to LOG FILES ONLY. if it inherited
