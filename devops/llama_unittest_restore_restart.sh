@@ -15,7 +15,7 @@
 # the model can reproduce it) and the restart response (prompt-2.log, proves
 # the restored KV yields the same result).
 #
-# Usage:  devops/llama_unittest_1.sh
+# Usage:  devops/llama_unittest_restore_restart.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"

@@ -4,7 +4,7 @@
 # prime, delete all but the last 2 .rscache files, resend in the same session.
 # expect: full restore (tail rs intact -> usable = last kv chunk), 6/6 phrases.
 #
-# Usage:  devops/llama_unittest_3b.sh
+# Usage:  devops/llama_unittest_evict_rscache.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
@@ -22,7 +22,7 @@ CHECKS=(
 
 PROMPT="please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
 
-echo "=== unittest_3b: rs-eviction resilience ==="
+echo "=== evict_rscache: rs-eviction resilience ==="
 "${DEVS}/llama_test.sh" \
     "${PROMPT}" \
     "[cmd:cmd_del_rs_middle.sh]" \

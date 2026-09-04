@@ -567,6 +567,34 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         }
     }
 
+    // NEVER restore the whole prompt: always leave at least one token to prefill.
+    //
+    // Logits are NOT state - they are the OUTPUT of a forward pass and are not in
+    // the cache files. A restore that covers all N prompt tokens leaves nothing to
+    // run a forward pass over, so no logits are ever produced for the sampler:
+    // the slot skips sampling entirely (i_batch == -1) or trips
+    // "corrupt output buffer (n_outputs=0)" -> GGML_ABORT in llama_get_logits_ith.
+    // That only happens when the prompt length is an exact multiple of bs (so the
+    // final chunk ends exactly at the last prompt token).
+    //
+    // Fix: drop the last chunk, re-prefilling bs tokens. Rejected alternatives:
+    // rolling back one token needs an invertible recurrent state (Gated DeltaNet
+    // is not; llama_memory_recurrent::seq_rm's bounded rollback needs n_rs_seq > 0,
+    // which is speculative-decoding-only and 0 here), and re-running the last token
+    // on top of the restored state + reloading the rs blob to repair the corrupted
+    // recurrent state works but is a lot of machinery for a rare case.
+    //
+    // The cost is negligible: this triggers only when len % bs == 0, i.e. 1 prompt
+    // in bs. Amortized it adds ~1 token of prefill per request - it just shifts the
+    // reuse threshold by one, and the len % bs == bs-1 case already prefills bs-1.
+    if (usable == n_chunks && n_chunks > 0 && tokens.size() % bs == 0) {
+        usable--;
+        SRV_INF("kv-chain: prompt length %zu is an exact multiple of the chunk size %zu; "
+                "capping the restore at %zu chunks so the last chunk is re-prefilled "
+                "(a forward pass is required to produce logits)\n",
+                tokens.size(), bs, usable);
+    }
+
     *n_tokens = 0;
     if (usable == 0) {
         SRV_INF("kv-chain: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);

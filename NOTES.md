@@ -19,7 +19,10 @@ compressed K caches + the three compressor rings — the per-token kv_raw rows
 are NOT in the .rscache (the .kvcache files already carry them, and a FULL-mode
 blob read would clear kv_raw and wipe the just-restored rows). Restore works
 both after a restart AND in the same session (no-restart): the pre-restore
-`seq_rm(0, -1)` properly resets the recurrent module's internal state.
+`seq_rm(0, -1)` properly resets the recurrent module's internal state. A
+restore NEVER covers the whole prompt — `load_prefix` caps it so at least one
+token is always re-prefilled (logits are not cacheable; a forward pass has to
+produce them).
 
 ## 1. Where things live
 
@@ -77,39 +80,30 @@ different model/config is a clean miss, never garbage.
 
 ## 4. Test status
 
-All PASS on Qwen3.8-27B (the model the tests were written for), `-ub 32 -b 32`:
+All PASS on Qwen3.8-27B (the model the tests were written for). Run them with
+`devops/llama_run_unittests.sh` (builds first, runs all, prints a summary,
+exits non-zero on failure); each writes `devops/out-<name>.log` — grep THAT
+instead of re-running, a full pass takes many minutes.
 
-- `devops/llama_unittest_1.sh`: full-chain restore with [restart] (v2-era,
-  still passes with v3 files).
-- `devops/llama_unittest_2.sh`: zero-behavior-change (no --kv-chain-dir).
-- `devops/llama_unittest_3a.sh`: v3 full-chain restore, NO restart — prime +
-  resend same session, cached_tokens=352, 6/6 phrases.
-- `devops/llama_unittest_3b.sh`: delete 9 of 11 .rscache (keep newest 2),
-  NO restart -> still full restore (352), 6/6 phrases.
-- `devops/llama_unittest_3c.sh`: delete 3rd-oldest .kvcache, NO restart ->
-  chain breaks at chunk 2, cached_tokens=64, 6/6 phrases.
-- `devops/llama_unittest_4.sh`: forked chains (PROMPT_A, PROMPT_A, PROMPT_B,
-  PROMPT_B, where B = A with a mid-insertion) -> 0/352/96/352: the 2nd B finds
-  A's trunk (3 chunks) + B's own branch (8 chunks) saved by the 1st B.
-- `devops/llama_unittest_5_dsv4f.sh`: DSV4F (DeepSeek-V4-Flash, arch `deepseek4`)
-  full-chain restore with [restart] — prime + resend, 6/6 phrases,
-  cached_tokens=352. proves the ATTN_ONLY/TAIL_ONLY split + compressed-K-cache
-  restore works end-to-end on the second architecture.
-- `devops/llama_unittest_6.sh`: prompt whose length is an EXACT multiple of the
-  ubatch (-ub 64, 256 tokens). prime + resend. currently FAILS (the §4b bug
-  below) — the resend restores all 256 tokens but returns an empty response.
-  In the general case, the response is not empty, but non-sensical, meaning:
-  it can reply to dialog, with an C comment-block: `/* ... */` or json, or xml,
-  or regular English text that is obviously not a proper reply to the prompt.
-  With the deepseek-v4-flash model, the output is non-sensical, with qwen 3.8
-  it hits a GGML_ASSERT which breaks the response, leaving it empty. Keep in
-  mind that when you start working on this issue, it will report cgarbage.
-  Focus on Qwen path for now, as a hard error is easier to troubleshoot.
-  helper: `devops/llama_make_exact_prompt_len.sh <N>` converges a prompt to
-  exactly N tokens (binary search over the passage length, needs the server
-  running; prints the prompt between `[` and `]`). llama_test.sh gained a
-  `[flush]` directive (wipe the cache dir mid-run, no restart).
-- grid-safety guard: `-b 96 -ub 32` -> FATAL + exit(1).
+Each script's header explains what it does; only the expected numbers are
+recorded here, because those are what a regression changes:
+
+- `restore_restart`  : cached_tokens 0/352, 6/6 phrases
+- `no_kvchain`       : native in-memory reuse, cached_tokens >= 256
+- `restore_session`  : cached_tokens 0/352, 6/6 phrases, >=10 files of each type
+- `evict_rscache`    : still a full restore (tail rs intact)
+- `evict_kvcache`    : chain breaks at chunk 2 -> cached_tokens 64
+- `forked_chains`    : exactly 0/352/96/352
+- `ubatch_edge`      : 0/192, 0/256, 0/192 at -ub 64 (the middle pair is the
+                       255/257 control; the 192s are the exact-multiple cap)
+- `dsv4f`            : cached_tokens 0/352, 6/6 phrases. NOT part of the runner
+                       (different model, same port/cache dir - never run it
+                       concurrently with the Qwen tests)
+- grid-safety guard  : `-b 96 -ub 32` -> FATAL + exit(1)
+
+Helper: `devops/llama_make_exact_prompt_len.sh <N>` converges a prompt to
+exactly N tokens (binary search over the passage length, needs a running
+server; prints the prompt between `[` and `]`).
 
 **Qwen3-4B (pure full-attn, arch `qwen3`, no recurrent layers)**: the kv-chain
 mechanics work (restore loads, cached_tokens correct), but the passage-
@@ -123,21 +117,11 @@ Tests run with `--reasoning off --reasoning-budget 0` (llama_run.sh) and
 n_ctx on thinking tokens and get capped mid-reasoning; temperature=0 keeps
 output deterministic for the fidelity checks.
 
-## 4b. Known bug: prompts whose length is an exact multiple of the ubatch size
-
-Unit-test 6 fails.
-
-**Test harness.** `devops/llama_unittest_6.sh` (committed): builds a 257-token
-prompt (primes + restores fine, the control) and a 256-token prompt (the bug),
-via `llama_make_exact_prompt_len.sh`; sequence is LARGE, LARGE, [restart],
-[flush], EXACT, EXACT at -ub 64 -b 64. Expected after the fix: responses
-OK/OK/OK/OK and cached_tokens 0/256/0/256.
-
-## 4c. DSV4F support — DONE (but fails with the same bug)
+## 4b. DSV4F support — DONE
 
 The disk hash-chain cache works for DeepSeek-V4-Flash (arch `deepseek4`,
 `llama_kv_cache_dsv4`). Qwen paths stay green (run `llama_run_unittests.sh` on
-the 27B after every change). unittest_5 covers DSV4F restore fidelity.
+the 27B after every change). the `dsv4f` test covers DSV4F restore fidelity.
 
 ### How DSV4F differs from Qwen
 
@@ -178,9 +162,10 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
    - <hash>.rscache per boundary = TAIL_ONLY blob = compressed K caches + rings.
      Fixed-size tail, last wins. the restore loads ONLY the last chunk's copy.
    - Restore: append all matched .kvcache chunks, then set_data_ext(TAIL_ONLY)
-     the last .rscache, set n_past, and prefill the remainder. NOTE: on a full
-     chain hit the "remainder" is empty - that transition is the broken path of
-     the §4b bug (do not "fix" it by skipping the forward pass).
+     the last .rscache, set n_past, and prefill the remainder. The remainder is
+     never empty: load_prefix caps the restore so at least one token is always
+     left to prefill - a forward pass is required to produce logits (the reason
+     is commented at the cap in kv-chain-store.cpp load_prefix).
 
 ## 5. Quirks / gotchas
 

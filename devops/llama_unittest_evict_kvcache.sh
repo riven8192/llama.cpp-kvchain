@@ -4,7 +4,7 @@
 # prime, delete the 3rd-oldest .kvcache file (chain breaks at chunk 2),
 # resend in the same session. expect: cached_tokens ~ 64, coherent output.
 #
-# Usage:  devops/llama_unittest_3c.sh
+# Usage:  devops/llama_unittest_evict_kvcache.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
@@ -22,7 +22,7 @@ CHECKS=(
 
 PROMPT="please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
 
-echo "=== unittest_3c: kv-chain break ==="
+echo "=== evict_kvcache: kv-chain break ==="
 "${DEVS}/llama_test.sh" \
     "${PROMPT}" \
     "[cmd:cmd_del_kv_middle.sh]" \

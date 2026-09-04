@@ -8,10 +8,10 @@
 # survive a restart). The native get_common_prefix() must kick in and reuse the
 # whole prompt from memory, and the model must reproduce the passage verbatim.
 #
-# The passage and checks are identical to llama_unittest_1.sh so both tests
+# The passage and checks are identical to llama_unittest_restore_restart.sh so both tests
 # exercise the same prompt.
 #
-# Usage:  devops/llama_unittest_2.sh
+# Usage:  devops/llama_unittest_no_kvchain.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"

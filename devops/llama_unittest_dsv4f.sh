@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit test 5: DSV4F (DeepSeek-V4-Flash) full-chain restore fidelity.
 #
-# Same shape as unittest_1 (prime, resend the identical prompt) but run
+# Same shape as llama_unittest_restore_restart.sh (prime, resend the identical prompt) but run
 # against the DSV4F model instead of Qwen. DSV4F (arch `deepseek4`,
 # llama_kv_cache_dsv4) is the second architecture the kv-chain disk cache must
 # support. Its state is NOT the clean "per-token KV + recurrent tail" split of
@@ -26,7 +26,7 @@
 # overrides LLAMA_HF_REF (env.sh preserves an already-set value). It must NOT be
 # run concurrently with the Qwen unittests (same port + cache dir).
 #
-# Usage:  devops/llama_unittest_5_dsv4f.sh
+# Usage:  devops/llama_unittest_dsv4f.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -35,7 +35,7 @@ export LLAMA_HF_REF="unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_XXS"
 
 . "${DEVS}/env.sh"
 
-# --- the distinctive passage (same as unittest_1) ---
+# --- the distinctive passage (same as llama_unittest_restore_restart.sh) ---
 PASSAGE=$( cat "${DEVS}/prompt_7sentences.txt" )
 
 # distinctive phrases spread across the passage

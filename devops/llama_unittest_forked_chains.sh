@@ -20,7 +20,7 @@
 # chain (e.g. hashing the whole prompt instead of the prefix, or not forking)
 # would yield a different 4-tuple.
 #
-# Usage:  devops/llama_unittest_4.sh
+# Usage:  devops/llama_unittest_forked_chains.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
@@ -30,7 +30,7 @@ PASSAGE=$( cat "${DEVS}/prompt_7sentences.txt" )
 PROMPT_A="'${PASSAGE}' -- the task is to ignore the above, and just respond with 'OK'"
 PROMPT_B="'${PASSAGE:0:500} [mid-insertion] ${PASSAGE:500}' -- the task is to ignore the above, and just respond with 'OK'"
 
-echo "=== unittest_4: forked chains (A, A, B, B) ==="
+echo "=== forked_chains: forked chains (A, A, B, B) ==="
 "${DEVS}/llama_test.sh" "${PROMPT_A}" "${PROMPT_A}" "${PROMPT_B}" "${PROMPT_B}" -- -ub 32 -b 32
 
 echo ""

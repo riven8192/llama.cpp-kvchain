@@ -4,7 +4,7 @@
 # prime, then resend the same prompt in the same session -> expect full chain
 # restore from disk (all kv+rs files present), 6/6 phrases, cached_tokens >= 256.
 #
-# Usage:  devops/llama_unittest_3a.sh
+# Usage:  devops/llama_unittest_restore_session.sh
 set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
@@ -22,7 +22,7 @@ CHECKS=(
 
 PROMPT="please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
 
-echo "=== unittest_3a: full-chain restore (.kvcache + .rscache) ==="
+echo "=== restore_session: full-chain restore (.kvcache + .rscache) ==="
 "${DEVS}/llama_test.sh" "${PROMPT}" "${PROMPT}" -- -ub 32 -b 32
 
 echo ""

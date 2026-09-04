@@ -3861,28 +3861,30 @@ private:
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        // a full disk restore leaves no prompt token in the batch; the
-                        // recurrent state is already at the end of the prompt, so start
-                        // decoding from here (the first decode token is added next iter)
-                        if (slot.kv_chain_full_restore) {
-                            slot.state = SLOT_STATE_GENERATING;
-                            slot.stats.n_gen = 0;
-                            slot.kv_chain_full_restore = false;
-                            slot.kv_chain_restored = false;
-                            SLT_INF(slot, "%s", "kv-chain: full prompt restored, starting decode\n");
-                        } else {
-                            slot.state = SLOT_STATE_DONE_PROMPT;
+                        // DEAD PATH: load_prefix() caps the restore so at least one
+                        // token is always left to prefill (see NOTES.md 4b), so a
+                        // full restore can no longer happen. it is kept as a hard
+                        // failure rather than removed because the "skip the forward
+                        // pass and go straight to GENERATING" shortcut that used to
+                        // live here is silently WRONG: with no forward pass there are
+                        // no logits, so the slot never samples (i_batch == -1) or
+                        // trips "corrupt output buffer (n_outputs=0)" -> GGML_ABORT.
+                        // if this ever fires again, fix the cap in load_prefix - do
+                        // NOT reinstate a no-forward-pass shortcut here.
+                        GGML_ASSERT(!slot.kv_chain_full_restore &&
+                                "kv-chain: full prompt restore must be capped in load_prefix");
 
-                            GGML_ASSERT(batch.size() > 0);
+                        slot.state = SLOT_STATE_DONE_PROMPT;
 
-                            // extract the logits only for the last token
-                            batch.set_output(batch.size() - 1, true);
+                        GGML_ASSERT(batch.size() > 0);
 
-                            slot.stats.n_gen = 0;
-                            slot.i_batch     = batch.size() - 1;
+                        // extract the logits only for the last token
+                        batch.set_output(batch.size() - 1, true);
 
-                            slot.init_sampler();
-                        }
+                        slot.stats.n_gen = 0;
+                        slot.i_batch     = batch.size() - 1;
+
+                        slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
