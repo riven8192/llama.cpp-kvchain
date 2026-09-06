@@ -3587,7 +3587,6 @@ private:
                                 // the valid recurrent tail) and prefill the rest.
                                 bool ok = true;
                                 const size_t bs = (size_t) kv_chain->ubatch_size();
-                                const std::vector<uint8_t> & rs_present = kv_chain->last_rs_present();
                                 size_t n_replayed = 0;
                                 for (size_t k = 0; k < chunks.size() && ok; ++k) {
                                     const llama_pos pos_lo    = (llama_pos) (k * bs);
@@ -3620,13 +3619,20 @@ private:
                                     n_replayed++;
                                 }
                                 if (!ok) {
-                                    // mid-replay attn failure: truncate at the deepest loaded
-                                    // chunk with a valid rs file (the recurrent tail is valid
-                                    // up to that boundary).
-                                    while (n_replayed > 0 && !rs_present[n_replayed - 1]) {
-                                        n_replayed--;
-                                    }
-                                    n_saved = n_replayed * bs;
+                                    // mid-replay failure. the streaming replay has a
+                                    // different failure invariant than the old
+                                    // read-all-first code: by the time a .kvcache read
+                                    // (or set_data) fails at chunk k, the attn rows of
+                                    // chunks [0,k) are ALREADY in the cache, but the
+                                    // recurrent tail is NOT (it is only loaded after
+                                    // the loop). those rows are orphaned - there is no
+                                    // valid recurrent state to resume from, so a
+                                    // partial restore would produce garbage. wipe the
+                                    // seq (same as the pre-restore wipe) and fall back
+                                    // to a 100% prefill.
+                                    slot.mem.seq_rm(slot.id, 0, -1);
+                                    n_saved = 0;
+                                    n_replayed = 0;
                                 }
                                 // load the recurrent tail from the TAIL chunk's .rscache.
                                 // load_prefix() already validated the tail rs file (and

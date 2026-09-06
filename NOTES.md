@@ -222,15 +222,20 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
   catch layout corruption. BUMP KV_CHAIN_VERSION if you ever re-add it (old
   no-checksum files would otherwise be mis-parsed).
 - Only the .rscache of the TAIL chunk is ever read (the recurrent tail is a
-  single fixed-size object; the middle rs files are superseded). a FAILED ATTN
-  (.kvcache) read at chunk k is a benign "cache ends here" (eviction race):
-  the replay loop (server-context.cpp) truncates at the last loaded chunk that
-  has a valid rs file (kv_chain_store::last_rs_present()) and prefills the
-  rest. a FAILED TAIL .rscache read is different: there is no earlier rs to
-  fall back to. `load_prefix` validates the tail up front and, on failure,
-  DISCARDS the ENTIRE restore (100% prefill) and, if the file is still on
-  disk, DELETES it (corrupt/stale) so the re-prefill re-saves a clean one
-  instead of re-reading + re-deleting it every request.
+  single fixed-size object; the middle rs files are superseded). a .kvcache
+  MISSING in phase 1 (fs::exists walk) is a clean break: the replay streams
+  the chunks before the break (tail rs = the break-1 chunk's) and prefills the
+  rest. a .kvcache PRESENT in phase 1 but failing to read DURING the replay
+  (eviction race / on-disk corruption) is harsher: by then the attn rows of
+  the earlier chunks are already in the KV cache, but the recurrent tail
+  (loaded only after the loop) is not - those rows are orphaned (no valid
+  recurrent state to resume from), so the replay loop WIPES the seq and falls
+  back to a 100% prefill (a partial restore would produce garbage). a FAILED
+  TAIL .rscache read is different again: there is no earlier rs to fall back
+  to. `load_prefix` validates the tail up front and, on failure, DISCARDS the
+  ENTIRE restore (100% prefill) and, if the file is still on disk, DELETES it
+  (corrupt/stale) so the re-prefill re-saves a clean one instead of
+  re-reading + re-deleting it every request.
 - devops/llama_run.sh: server stdout goes to log FILES ONLY (an inherited
   stdout pipe makes pipe-EOF-waiting callers hang); $log is a symlink to the
   newest timestamped log.
