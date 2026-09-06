@@ -22,6 +22,8 @@ if ! ./llama_build.sh 1>./.build.log 2>&1; then
     exit 1
 fi
 
+# do NOT run the dsv4-flash test here, because the OOM-monitor job will kill
+# random processes to free resources, when opencode/qwen 3.8 are also running.
 TESTS=(
     restore_restart    # full-chain restore across a server restart
     no_kvchain         # zero-behavior-change control (feature disabled)
