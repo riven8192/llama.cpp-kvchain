@@ -206,6 +206,12 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
   prompt has media. use `get_text_tokens()` (not `get_tokens()`) to get the
   token list without the `!has_mtmd` assert.
 - `-ub` has a floor of 32 (`-ub 8` is silently ignored -> 2048).
+- With MTP speculative decoding enabled, the `cb_ubatch` hook fires TWICE at the
+  final (off-grid) tail position: once for the real prefill, once from the MTP
+  draft path (`common_speculative_impl_draft_mtp::process` -> `llama_decode` on
+  the draft ctx). BENIGN: the draft runs on a separate ctx (separate R/S), so the
+  target cache is committed exactly once — verified byte-identical output at
+  temp=0/seed=42 with MTP on vs off. off-grid, so no chunk is saved either way.
 - Model-file mtime in the metadata blob uses std::filesystem's
   last_write_time (different epoch than unix time, logs as a negative number).
   Consistent across runs so the root hash is stable; do not "fix" it without
