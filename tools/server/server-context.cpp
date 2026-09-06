@@ -3571,21 +3571,33 @@ private:
                                 // cells freed, head updated). this makes the no-restart
                                 // case equivalent to a fresh context (restart).
                                 slot.mem.seq_rm(slot.id, 0, -1);
-                                // replay the matched chunks in order. each chunk's .kvcache
-                                // holds the ATTN_ONLY rows for its own window [k*bs,(k+1)*bs).
-                                // attn: chunk 0 wipes (APPEND cleared) any stale cells, later
-                                // chunks append (APPEND set) so all positions accumulate.
-                                // the recurrent / compressor-ring tail is a single fixed-size
-                                // "last write wins" object, so it is loaded ONCE, from the TAIL
-                                // chunk's .rscache, via the PLAIN set_data_ext(PARTIAL_ONLY)
-                                // (the same call the in-memory context-checkpoint restore uses).
-                                // it is NOT replayed per chunk: the earlier rs files are
-                                // superseded, and the tail object cannot be windowed mid-chunk.
+                                // replay the matched chunks in order, ONE FILE AT A TIME:
+                                // read the .kvcache, set_data, free it, next chunk. the
+                                // whole chain is never in RAM at once (see kv_chain_chunk:
+                                // on a resource-constrained box the old "read everything
+                                // first" behavior peaked at ~2x the chain size).
+                                // each chunk's .kvcache holds the ATTN_ONLY rows for its
+                                // own window [k*bs,(k+1)*bs). attn: chunk 0 wipes (APPEND
+                                // cleared) any stale cells, later chunks append (APPEND set)
+                                // so all positions accumulate.
+                                // a .kvcache that fails to open/validate MID-replay is a
+                                // benign "cache ends here" (eviction race / manual
+                                // deletion): truncate at the deepest loaded chunk whose rs
+                                // file is present (kv_chain->last_rs_present() - its rs IS
+                                // the valid recurrent tail) and prefill the rest.
                                 bool ok = true;
                                 const size_t bs = (size_t) kv_chain->ubatch_size();
+                                const std::vector<uint8_t> & rs_present = kv_chain->last_rs_present();
+                                size_t n_replayed = 0;
                                 for (size_t k = 0; k < chunks.size() && ok; ++k) {
                                     const llama_pos pos_lo    = (llama_pos) (k * bs);
                                     const llama_pos pos_hi    = (llama_pos) ((k + 1) * bs);
+                                    std::vector<uint8_t> attn_blob;
+                                    if (!kv_chain->read_chunk_file(chunks[k].attn_file, attn_blob, chunks[k].tokens)) {
+                                        SLT_WRN(slot, "kv-chain[storage]: kv read failed/mismatch at chunk %zu, cache ends here\n", k);
+                                        ok = false;
+                                        break;
+                                    }
                                     // ATTN_ONLY (not FULL_ONLY): the .kvcache blob was written
                                     // with ATTN_ONLY, so the read must use the same flag. on a
                                     // DSV4 cache FULL_ONLY would try to read ring bytes that are
@@ -3594,20 +3606,33 @@ private:
                                             (k == 0) ? LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY
                                                     : (LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
                                     const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
-                                            chunks[k].attn_blob.data(), chunks[k].attn_blob.size(), slot.id,
+                                            attn_blob.data(), attn_blob.size(), slot.id,
                                             attn_flags, pos_lo, pos_hi);
-                                    if (n_attn != chunks[k].attn_blob.size()) {
-                                        SLT_WRN(slot, "kv-chain[storage]: attn restore failed at chunk %zu (%zu of %zu bytes)\n",
-                                                k, n_attn, chunks[k].attn_blob.size());
+                                    attn_blob.clear();
+                                    attn_blob.shrink_to_fit();
+                                    // set_data_window_ext returns the bytes CONSUMED from the
+                                    // blob (= blob size for a well-formed file); 0 = failure.
+                                    if (n_attn == 0) {
+                                        SLT_WRN(slot, "kv-chain[storage]: attn restore failed at chunk %zu\n", k);
                                         ok = false;
                                         break;
                                     }
+                                    n_replayed++;
                                 }
-                                // load the recurrent tail from the LAST matched chunk's .rscache.
-                                // empty recr_blob = "skip" (rs file was evicted for the tail
-                                // chunk) - but load_prefix() already discards the whole restore
-                                // in that case (no valid recurrent tail), so we only reach here
-                                // with a non-empty tail recr_blob.
+                                if (!ok) {
+                                    // mid-replay attn failure: truncate at the deepest loaded
+                                    // chunk with a valid rs file (the recurrent tail is valid
+                                    // up to that boundary).
+                                    while (n_replayed > 0 && !rs_present[n_replayed - 1]) {
+                                        n_replayed--;
+                                    }
+                                    n_saved = n_replayed * bs;
+                                }
+                                // load the recurrent tail from the TAIL chunk's .rscache.
+                                // load_prefix() already validated the tail rs file (and
+                                // discarded the whole restore if it was bad), so we only
+                                // reach here with a valid tail. read it now (one 150 MiB
+                                // read, freed immediately after).
                                 // TAIL_ONLY (not PARTIAL_ONLY): the .rscache blob was dumped
                                 // with TAIL_ONLY. on a DSV4 cache that is the compressed K
                                 // caches + the rings, WITHOUT kv_raw - loading it with
@@ -3615,15 +3640,22 @@ private:
                                 // mis-parse (silent garbage). the plain set_data_ext (no
                                 // window) is what the blob was serialized with.
                                 if (ok && !chunks.empty()) {
-                                    const auto & tail_recr = chunks.back().recr_blob;
-                                    if (!tail_recr.empty()) {
-                                        const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
-                                                tail_recr.data(), tail_recr.size(), slot.id,
-                                                LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
-                                        if (n_recr != tail_recr.size()) {
-                                            SLT_WRN(slot, "kv-chain[storage]: recr restore failed at tail chunk (%zu of %zu bytes)\n",
-                                                    n_recr, tail_recr.size());
+                                    std::vector<uint8_t> tail_recr;
+                                    const kv_chain_chunk & tail_chunk = chunks.back();
+                                    if (!tail_chunk.recr_file.empty()) {
+                                        if (!kv_chain->read_chunk_file(tail_chunk.recr_file, tail_recr, tail_chunk.tokens)) {
+                                            SLT_WRN(slot, "%s", "kv-chain[storage]: tail rs re-read failed at tail chunk, discarding restore");
                                             ok = false;
+                                        } else {
+                                            const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
+                                                    tail_recr.data(), tail_recr.size(), slot.id,
+                                                    LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
+                                            tail_recr.clear();
+                                            tail_recr.shrink_to_fit();
+                                            if (n_recr == 0) {
+                                                SLT_WRN(slot, "%s", "kv-chain[storage]: recr restore failed at tail chunk");
+                                                ok = false;
+                                            }
                                         }
                                     }
                                 }
@@ -3637,8 +3669,10 @@ private:
                                     const size_t n_left = (input_tokens.size() > (size_t) n_past)
                                                        ? (input_tokens.size() - (size_t) n_past) : 0;
                                     SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
-                                            n_past, chunks.size(), n_left);
+                                            n_past, n_replayed, n_left);
                                 } else {
+                                    // the pre-restore seq_rm(0, -1) already wiped the seq;
+                                    // n_past stays 0 -> 100% prefill.
                                     SLT_WRN(slot, "%s", "kv-chain[storage]: failed to restore chain, falling back to prefill");
                                 }
                             }

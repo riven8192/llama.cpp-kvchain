@@ -11,14 +11,22 @@
 
 namespace fs = std::filesystem;
 
-// one matched chunk's payload, in chain order. each chunk holds the attn rows
-// and the recurrent rows for ITS OWN window [k*bs, (k+1)*bs) - no duplication
-// across chunks. on restore the caller loads each chunk's attn (appending,
-// first chunk wipes) and each chunk's recurrent (overwriting; the last one wins).
+// one matched chunk, in chain order. holds ONLY the file paths (and the
+// validated header tokens) - NOT the blob data. the blobs are large (~16 MiB
+// attn per chunk; the tail rs is ~150 MiB), and materializing the WHOLE chain
+// in RAM before the restore (the old behavior) peaked at ~2x the chain size on
+// resource-constrained boxes. the restore therefore replays chunk by chunk:
+// open the file, feed the blob to set_data, close, next. peak = one file.
+// attn_file:  this chunk's .kvcache (ATTN_ONLY rows for [k*bs,(k+1)*bs)),
+//             always set. additive across chunks (chunk 0 wipes, rest APPEND).
+// recr_file:  this chunk's .rscache. set for the TAIL chunk only (the
+//             recurrent tail is a single fixed-size "last write wins" object;
+//             the earlier rs files are superseded and never read). empty for
+//             all other chunks.
 struct kv_chain_chunk {
-    std::vector<uint8_t> attn_blob; // seq state blob for the attn (per-token KV) part
-    std::vector<uint8_t> recr_blob; // seq state blob for the recurrent (R/S) part
-    llama_tokens        tokens;    // the chunk's token IDs, verbatim from the file header
+    fs::path     attn_file; // .kvcache file for this chunk's window
+    fs::path     recr_file; // .rscache file, TAIL chunk only
+    llama_tokens tokens;    // the chunk's token IDs, verbatim from the file header
 };
 
 // disk-backed, content-addressed KV state store
@@ -55,7 +63,8 @@ struct kv_chain_metadata {
     uint32_t rope_freq_scale_bits;        // float bits (0.0f = "from model")
 };
 
-struct kv_chain_store {
+class kv_chain_store {
+public:
     // root_dir:    base cache dir (empty = feature disabled).
     // params:      common_params of the loaded model (rope config, kv dtypes).
     // model:       the loaded model (arch + quant string + file stat).
@@ -90,7 +99,25 @@ struct kv_chain_store {
     // finds the longest saved prefix matching tokens[0..lcp). walks the chain,
     // stopping at the first missing/corrupt file. returns the matched chunks in
     // order (empty on miss) and sets *n_tokens = prefix length (= n_chunks*bs).
+    // the returned chunks carry file PATHS, not blob data (see struct comment):
+    // the caller replays them one at a time with read_chunk_file(), so the
+    // whole chain is never materialized in RAM at once.
     std::vector<kv_chain_chunk> load_prefix(const llama_tokens & tokens, size_t * n_tokens) const;
+
+    // reads + validates ONE chunk file (header: magic/version/n_tokens + token
+    // IDs must match `expected_tokens`) and returns the blob. used by the
+    // restore to stream the chain file-by-file (peak RAM = one file).
+    // returns false if missing/corrupt/token-mismatch.
+    bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob,
+                         const llama_tokens & expected_tokens) const;
+
+    // per-chunk "rs file present" map from the LAST load_prefix() call (in
+    // chain order, only the matched prefix; 1 = present). the replay loop needs
+    // it for the mid-replay .kvcache-failure fallback: when a chunk's attn file
+    // fails to read, truncate the restore at the deepest loaded chunk whose rs
+    // file is present (its rs IS the valid recurrent tail).
+    const std::vector<uint8_t> & last_rs_present() const { return last_rs_present_; }
+
 
     // touches (utimensat) the files of the given chunk hashes so their mtime is
     // "now". required because the default relatime mount does not update mtime
@@ -120,12 +147,10 @@ private:
                           const llama_tokens & tokens, const std::vector<uint8_t> & blob);
     void evict_oldest(uint64_t need_bytes);
 
-    // reads a single-blob chunk file (.kvcache or .rscache); returns false if missing/corrupt
-    static bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob, llama_tokens & out_tokens);
-
     std::string root_dir;
     uint64_t    root_hash_ = 0; // identity of this model/config; the chain's parent for chunk 0
     uint64_t    limit_bytes;
     int32_t     ubatch_size_; // chunk stride == n_ubatch (the ubatch boundary grid)
     uint64_t    total_bytes_cur = 0;
+    mutable std::vector<uint8_t> last_rs_present_; // set by load_prefix() (const: it caches the last call's result); see last_rs_present()
 };
