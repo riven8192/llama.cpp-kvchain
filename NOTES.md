@@ -31,8 +31,10 @@ produce them).
   there).
 - Public API additions: `include/llama.h` — windowed state-seq variants
   (`llama_state_seq_get_size_window_ext` / `_get_data_window_ext` /
-  `_set_data_window_ext`), flags `FULL_ONLY` (attn only) and `APPEND`
-  (restore without seq_rm), per-ubatch hook `llama_context_params.cb_ubatch`.
+  `_set_data_window_ext`), flags `FULL_ONLY` / `ATTN_ONLY` (per-token KV only;
+  the two diverge only on dsv4, where FULL_ONLY drags in the rings) /
+  `TAIL_ONLY` (everything except per-token KV) / `APPEND` (restore without
+  seq_rm), per-ubatch hook `llama_context_params.cb_ubatch`.
 - State plumbing: `src/llama-context.cpp` (hook fired in `decode`'s ubatch loop,
   ~line 1976), `src/llama-memory.h` (virtuals take `pos_lo`/`pos_limit`),
   `src/llama-kv-cache.cpp` (window filter + APPEND),
@@ -42,11 +44,11 @@ produce them).
   - save path: `kv_chain_save_prefill_ubatch` (~line 912), armed per slot,
     dumps only when pos is on the bs-grid
   - restore path: SLOT_STATE_STARTED block (~line 3520), replays matched chunks
-  - native in-memory prefix caching is bypassed when kv_chain is set (~3317)
-  - context checkpoints are disabled when kv_chain is set (~3651, keeps the
+  - native in-memory prefix caching is bypassed when kv_chain is set (~3352)
+  - context checkpoints are disabled when kv_chain is set (~3730, keeps the
     ubatch grid on-stride; chunk files make them redundant anyway)
   - grid-safety startup guard: `-b`/`-ub` must have a power-of-2 ratio or the
-    server exits(1) (~line 1445)
+    server exits(1) (~1467)
 
 ## 2. Design in one paragraph
 
@@ -77,6 +79,12 @@ different model/config is a clean miss, never garbage.
   `--kv-chain-limit-gb N` (default 16; devops/env.sh passes 100).
 - Eviction: LRU by mtime after each write; a file vanishing mid-restore is a
   benign "cache ends here". Stray `.tmp` files removed at startup.
+- LRU touch on restore: `load_prefix` touches every matched .kvcache, the
+  TAIL .rscache, PLUS the .rscache of every chunk index that is a multiple of
+  `KV_CHAIN_RS_TOUCH_STRIDE` (8) below the tail — so intermediate fork-point
+  rs files survive LRU (a future prompt forking off the chain halfway still
+  finds its recurrent state). tested by the mtime gap-pattern check in
+  `llama_unittest_forked_chains.sh`.
 
 ## 4. Test status
 
@@ -93,7 +101,7 @@ recorded here, because those are what a regression changes:
 - `restore_session`  : cached_tokens 0/352, 6/6 phrases, >=10 files of each type
 - `evict_rscache`    : still a full restore (tail rs intact)
 - `evict_kvcache`    : chain breaks at chunk 2 -> cached_tokens 64
-- `forked_chains`    : exactly 0/352/96/352
+- `forked_chains`    : exactly 0/352/96/352 + rs-touch gap pattern
 - `ubatch_edge`      : 0/192, 0/256, 0/192 at -ub 64 (the middle pair is the
                        255/257 control; the 192s are the exact-multiple cap)
 - `dsv4f`            : cached_tokens 0/352, 6/6 phrases. NOT part of the runner
@@ -126,7 +134,7 @@ the 27B after every change). the `dsv4f` test covers DSV4F restore fidelity.
 ### How DSV4F differs from Qwen
 
 Qwen3.8 = 16 full-attn + 48 Gated DeltaNet. Its state splits cleanly into
-"per-token KV (additive, windowable)" + "recurrent R/S (fixed-size tail)".
+  "per-token KV (additive, windowable)" + "recurrent R/S (fixed-size tail)".
 DSV4F is NOT that shape. `llama_kv_cache_dsv4` owns FIVE groups
 (see src/llama-kv-cache-dsv4.h):
   - kv_raw  (ISWA: base+swa)  -> per-token, windowable like Qwen attn
@@ -134,7 +142,7 @@ DSV4F is NOT that shape. `llama_kv_cache_dsv4` owns FIVE groups
                                  prefix-style rows (row i covers [i*ratio,(i+1)*ratio))
   - csa_state / hca_state / lid_state -> compressor RING states (fixed-size)
 
-### The two new flags (see include/llama.h)
+### The part-selection flags (see include/llama.h)
 
   - ATTN_ONLY (16): per-token KV part only. on dsv4 = kv_raw (NOT the rings,
     NOT the compressed caches). on the hybrid / pure-attn caches == FULL_ONLY.
