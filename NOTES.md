@@ -183,6 +183,66 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
 
 ## 5. Quirks / gotchas
 
+### ⚠️ KNOWN BROKEN / OPEN ISSUE: --parallel > 1 attn blob + the 16 GB chunk regression
+
+**Status: NOT fixed. The fix attempt below was ROLLED BACK. Do not re-apply it.**
+
+Symptom that started this: a `--parallel 2` server reading chunk files written
+by a `--parallel 1` server (stale cache dir across a --parallel change) fails
+restore with `state_read: n_stream mismatch (blob=1 live=2, ...)`, then falls
+back to a 100% prefill. The `.kvcache` (attn) blob carries `n_stream` in its
+header and `llama_kv_cache::state_read` (src/llama-kv-cache.cpp, the
+`state_read` fn) ASSERTS blob-n_stream == live-n_stream, so the two --parallel
+values are incompatible. (The `.rscache`/recr blob is fine — it is always a
+single slot's R/S and does NOT scale with n_stream.)
+
+**The failed fix (ROLLED BACK — produced 16 GB .kvcache files per chunk at
+-ub 256, trashed the cache, broke everything).** It tried to make the attn blob
+stream-agnostic by, in `llama_kv_cache::state_write`, taking a NEW `seq_id != -1`
+fast-path that wrote an `n_stream==0` sentinel + ONE cell_count/meta/data block
+instead of the per-stream loop, and `state_read` handled `n_stream_cur==0`.
+WHY IT BLEW UP TO 16 GB: the per-stream loop is NOT redundant bookkeeping — with
+`n_stream == n_seq_max` (unified off) the cache has `n_stream` PARALLEL cell
+arrays (`v_cells[0..n_stream-1]`), and a given token position lives in the
+array `seq_to_stream[seq_id]`. The OLD loop iterated ALL streams and wrote the
+cells of EACH, but for a single-seq save only ONE stream actually contains the
+seq's cells (the others are empty for that seq) so it netted out to one block.
+The "optimization" of reading `v_cells[seq_to_stream[seq_id]]` directly LOOKS
+equivalent but the bug is that `seq_to_stream[seq_id]` is only valid AFTER the
+seq has been placed in the cache; combined with the window filter and the way
+`cells.size()` (the full ring, not the used prefix) is iterated, the single-array
+path ended up serializing the ENTIRE ring buffer (mem_size cells x n_layer x
+embd) instead of just the window — hence ~16 GB. The per-stream loop's
+`cell_count==0 -> continue` was implicitly bounding the output; the rewrite
+lost that bound.
+
+**How to fix it PROPERLY (do this, not the above):**
+1. Do NOT restructure the `state_write`/`state_read` core layout. The
+   per-stream loop + `n_stream` header is load-bearing and shared by ALL
+   llama state-seq callers (llama_state_seq_save_file etc.), not just kv-chain.
+2. The clean, minimal fix is the one REJECTED in this session for being
+   non-incremental but which is actually the safe one: bake `n_seq_max`
+   (== --parallel, == the attn `n_stream` when unified is off) into the
+   kv-chain ROOT HASH metadata blob (kv-chain-store.cpp `compute_root_hash`,
+   `kv_chain_metadata` struct). A different --parallel then gets a different
+    root hash -> a CLEAN MISS (no files match) instead of a silent n_stream
+    mismatch. This is correct because the R/S (.rscache) is semantically a
+    specific slot's state, so cross-parallel reuse is not meaningful anyway.
+    Add `uint32_t n_seq_max` to `kv_chain_metadata`, fill it in
+    `compute_root_hash` (from `params.n_parallel` — note n_seq_max == n_parallel,
+    see common/common.cpp `cparams.n_seq_max = params.n_parallel`), hash it in
+    the canonical serialization, and BUMP KV_CHAIN_VERSION (4 -> 5) so any
+    pre-existing cache dir is a clean miss.
+3. If cross-parallel attn reuse is ever actually wanted (it is NOT, the R/S
+   forbids it), that is a much larger core-llama serialization rework and
+   should be a separate, well-tested effort — do not attempt it as a side
+   effect.
+
+Relevant locations: src/llama-kv-cache.cpp `llama_kv_cache::state_write`
+(~line 1967) and `state_read` (~line 2059); tools/server/kv-chain-store.cpp
+`compute_root_hash` + `kv_chain_metadata` (in kv-chain-store.h) +
+`KV_CHAIN_VERSION` (line 32).
+
 - Chunk stride grid: every ubatch boundary must be a multiple of n_ubatch,
   including KV-full retry halvings (n_batch /= 2) — enforced by the startup
   guard (section 1); `-b == -ub` is trivially safe.
