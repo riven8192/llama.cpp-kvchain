@@ -44,7 +44,7 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
     const fs::path cache_dir = fs::path(this->root_dir);
     fs::create_directories(cache_dir, ec);
     if (ec) {
-        SRV_ERR("kv-chain: failed to create cache dir '%s': %s (ec=%d)\n",
+        SRV_ERR("kv-chain[storage]: failed to create cache dir '%s': %s (ec=%d)\n",
                 cache_dir.string().c_str(), ec.message().c_str(), ec.value());
         this->root_dir.clear();
         this->root_hash_ = 0;
@@ -64,7 +64,7 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
         const auto size = static_cast<uint64_t>(entry.file_size());
         total_bytes_cur += size;
     }
-    SRV_INF("kv-chain: cache dir '%s', root=%s, %zu bytes on disk, %.3f GiB (limit %.3f GiB), chunk ub=%d\n",
+    SRV_INF("kv-chain[storage]: cache dir '%s', root=%s, %zu bytes on disk, %.1f GiB (limit %.1f GiB), chunk ub=%d\n",
             cache_dir.string().c_str(), hash_str(root_hash_).c_str(), (size_t) total_bytes_cur,
             (double) total_bytes_cur / (1024.0*1024.0*1024.0),
             (double) limit_bytes / (1024.0*1024.0*1024.0),
@@ -169,10 +169,11 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     md.type_v            = params.cache_type_v;
     md.rope_scaling_type = params.rope_scaling_type;
     {
+        // copy the float bits portably (memcpy, not a type-punned pointer cast)
         const float rope_freq_base  = params.rope_freq_base;  // 0.0f = "from model"
         const float rope_freq_scale = params.rope_freq_scale; // 0.0f = "from model"
-        md.rope_freq_base_bits   = *reinterpret_cast<const uint32_t *>(&rope_freq_base);
-        md.rope_freq_scale_bits  = *reinterpret_cast<const uint32_t *>(&rope_freq_scale);
+        std::memcpy(&md.rope_freq_base_bits,  &rope_freq_base,  sizeof(uint32_t));
+        std::memcpy(&md.rope_freq_scale_bits, &rope_freq_scale, sizeof(uint32_t));
     }
 
     std::string model_path;
@@ -197,7 +198,7 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
         }
     }
     if (model == nullptr) {
-        SRV_WRN("kv-chain: no model handle, root hash will not include arch/ftype/file identity", (const char *) "");
+        SRV_WRN("%s", "kv-chain[storage]: no model handle, root hash will not include arch/ftype/file identity");
     }
 
     // canonical serialization: every field, length-prefixed, in struct order.
@@ -219,9 +220,11 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
 
     root_hash_ = h;
     {
-        const float rope_freq_base  = *reinterpret_cast<const float *>(&md.rope_freq_base_bits);
-        const float rope_freq_scale = *reinterpret_cast<const float *>(&md.rope_freq_scale_bits);
-        SRV_INF("kv-chain: metadata: version=%d chunk_size=%d model='%s' size=%lld mtime=%lld arch='%s' ftype='%s' type_k=%d type_v=%d rope=(%d,%.6g,%.6g)\n",
+        float rope_freq_base  = 0.0f;
+        float rope_freq_scale = 0.0f;
+        std::memcpy(&rope_freq_base,  &md.rope_freq_base_bits,  sizeof(float));
+        std::memcpy(&rope_freq_scale, &md.rope_freq_scale_bits, sizeof(float));
+        SRV_INF("kv-chain[storage]: metadata: version=%d chunk_size=%d model='%s' size=%lld mtime=%lld arch='%s' ftype='%s' type_k=%d type_v=%d rope=(%d,%.6g,%.6g)\n",
                 md.format_version, md.chunk_size, model_path.c_str(),
                 (long long) md.model_file_size, (long long) md.model_file_mtime,
                 md.arch.c_str(), md.ftype.c_str(),
@@ -242,7 +245,7 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
     std::vector<uint8_t> blob(size);
     const size_t got = llama_state_seq_get_data_window_ext(ctx, blob.data(), size, seq_id, flags, pos_lo, pos_hi);
     if (got == 0 || got != size) {
-        SRV_WRN("kv-chain: failed to get window state (%zu of %zu bytes)\n", got, size);
+        SRV_WRN("kv-chain[storage]: failed to get window state (%zu of %zu bytes)\n", got, size);
         return {};
     }
     return blob;
@@ -271,7 +274,7 @@ static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) 
     std::vector<uint8_t> blob(size);
     const size_t got = llama_state_seq_get_data_ext(ctx, blob.data(), size, seq_id, LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
     if (got == 0 || got != size) {
-        SRV_WRN("kv-chain: failed to get tail state (%zu of %zu bytes)\n", got, size);
+        SRV_WRN("kv-chain[storage]: failed to get tail state (%zu of %zu bytes)\n", got, size);
         return {};
     }
     return blob;
@@ -299,7 +302,7 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
     std::vector<uint8_t> attn = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY);
     std::vector<uint8_t> recr = dump_tail(ctx, seq_id);
     if (attn.empty() || recr.empty()) {
-        SRV_WRN("kv-chain: failed to dump chunk window [%d, %d)\n", (int) pos_lo, (int) pos_hi);
+        SRV_WRN("kv-chain[storage]: failed to dump chunk window [%d, %d)\n", (int) pos_lo, (int) pos_hi);
         return false;
     }
 
@@ -308,7 +311,7 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
     // [DEBUG] every save attempt: the hash the file will be named by (and the
     // parent it was computed from), plus whether both files already existed
     // (idempotent skip) or were written.
-    SRV_INF("kv-chain[save]: chunk hash=%s parent=%s tokens=[%d..%d) existing=(kv=%d rs=%d)\n",
+    SRV_INF("kv-chain[storage]: saving chunk hash=%s parent=%s tokens=[%d..%d) existing=(kv=%d rs=%d)\n",
             hash_str(chunk_hash).c_str(), hash_str(parent_hash).c_str(),
             (int) pos_lo, (int) pos_hi,
             (int) fs::exists(dir / (hash_str(chunk_hash) + ".kvcache")),
@@ -360,7 +363,7 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
         }
     }
     if (any_written) {
-        SRV_INF("kv-chain: saved chunk hash=%s (attn %.3f MiB, recr %.3f MiB)\n",
+        SRV_INF("kv-chain[storage]: saved chunk hash=%s (attn %.1f MiB, recr %.1f MiB)\n",
                 stem.c_str(),
                 (double) attn.size() / (1024.0*1024.0), (double) recr.size() / (1024.0*1024.0));
     }
@@ -374,7 +377,7 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
     {
         std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) {
-            SRV_ERR("kv-chain: failed to open '%s' for writing\n", tmp.string().c_str());
+            SRV_ERR("kv-chain[storage]: failed to open '%s' for writing\n", tmp.string().c_str());
             return false;
         }
         const uint32_t magic   = KV_CHAIN_MAGIC;
@@ -390,7 +393,7 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
         f.write(reinterpret_cast<const char *>(&blob_sz),  sizeof(blob_sz));
         f.write(reinterpret_cast<const char *>(blob.data()), blob.size());
         if (!f) {
-            SRV_ERR("kv-chain: write failed for '%s'\n", tmp.string().c_str());
+            SRV_ERR("kv-chain[storage]: write failed for '%s'\n", tmp.string().c_str());
             fs::remove(tmp, ec);
             return false;
         }
@@ -401,7 +404,7 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
 
     fs::rename(tmp, file, ec);
     if (ec) {
-        SRV_ERR("kv-chain: rename failed for '%s': %s\n", file.string().c_str(), ec.message().c_str());
+        SRV_ERR("kv-chain[storage]: rename failed for '%s': %s\n", file.string().c_str(), ec.message().c_str());
         fs::remove(tmp, ec);
         return false;
     }
@@ -437,7 +440,7 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     const uint32_t magic = *reinterpret_cast<const uint32_t *>(buf.data());
     const uint32_t version = *reinterpret_cast<const uint32_t *>(buf.data() + sizeof(uint32_t));
     if (magic != KV_CHAIN_MAGIC || version != KV_CHAIN_VERSION) {
-        SRV_WRN("kv-chain: bad magic/version in %s (magic=%08x version=%u), ignoring\n",
+        SRV_WRN("kv-chain[storage]: bad magic/version in %s (magic=%08x version=%u), ignoring\n",
                 file.string().c_str(), magic, version);
         return false;
     }
@@ -452,7 +455,7 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     // no trailing checksum in the file (see above)
     const size_t expected = hdr_len + sizeof(uint32_t) + blob_size;
     if (expected != file_size) {
-        SRV_WRN("kv-chain: size mismatch in %s (expected %zu, got %llu), ignoring\n",
+        SRV_WRN("kv-chain[storage]: size mismatch in %s (expected %zu, got %llu), ignoring\n",
                 file.string().c_str(), expected, (unsigned long long) file_size);
         return false;
     }
@@ -490,7 +493,7 @@ void kv_chain_store::evict_oldest(uint64_t need_bytes) {
         }
         if (fs::remove(e.p, ec)) {
             total_bytes_cur -= e.size;
-            SRV_INF("kv-chain: evicted %s (%.3f MiB)\n", e.p.filename().string().c_str(), e.size / (1024.0*1024.0));
+            SRV_INF("kv-chain[storage]: evicted %s (%.1f MiB)\n", e.p.filename().string().c_str(), e.size / (1024.0*1024.0));
         }
     }
 }
@@ -554,7 +557,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         const bool rs_exists = kv_exists && fs::exists(dir / (stem + ".rscache"));
         // [DEBUG] every find attempt: the precomputed name for chunk k and what
         // is on disk for it. a 'kv=0' here means the walk stops.
-        SRV_DBG("kv-chain[find]: chunk %zu hash=%s kv=%d rs=%d\n", k, stem.c_str(),
+        SRV_DBG("kv-chain[storage]: chunk %zu hash=%s kv=%d rs=%d\n", k, stem.c_str(),
                 (int) kv_exists, (int) rs_exists);
         if (!kv_exists) {
             break;
@@ -589,7 +592,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // reuse threshold by one, and the len % bs == bs-1 case already prefills bs-1.
     if (usable == n_chunks && n_chunks > 0 && tokens.size() % bs == 0) {
         usable--;
-        SRV_INF("kv-chain: prompt length %zu is an exact multiple of the chunk size %zu; "
+        SRV_INF("kv-chain[storage]: prompt length %zu is an exact multiple of the chunk size %zu; "
                 "capping the restore at %zu chunks so the last chunk is re-prefilled "
                 "(a forward pass is required to produce logits)\n",
                 tokens.size(), bs, usable);
@@ -597,7 +600,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
 
     *n_tokens = 0;
     if (usable == 0) {
-        SRV_INF("kv-chain: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);
+        SRV_INF("kv-chain[storage]: %zu prompt chunks, no usable chain (no kv+rs pair on disk)\n", n_chunks);
         return chunks;
     }
 
@@ -642,7 +645,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         std::vector<uint8_t> attn_blob;
         llama_tokens file_tokens;
         if (!read_chunk_file(kv_file, attn_blob, file_tokens) || file_tokens != block) {
-            SRV_WRN("kv-chain: load_prefix: kv read failed/mismatch at chunk %zu, cache ends here\n", k);
+            SRV_WRN("kv-chain[storage]: load_prefix: kv read failed/mismatch at chunk %zu, cache ends here\n", k);
             kv_failed = true;
             break;
         }
@@ -656,12 +659,12 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
             const fs::path rs_file = dir / (stems[k] + ".rscache");
             llama_tokens rs_tokens;
             if (!read_chunk_file(rs_file, recr_blob, rs_tokens) || rs_tokens != block) {
-                SRV_WRN("kv-chain: load_prefix: rs read failed/mismatch at tail chunk %zu, discarding entire restore\n", k);
+                SRV_WRN("kv-chain[storage]: load_prefix: rs read failed/mismatch at tail chunk %zu, discarding entire restore\n", k);
                 // if the file is still on disk it is corrupt/stale: delete it so
                 // it is not re-read (and re-deleted) on the next restore.
                 std::error_code dec;
                 if (fs::exists(rs_file, dec) && fs::remove(rs_file, dec)) {
-                    SRV_WRN("kv-chain: load_prefix: deleted corrupt rs file %s\n", rs_file.filename().string().c_str());
+                    SRV_WRN("kv-chain[storage]: load_prefix: deleted corrupt rs file %s\n", rs_file.filename().string().c_str());
                 }
                 rs_failed = true;
                 break;
@@ -697,13 +700,30 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
 
     if (usable > 0) {
         // touch exactly the files that were read and replayed:
-        // chunks[0..usable-1]'s .kvcache + the ONE .rscache of chunk (usable-1).
+        // chunks[0..usable-1]'s .kvcache + the .rscache of the TAIL chunk
+        // (usable-1), PLUS the .rscache of every chunk index that is a multiple
+        // of KV_CHAIN_RS_TOUCH_STRIDE below the tail (0, 8, 16, ... < usable-1,
+        // plus the tail itself if it happens to land on the grid).
+        // WHY: a future prompt may fork off this chain at one of those
+        // intermediate boundaries (a shorter shared prefix). if we only touched
+        // the tail rs file, LRU eviction would prune the intermediate rs files
+        // even though a fork at that boundary still needs its recurrent state -
+        // the fork would silently degrade to a full re-prefill of the shared
+        // trunk. touching the grid-stride rs files keeps the most useful fork
+        // points alive without paying for every chunk's rs file.
+        static constexpr size_t KV_CHAIN_RS_TOUCH_STRIDE = 8;
         std::vector<fs::path> to_touch(kv_files_touched.begin(), kv_files_touched.begin() + usable);
-        to_touch.push_back(dir / (stems[usable - 1] + ".rscache"));
+        const size_t tail = usable - 1;
+        for (size_t k = 0; k < tail; k += KV_CHAIN_RS_TOUCH_STRIDE) {
+            if (rs_present[k]) {
+                to_touch.push_back(dir / (stems[k] + ".rscache"));
+            }
+        }
+        to_touch.push_back(dir / (stems[tail] + ".rscache"));
         touch_chain_files(to_touch);
     }
 
-    SRV_INF("kv-chain: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu, replayed %zu chunks (%.3f GiB)\n",
+    SRV_INF("kv-chain[storage]: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu, replayed %zu chunks (%.1f GiB)\n",
             n_chunks, n_kv_found, usable, chunks.size(),
             (double) total_loaded / (1024.0*1024.0*1024.0));
     return chunks;

@@ -78,6 +78,35 @@ else
   PASS=0
 fi
 
+# --- rs-file touch-stride check -------------------------------------------
+# The restore touches the TAIL rs file PLUS every rs file at an index that is a
+# multiple of 8 (KV_CHAIN_RS_TOUCH_STRIDE in kv-chain-store.cpp) below the tail.
+# The chains in this test are 11 chunks (indices 0..10), so a full restore
+# touches rs at 0, 8 and the tail 10 -> exactly 3 rs files touched at ~the same
+# instant, while all the others keep their (earlier) save timestamps.
+#
+# We cannot map a file's hex hash name to a chunk index, so instead of checking
+# WHICH files were touched we check the COUNT: take the 4 most recently modified
+# .rscache files and look at the time gaps between them. prompt4's restore
+# (the last operation) touches 3 files at once, so sorted ascending the 4 newest
+# must show: a LARGE gap (>500ms) between the 4th-newest (a file that was NOT
+# touched in that restore) and the 3rd-newest, then small gaps (<100ms) between
+# the 3 files that WERE touched together. a wrong stride (e.g. touching only
+# the tail, or touching every rs file) changes this 4-tuple's gap pattern.
+#
+# (sloppy by design - see the comment in project-plan: this is a local hack,
+# the gap pattern is the strongest signal available without hash->index mapping)
+rs_touch_gaps=$( find "${KV_CACHE_DIR}" -name '*.rscache' -printf '%T@\n' 2>/dev/null | sort -n | tail -n 4 | awk 'NR>1{printf "%.3f ", $1-p} {p=$1}' )
+echo "rs-touch gaps (newest-4, oldest->newest): ${rs_touch_gaps}"
+n_small=$( echo "${rs_touch_gaps}" | awk '{n=0; for (i=1; i<=NF; i++) if ($i+0 < 0.1) n++} END{print n}' )
+n_large=$( echo "${rs_touch_gaps}" | awk '{n=0; for (i=1; i<=NF; i++) if ($i+0 > 0.5) n++} END{print n}' )
+if [[ "${n_small}" -eq 2 && "${n_large}" -eq 1 ]]; then
+  echo "PASS [rs-touch] 3 rs files touched together (2 gaps <100ms) + 1 gap >500ms to the rest"
+else
+  echo "FAIL [rs-touch] expected 2 gaps <100ms and 1 gap >500ms in the newest-4, got: ${rs_touch_gaps}"
+  PASS=0
+fi
+
 echo ""
 if [[ "${PASS}" -eq 1 ]]; then
   echo "=== RESULT: PASS ==="

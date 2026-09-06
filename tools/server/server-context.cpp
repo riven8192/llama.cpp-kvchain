@@ -3349,7 +3349,7 @@ private:
                                     // here so the kv-chain restore path is the single source of
                                     // truth. the UNEXPECTED warning below is the last-resort
                                     // check that this branch is the only prefix-cache path.
-                                    SLT_WRN(slot, "%s", "kv-chain: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
+                                    SLT_WRN(slot, "%s", "kv-chain[storage]: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
                                     n_past = 0;
                                 } else {
                                     // reuse any previously computed tokens that are common with the new prompt
@@ -3538,7 +3538,7 @@ private:
                         }
 
                         if (kv_chain) {
-                            SLT_INF(slot, "kv-chain: restore check: n_past=%d prompt.n_tokens=%zu cache_prompt=%d has_mtmd=%d input_n=%zu\n",
+                            SLT_INF(slot, "kv-chain[storage]: restore check: n_past=%d prompt.n_tokens=%d cache_prompt=%d has_mtmd=%d input_n=%zu\n",
                                     n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
                                     (int) input_tokens.has_mtmd, input_tokens.size());
                         }
@@ -3597,7 +3597,7 @@ private:
                                             chunks[k].attn_blob.data(), chunks[k].attn_blob.size(), slot.id,
                                             attn_flags, pos_lo, pos_hi);
                                     if (n_attn != chunks[k].attn_blob.size()) {
-                                        SLT_WRN(slot, "kv-chain: attn restore failed at chunk %zu (%zu of %zu bytes)\n",
+                                        SLT_WRN(slot, "kv-chain[storage]: attn restore failed at chunk %zu (%zu of %zu bytes)\n",
                                                 k, n_attn, chunks[k].attn_blob.size());
                                         ok = false;
                                         break;
@@ -3621,7 +3621,7 @@ private:
                                                 tail_recr.data(), tail_recr.size(), slot.id,
                                                 LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
                                         if (n_recr != tail_recr.size()) {
-                                            SLT_WRN(slot, "kv-chain: recr restore failed at tail chunk (%zu of %zu bytes)\n",
+                                            SLT_WRN(slot, "kv-chain[storage]: recr restore failed at tail chunk (%zu of %zu bytes)\n",
                                                     n_recr, tail_recr.size());
                                             ok = false;
                                         }
@@ -3636,10 +3636,10 @@ private:
                                     slot.kv_chain_full_restore = (n_saved >= (size_t) slot.task->n_tokens());
                                     const size_t n_left = (input_tokens.size() > (size_t) n_past)
                                                        ? (input_tokens.size() - (size_t) n_past) : 0;
-                                    SLT_INF(slot, "kv-chain: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
+                                    SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
                                             n_past, chunks.size(), n_left);
                                 } else {
-                                    SLT_WRN(slot, "kv-chain: failed to restore chain, falling back to prefill\n", (const char *) "");
+                                    SLT_WRN(slot, "%s", "kv-chain[storage]: failed to restore chain, falling back to prefill");
                                 }
                             }
                         }
