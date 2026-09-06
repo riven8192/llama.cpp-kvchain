@@ -22,7 +22,10 @@ both after a restart AND in the same session (no-restart): the pre-restore
 `seq_rm(0, -1)` properly resets the recurrent module's internal state. A
 restore NEVER covers the whole prompt — `load_prefix` caps it so at least one
 token is always re-prefilled (logits are not cacheable; a forward pass has to
-produce them).
+produce them). The restore STREAMS: `load_prefix` only validates the tail
+.rscache and returns file paths; the replay loop reads each .kvcache one at a
+time (read -> set_data -> free), so peak RAM = one file, never the whole
+chain (matters on a 128 GB box running an 110 GB model).
 
 ## 1. Where things live
 
@@ -63,10 +66,13 @@ fixed-size object per position (restore: the LAST chunk's rs wins — it cannot
 roll back mid-chunk, hence partial-chunk reuse is descoped). Restore is
 two-phase: phase 1 walks the chain with `fs::exists()` only (cheap, no reads)
 to find the first missing .kvcache (the break) and `usable` = the last chunk
-with an rs file; phase 2 reads the .kvcache of every chunk in [0,usable) and
-the .rscache of the TAIL chunk ALONE (the earlier rs files are superseded, so
-they are never read). A missing middle .rscache is simply skipped (empty
-recr_blob, no set_data); the chain is truncated at `usable`. One version number,
+with an rs file; phase 2 validates the TAIL .rscache (the only rs ever read;
+a bad tail discards the whole restore + deletes the corrupt file) and returns
+the matched chunks as file paths — the caller then replays them one at a time
+(read .kvcache -> set_data -> free; tail rs read last), so the whole chain is
+never in RAM at once. A missing middle .rscache is simply skipped (the chain
+is truncated at `usable`); a .kvcache that fails mid-replay truncates at the
+deepest loaded chunk with a valid rs file. One version number,
 `KV_CHAIN_VERSION`, covers both the file layout and the root-hash metadata blob
 (bump on any change to either; see kv-chain-store.cpp). Hash chain: FNV-1a64,
 `hash_k = H(hash_{k-1} + chunk_k_tokens)`; root dir = FNV-1a64 over a metadata
@@ -215,15 +221,16 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
   trade-off). The size/magic/version/token checks in `read_chunk_file` still
   catch layout corruption. BUMP KV_CHAIN_VERSION if you ever re-add it (old
   no-checksum files would otherwise be mis-parsed).
-- Two-phase restore reads the .rscache of the TAIL chunk only. a FAILED ATTN
-  (.kvcache) read at chunk k is a benign "cache ends here": walk back to the
-  last fully-loaded chunk that has a valid rs file (its recr IS the tail we
-  already read) and prefill the rest. a FAILED TAIL .rscache read is different:
-  the recurrent tail is a single fixed-size object and we only ever read the
-  LAST one, so there is no earlier rs to fall back to. `load_prefix` then
-  DISCARDS the ENTIRE restore (n_loaded=0 -> 100% prefill) and, if the file is
-  still on disk, DELETES it (corrupt/stale) so the re-prefill re-saves a clean
-  one instead of re-reading + re-deleting it every request.
+- Only the .rscache of the TAIL chunk is ever read (the recurrent tail is a
+  single fixed-size object; the middle rs files are superseded). a FAILED ATTN
+  (.kvcache) read at chunk k is a benign "cache ends here" (eviction race):
+  the replay loop (server-context.cpp) truncates at the last loaded chunk that
+  has a valid rs file (kv_chain_store::last_rs_present()) and prefills the
+  rest. a FAILED TAIL .rscache read is different: there is no earlier rs to
+  fall back to. `load_prefix` validates the tail up front and, on failure,
+  DISCARDS the ENTIRE restore (100% prefill) and, if the file is still on
+  disk, DELETES it (corrupt/stale) so the re-prefill re-saves a clean one
+  instead of re-reading + re-deleting it every request.
 - devops/llama_run.sh: server stdout goes to log FILES ONLY (an inherited
   stdout pipe makes pipe-EOF-waiting callers hang); $log is a symlink to the
   newest timestamped log.
