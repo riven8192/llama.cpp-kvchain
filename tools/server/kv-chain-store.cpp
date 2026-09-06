@@ -29,7 +29,16 @@ static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
 //     (PARTIAL_ONLY -> TAIL_ONLY), so old files are a clean miss. bump whenever
 //     EITHER changes: an old file with a stale version is never read (version
 //     check), and the root hash changes, so old chunks are a clean miss.
-static constexpr uint32_t KV_CHAIN_VERSION = 4;
+// v5: n_seq_max (--parallel) added to the root-hash metadata blob. the attn
+//     blob's n_stream scales with --parallel (with kv-unified off the cache has
+//     n_stream == n_seq_max parallel cell arrays), so a chunk file written by a
+//     server with a different --parallel used to fail restore with
+//     "state_read: n_stream mismatch" and fall back to a 100% prefill. baking
+//     it into the root hash turns that into a CLEAN MISS (different chain
+//     names, no files match). the version is ALSO hashed into the root, so a
+//     chain computed under an older version can never hit a file written by
+//     this one.
+static constexpr uint32_t KV_CHAIN_VERSION = 5;
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t ubatch_size,
                                const common_params & params, const llama_model * model) :
@@ -168,6 +177,14 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     md.type_k            = params.cache_type_k;
     md.type_v            = params.cache_type_v;
     md.rope_scaling_type = params.rope_scaling_type;
+    // --parallel becomes the ctx's n_seq_max (common/common.cpp: cparams.n_seq_max
+    // = params.n_parallel). with kv-unified off the attn cache has n_stream ==
+    // n_seq_max parallel cell arrays, so a different --parallel changes the attn
+    // blob LAYOUT -> it must change the root hash (clean miss, not a mismatch).
+    // the .rscache blob never carries n_stream (a single slot's R/S), but a
+    // clean miss is still the right semantics: cross-parallel reuse is not
+    // meaningful anyway.
+    md.n_seq_max           = static_cast<uint32_t>(params.n_parallel > 0 ? params.n_parallel : 1);
     {
         // copy the float bits portably (memcpy, not a type-punned pointer cast)
         const float rope_freq_base  = params.rope_freq_base;  // 0.0f = "from model"
@@ -216,6 +233,7 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     h = hash_le(h, static_cast<uint64_t>(md.rope_scaling_type),4);
     h = hash_le(h, md.rope_freq_base_bits,  4);
     h = hash_le(h, md.rope_freq_scale_bits, 4);
+    h = hash_le(h, md.n_seq_max,            4);
     h = hash_str_field(h, model_path);
 
     root_hash_ = h;
@@ -224,12 +242,13 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
         float rope_freq_scale = 0.0f;
         std::memcpy(&rope_freq_base,  &md.rope_freq_base_bits,  sizeof(float));
         std::memcpy(&rope_freq_scale, &md.rope_freq_scale_bits, sizeof(float));
-        SRV_INF("kv-chain[storage]: metadata: version=%d chunk_size=%d model='%s' size=%lld mtime=%lld arch='%s' ftype='%s' type_k=%d type_v=%d rope=(%d,%.6g,%.6g)\n",
+        SRV_INF("kv-chain[storage]: metadata: version=%d chunk_size=%d model='%s' size=%lld mtime=%lld arch='%s' ftype='%s' type_k=%d type_v=%d rope=(%d,%.6g,%.6g) n_seq_max=%d\n",
                 md.format_version, md.chunk_size, model_path.c_str(),
                 (long long) md.model_file_size, (long long) md.model_file_mtime,
                 md.arch.c_str(), md.ftype.c_str(),
                 (int) md.type_k, (int) md.type_v,
-                md.rope_scaling_type, rope_freq_base, rope_freq_scale);
+                md.rope_scaling_type, rope_freq_base, rope_freq_scale,
+                (int) md.n_seq_max);
     }
 }
 

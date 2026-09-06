@@ -739,10 +739,24 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     // Count the number of cells with the specified seq_id
     // Find all the ranges of cells with this seq id (or all, when -1)
+    // NOTE: a cell OUTSIDE [pos_lo, pos_limit) must close the current range,
+    // not just be skipped with `continue` (which would let the range span it):
+    // cell_ranges is a range over the raw cells[] index space, and the DEBUG
+    // CHECK below recomputes the count from those ranges. skipping without
+    // closing merges the ranges across the gap (count mismatch -> assert).
+    // this only matters for --parallel > 1, where the recurrent ring can hold
+    // cells of multiple slots interleaved (e.g. slot 1 cells at even positions,
+    // slot 0 at odd) - a window filter then sees out-of-window cells between
+    // in-window ones. (with a single slot all cells are contiguous, so a bare
+    // `continue` happened to work there)
     uint32_t cell_range_begin = size;
     for (uint32_t i = 0; i < size; ++i) {
         const auto & cell = cells[i];
         if (cell.pos < pos_lo || cell.pos >= pos_limit) {
+            if (cell_range_begin != size) {
+                cell_ranges.emplace_back(cell_range_begin, i);
+                cell_range_begin = size;
+            }
             continue;
         }
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {

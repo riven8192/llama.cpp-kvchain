@@ -61,6 +61,9 @@ struct kv_chain_metadata {
     int32_t  rope_scaling_type;           // llama_rope_scaling_type
     uint32_t rope_freq_base_bits;         // float bits (0.0f = "from model")
     uint32_t rope_freq_scale_bits;        // float bits (0.0f = "from model")
+    uint32_t n_seq_max;                   // --parallel: the attn blob's n_stream scales with it, so
+                                          // a different --parallel gets a different root hash ->
+                                          // a clean miss instead of a blob/live n_stream mismatch
 };
 
 class kv_chain_store {

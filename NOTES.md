@@ -9,7 +9,7 @@ selected via `LLAMA_HF_REF` (devops/env.sh, default
 resolves the exact snapshot file (and downloads it if missing). The kv-chain
 root hash uses the resolved path, so cache identity follows the ref.
 
-CURRENT STATE: v4 — chunk state is split into `<hash>.kvcache` (attn) +
+CURRENT STATE: v5 — chunk state is split into `<hash>.kvcache` (attn) +
 `<hash>.rscache` (tail) in a FLAT cache dir. The .kvcache holds an ATTN_ONLY
 blob (per-token KV rows for the chunk window only); the .rscache holds a
 TAIL_ONLY blob (the tail object, last write wins, only the last chunk's copy is
@@ -75,9 +75,9 @@ is truncated at `usable`); a .kvcache that fails mid-replay truncates at the
 deepest loaded chunk with a valid rs file. One version number,
 `KV_CHAIN_VERSION`, covers both the file layout and the root-hash metadata blob
 (bump on any change to either; see kv-chain-store.cpp). Hash chain: FNV-1a64,
-`hash_k = H(hash_{k-1} + chunk_k_tokens)`; root dir = FNV-1a64 over a metadata
-blob (stat-only model identity, chunk size, dtypes, rope, version) so a
-different model/config is a clean miss, never garbage.
+`hash_k = H(hash_{k-1} + chunk_k_tokens)`; root = FNV-1a64 over a metadata
+blob (stat-only model identity, chunk size, dtypes, rope, n_seq_max, version)
+so a different model/config/parallel is a clean miss, never garbage.
 
 ## 3. Config
 
@@ -183,66 +183,21 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
 
 ## 5. Quirks / gotchas
 
-### ⚠️ KNOWN BROKEN / OPEN ISSUE: --parallel > 1 attn blob + the 16 GB chunk regression
-
-**Status: NOT fixed. The fix attempt below was ROLLED BACK. Do not re-apply it.**
-
-Symptom that started this: a `--parallel 2` server reading chunk files written
-by a `--parallel 1` server (stale cache dir across a --parallel change) fails
-restore with `state_read: n_stream mismatch (blob=1 live=2, ...)`, then falls
-back to a 100% prefill. The `.kvcache` (attn) blob carries `n_stream` in its
-header and `llama_kv_cache::state_read` (src/llama-kv-cache.cpp, the
-`state_read` fn) ASSERTS blob-n_stream == live-n_stream, so the two --parallel
-values are incompatible. (The `.rscache`/recr blob is fine — it is always a
-single slot's R/S and does NOT scale with n_stream.)
-
-**The failed fix (ROLLED BACK — produced 16 GB .kvcache files per chunk at
--ub 256, trashed the cache, broke everything).** It tried to make the attn blob
-stream-agnostic by, in `llama_kv_cache::state_write`, taking a NEW `seq_id != -1`
-fast-path that wrote an `n_stream==0` sentinel + ONE cell_count/meta/data block
-instead of the per-stream loop, and `state_read` handled `n_stream_cur==0`.
-WHY IT BLEW UP TO 16 GB: the per-stream loop is NOT redundant bookkeeping — with
-`n_stream == n_seq_max` (unified off) the cache has `n_stream` PARALLEL cell
-arrays (`v_cells[0..n_stream-1]`), and a given token position lives in the
-array `seq_to_stream[seq_id]`. The OLD loop iterated ALL streams and wrote the
-cells of EACH, but for a single-seq save only ONE stream actually contains the
-seq's cells (the others are empty for that seq) so it netted out to one block.
-The "optimization" of reading `v_cells[seq_to_stream[seq_id]]` directly LOOKS
-equivalent but the bug is that `seq_to_stream[seq_id]` is only valid AFTER the
-seq has been placed in the cache; combined with the window filter and the way
-`cells.size()` (the full ring, not the used prefix) is iterated, the single-array
-path ended up serializing the ENTIRE ring buffer (mem_size cells x n_layer x
-embd) instead of just the window — hence ~16 GB. The per-stream loop's
-`cell_count==0 -> continue` was implicitly bounding the output; the rewrite
-lost that bound.
-
-**How to fix it PROPERLY (do this, not the above):**
-1. Do NOT restructure the `state_write`/`state_read` core layout. The
-   per-stream loop + `n_stream` header is load-bearing and shared by ALL
-   llama state-seq callers (llama_state_seq_save_file etc.), not just kv-chain.
-2. The clean, minimal fix is the one REJECTED in this session for being
-   non-incremental but which is actually the safe one: bake `n_seq_max`
-   (== --parallel, == the attn `n_stream` when unified is off) into the
-   kv-chain ROOT HASH metadata blob (kv-chain-store.cpp `compute_root_hash`,
-   `kv_chain_metadata` struct). A different --parallel then gets a different
-    root hash -> a CLEAN MISS (no files match) instead of a silent n_stream
-    mismatch. This is correct because the R/S (.rscache) is semantically a
-    specific slot's state, so cross-parallel reuse is not meaningful anyway.
-    Add `uint32_t n_seq_max` to `kv_chain_metadata`, fill it in
-    `compute_root_hash` (from `params.n_parallel` — note n_seq_max == n_parallel,
-    see common/common.cpp `cparams.n_seq_max = params.n_parallel`), hash it in
-    the canonical serialization, and BUMP KV_CHAIN_VERSION (4 -> 5) so any
-    pre-existing cache dir is a clean miss.
-3. If cross-parallel attn reuse is ever actually wanted (it is NOT, the R/S
-   forbids it), that is a much larger core-llama serialization rework and
-   should be a separate, well-tested effort — do not attempt it as a side
-   effect.
-
-Relevant locations: src/llama-kv-cache.cpp `llama_kv_cache::state_write`
-(~line 1967) and `state_read` (~line 2059); tools/server/kv-chain-store.cpp
-`compute_root_hash` + `kv_chain_metadata` (in kv-chain-store.h) +
-`KV_CHAIN_VERSION` (line 32).
-
+- `--parallel > 1` is supported: `n_seq_max` (= `--parallel`) is baked into the
+  kv-chain ROOT HASH (kv-chain-store.cpp `compute_root_hash`,
+  `kv_chain_metadata`), so a chunk file written by a server with a different
+  --parallel is a CLEAN MISS (different chain names), not the old
+  `state_read: n_stream mismatch` fallback. Do NOT restructure the attn
+  `state_write`/`state_read` per-stream loop to make the blob stream-agnostic:
+  that loop is load-bearing and shared by all llama state-seq callers, and a
+  previous attempt at it serialized the whole recurrent ring (~16 GB files).
+  Cross-parallel REUSE of chunk files is deliberately unsupported (the .rscache
+  is one slot's R/S). tested by `llama_unittest_parallel.sh`.
+- The recurrent window filter (llama-memory-recurrent.cpp `state_write`) must
+  CLOSE the open cell range on an out-of-window cell, not just `continue`:
+  with --parallel > 1 the recurrent ring interleaves cells of multiple slots,
+  so a bare skip let `cell_ranges` span the gap and tripped the
+  `cell_count == cell_count_check` assert on the first chunk save.
 - Chunk stride grid: every ubatch boundary must be a multiple of n_ubatch,
   including KV-full retry halvings (n_batch /= 2) — enforced by the startup
   guard (section 1); `-b == -ub` is trivially safe.
@@ -266,12 +221,11 @@ Relevant locations: src/llama-kv-cache.cpp `llama_kv_cache::state_write`
   prompt has media. use `get_text_tokens()` (not `get_tokens()`) to get the
   token list without the `!has_mtmd` assert.
 - `-ub` has a floor of 32 (`-ub 8` is silently ignored -> 2048).
-- With MTP speculative decoding enabled, the `cb_ubatch` hook fires TWICE at the
-  final (off-grid) tail position: once for the real prefill, once from the MTP
-  draft path (`common_speculative_impl_draft_mtp::process` -> `llama_decode` on
-  the draft ctx). BENIGN: the draft runs on a separate ctx (separate R/S), so the
-  target cache is committed exactly once — verified byte-identical output at
-  temp=0/seed=42 with MTP on vs off. off-grid, so no chunk is saved either way.
+- With MTP speculative decoding enabled, the `cb_ubatch` hook fires TWICE at
+  every completed boundary (once for the target prefill, once from the MTP
+  draft path re-decoding the same tokens). the save hook dedupes on
+  `slot.kv_chain_last_saved_pos`, so the second fire is a no-op (log line only,
+  no re-dump).
 - Model-file mtime in the metadata blob uses std::filesystem's
   last_write_time (different epoch than unix time, logs as a negative number).
   Consistent across runs so the root hash is stable; do not "fix" it without

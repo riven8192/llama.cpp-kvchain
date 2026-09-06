@@ -279,6 +279,17 @@ struct server_slot {
     // or the prompt has no complete chunk.
     std::vector<uint64_t> kv_chain_hashes;
 
+    // the `pos` (tokens committed) of the last chunk boundary this slot saved.
+    // the per-ubatch hook can fire TWICE for the same boundary when MTP
+    // speculative decoding is on: after the target prefill pass, the MTP draft
+    // path (common_speculative_impl_draft_mtp::process) re-runs llama_decode on
+    // the SAME tokens, which fires cb_ubatch a second time with the identical
+    // pos. without this dedupe the second call would re-dump the whole chunk
+    // blob (~150 MiB) before kv_chain_store::save finds the files already
+    // exist and skips the write. normal prefill always advances pos, so this
+    // can only ever match the MTP double-fire.
+    size_t kv_chain_last_saved_pos = 0;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -357,6 +368,7 @@ struct server_slot {
         spec_is_replay = false;
         kv_chain_restored = false;
         kv_chain_full_restore = false;
+        kv_chain_last_saved_pos = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -950,6 +962,14 @@ private:
         // [(k-1)*bs, k*bs). e.g. pos=32 completes chunk 0 = [0,32).
         const size_t chunk_n = pos / bs - 1;
 
+        // MTP double-fire dedupe: the draft path re-decodes the same tokens and
+        // re-fires this hook at the identical pos (see kv_chain_last_saved_pos).
+        // the chunk was already dumped by the target pass, so skip.
+        if (pos == slot.kv_chain_last_saved_pos) {
+            SLT_INF(slot, "kv-chain[ubatch]: pos=%d already saved (MTP draft re-fire), skipping\n", (int) pos);
+            return;
+        }
+
         const size_t n = slot.prompt.n_tokens();
         if (pos > n) {
             return;
@@ -975,6 +995,7 @@ private:
         // chunks are replayed in order (attn appends, recurrent overwrites).
         kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
                        chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // [DEBUG] parent for logging only
+        slot.kv_chain_last_saved_pos = pos;
     }
 
     server_metrics metrics;
