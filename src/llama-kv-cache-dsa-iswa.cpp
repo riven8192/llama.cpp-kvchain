@@ -233,20 +233,30 @@ bool llama_kv_cache_dsa_iswa::get_can_shift() const {
            kv_dsa->get_mla()->get_size() == kv_swa->get_size();
 }
 
-void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        kv_dsa->state_write(io, seq_id, flags);
+void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
+    // here the dsa part is a separate kv_dsa, so FULL_ONLY/ATTN_ONLY select it
+    // alone and PARTIAL_ONLY/TAIL_ONLY select the swa part alone (mirrors iswa).
+    const bool write_dsa = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool write_swa = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    if (write_dsa) {
+        kv_dsa->state_write(io, seq_id, flags, pos_lo, pos_limit);
     }
-
-    kv_swa->state_write(io, seq_id, flags);
+    if (write_swa) {
+        kv_swa->state_write(io, seq_id, flags, pos_lo, pos_limit);
+    }
 }
 
-void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        kv_dsa->state_read(io, seq_id, flags);
+void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    // mirror of state_write: on this cache ATTN_ONLY == FULL_ONLY and
+    // TAIL_ONLY == PARTIAL_ONLY (the dsa part is a separate kv_dsa).
+    const bool read_dsa = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool read_swa = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    if (read_dsa) {
+        kv_dsa->state_read(io, seq_id, flags, pos_lo, pos_limit);
     }
-
-    kv_swa->state_read(io, seq_id, flags);
+    if (read_swa) {
+        kv_swa->state_read(io, seq_id, flags, pos_lo, pos_limit);
+    }
 }
 
 llama_kv_cache_dsa * llama_kv_cache_dsa_iswa::get_dsa() const {

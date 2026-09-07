@@ -2152,6 +2152,7 @@ const slot_info_vec_t *   sinfos_in,
         return;
     }
 
+    GGML_UNUSED(flags);
     GGML_UNUSED(pos_lo);
     GGML_UNUSED(pos_limit); // the blob already contains only cells in [pos_lo, pos_limit)
 
