@@ -2975,10 +2975,12 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 // the seq-state blob header is ONLY this magic: the source seq_id used to be
 // written right after it, but NOTHING ever consumed it (the read path loaded
 // it into a local and discarded it; the destination is the caller's dest_seq_id
-// argument). it was removed from the header - the magic was bumped from the old
-// 0xaf143cd8 so a new binary rejects old blobs (which carry the extra 4 bytes)
-// instead of mis-parsing them.
-static constexpr uint32_t io_magic_seq = 0xaf143cd9;
+// argument). it was removed from the header. the magic value itself is kept
+// constant (0xaf143cd8) - the file-level KV_CHAIN_VERSION check in
+// kv-chain-store.cpp is the boundary that keeps old (seq_id-carrying) blobs
+// from being read; a raw blob fed directly to the state_seq_set API bypasses
+// that check, so local caches from before this change must be deleted.
+static constexpr uint32_t io_magic_seq = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
