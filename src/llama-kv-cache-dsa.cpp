@@ -161,14 +161,14 @@ bool llama_kv_cache_dsa::get_can_shift() const {
            kv_mla->get_size() == kv_lid->get_size();
 }
 
-void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    kv_mla->state_write(io, seq_id, flags);
-    kv_lid->state_write(io, seq_id, flags);
+void llama_kv_cache_dsa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
+    kv_mla->state_write(io, seq_id, flags, pos_lo, pos_limit);
+    kv_lid->state_write(io, seq_id, flags, pos_lo, pos_limit);
 }
 
-void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    kv_mla->state_read(io, seq_id, flags);
-    kv_lid->state_read(io, seq_id, flags);
+void llama_kv_cache_dsa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    kv_mla->state_read(io, seq_id, flags, pos_lo, pos_limit);
+    kv_lid->state_read(io, seq_id, flags, pos_lo, pos_limit);
 }
 
 llama_kv_cache * llama_kv_cache_dsa::get_mla() const {

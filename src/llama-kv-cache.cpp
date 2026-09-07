@@ -2050,15 +2050,27 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     return gf;
 }
 
-void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
 
-    GGML_UNUSED(flags);
+    // a plain kv cache has no recurrent part: PARTIAL_ONLY / TAIL_ONLY must
+    // serialize an EMPTY state (the real n_stream, then cell_count=0 per
+    // stream - NOT n_stream=0, which would trip the read-side n_stream check).
+    // without this, the restore would read the full attn state as recr.
+    const bool recr_only = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
 
     io.write(&n_stream, sizeof(n_stream));
+
+    if (recr_only) {
+        const uint32_t cell_count_empty = 0;
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            io.write(&cell_count_empty, sizeof(cell_count_empty));
+        }
+        return;
+    }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         cell_ranges_t cr { s, {} };
@@ -2076,6 +2088,8 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && (cells.pos_get(i) >= pos_lo);
+            add_cell = add_cell && (cells.pos_get(i) < pos_limit);
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
@@ -2120,22 +2134,26 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 }
 
-void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
+void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    state_read_sinfo(io, seq_id, flags, pos_lo, pos_limit, nullptr, nullptr, false);
 }
 
 void llama_kv_cache::state_read_sinfo(
         llama_io_read_i & io,
            llama_seq_id   seq_id,
   llama_state_seq_flags   flags,
+             llama_pos    pos_lo,
+             llama_pos    pos_limit,
       slot_info_vec_t *   sinfos_out,
-const slot_info_vec_t *   sinfos_in) {
+const slot_info_vec_t *   sinfos_in,
+             bool         append) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
 
-    GGML_UNUSED(flags);
+    GGML_UNUSED(pos_lo);
+    GGML_UNUSED(pos_limit); // the blob already contains only cells in [pos_lo, pos_limit)
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -2177,7 +2195,7 @@ const slot_info_vec_t *   sinfos_in) {
         slot_info sinfo;
 
         bool res = true;
-        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr);
+        res = res && state_read_meta(io, strm, cell_count, sinfo, seq_id, sinfos_in ? &(*sinfos_in)[s] : nullptr, append);
 
         try {
             res = res && state_read_data(io, strm, cell_count, sinfo);
@@ -2332,13 +2350,15 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
-bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in) {
+bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id, const slot_info * sinfo_in, bool append) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
     if (dest_seq_id != -1) {
         // single sequence
-        seq_rm(dest_seq_id, -1, -1);
+        if (!append) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 

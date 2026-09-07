@@ -395,6 +395,11 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // called after each ubatch is processed by llama_decode, with the
+        // position of the ubatch's last token (the boundary just completed)
+        void (* cb_ubatch)(void * user_data, uint32_t n_pos);
+        void *              cb_ubatch_data;
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
@@ -911,6 +916,22 @@ extern "C" {
 // work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
+// inverse of PARTIAL_ONLY: work only with the full (per-token KV) cache, skipping the recurrent state
+#define LLAMA_STATE_SEQ_FLAGS_FULL_ONLY 4
+
+// like FULL_ONLY, but never includes the fixed-size recurrent / ring state even
+// on caches that bundle it into the full part (e.g. llama_kv_cache_dsv4);
+// behaves like FULL_ONLY on the plain hybrid and pure-attn caches.
+#define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY 16
+
+// inverse of ATTN_ONLY: everything except the per-token KV part. on
+// llama_kv_cache_dsv4 this is the compressed K caches + the ring states; on
+// the plain hybrid and pure-attn caches it behaves like PARTIAL_ONLY.
+#define LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY 32
+
+// on restore (state_read), do not clear the destination seq's cells first; append to them
+#define LLAMA_STATE_SEQ_FLAGS_APPEND 8
+
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
@@ -920,7 +941,15 @@ extern "C" {
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
-           llama_state_seq_flags   flags);
+            llama_state_seq_flags   flags);
+
+    // size of the seq state blob for the window [pos_lo, pos_limit)
+    LLAMA_API size_t llama_state_seq_get_size_window_ext(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+            llama_state_seq_flags   flags,
+                    llama_pos      pos_lo,
+                    llama_pos      pos_limit);
 
     LLAMA_API size_t llama_state_seq_get_data_ext(
             struct llama_context * ctx,
@@ -931,10 +960,46 @@ extern "C" {
 
     LLAMA_API size_t llama_state_seq_set_data_ext(
             struct llama_context * ctx,
-                   const uint8_t * src,
-                          size_t   size,
-                    llama_seq_id   dest_seq_id,
-           llama_state_seq_flags   flags);
+                    const uint8_t * src,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+
+    // like the _ext above, but only (de)serialize cells with pos_lo <= pos < pos_limit
+    LLAMA_API size_t llama_state_seq_get_data_window_ext(
+            struct llama_context * ctx,
+                          uint8_t * dst,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_lo,
+                          llama_pos pos_limit);
+
+    LLAMA_API size_t llama_state_seq_set_data_window_ext(
+            struct llama_context * ctx,
+                    const uint8_t * src,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_lo,
+                          llama_pos pos_limit);
+
+    // like the _ext above, but only (de)serialize cells with pos < pos_limit
+    LLAMA_API size_t llama_state_seq_get_data_prefix_ext(
+            struct llama_context * ctx,
+                          uint8_t * dst,
+                           size_t   size,
+                     llama_seq_id   seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_limit);
+
+    LLAMA_API size_t llama_state_seq_set_data_prefix_ext(
+            struct llama_context * ctx,
+                    const uint8_t * src,
+                           size_t   size,
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags,
+                          llama_pos pos_limit);
 
     //
     // Decoding

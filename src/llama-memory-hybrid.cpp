@@ -187,18 +187,30 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
-void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_write(io, seq_id, flags);
+void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
+    // here the recurrent part is a separate mem_recr, so FULL_ONLY/ATTN_ONLY
+    // select mem_attn alone and PARTIAL_ONLY/TAIL_ONLY select mem_recr alone.
+    const bool write_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool write_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    if (write_attn) {
+        mem_attn->state_write(io, seq_id, flags, pos_lo, pos_limit);
     }
-    mem_recr->state_write(io, seq_id, flags);
+    if (write_recr) {
+        mem_recr->state_write(io, seq_id, flags, pos_lo, pos_limit);
+    }
 }
 
-void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-        mem_attn->state_read(io, seq_id, flags);
+void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    // mirror of state_write: on this hybrid ATTN_ONLY == FULL_ONLY and
+    // TAIL_ONLY == PARTIAL_ONLY (the recurrent part is a separate mem_recr).
+    const bool read_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+    const bool read_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    if (read_attn) {
+        mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit);
     }
-    mem_recr->state_read(io, seq_id, flags);
+    if (read_recr) {
+        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit);
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

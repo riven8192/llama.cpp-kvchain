@@ -491,6 +491,9 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
+    void (* cb_ubatch)(void * user_data, uint32_t n_pos) = nullptr;
+    void * cb_ubatch_data                                = nullptr;
+
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
@@ -630,6 +633,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string kv_chain_dir    = "";    // disk-backed hash-chain KV cache dir (empty = disabled)
+    int32_t kv_chain_limit_gb   = 16;    // max total size of the hash-chain KV cache, in GiB (0 = no limit)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

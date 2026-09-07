@@ -1,0 +1,9 @@
+# runtime artifacts
+*.log
+*.pid
+*.lock
+.kv-cache/
+
+# large prompt fixtures (pasted in for the ubatch-grid probe; not source)
+prompt_30k.txt
+prompt_7sentences.txt

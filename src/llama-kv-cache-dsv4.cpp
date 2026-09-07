@@ -22,6 +22,9 @@ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
+// compressed K rows + rings, no kv_raw. dsv4 never emits this on its own; it is
+// the TAIL_ONLY mode (the per-chunk files already hold kv_raw).
+static constexpr uint32_t DSV4_STATE_MODE_TAIL     = 2;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
@@ -1591,20 +1594,37 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
-void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    // ATTN_ONLY: only the per-token KV (kv_raw) - never the rings or the
+    // compressed K caches (both are the "tail object", stored separately).
+    const bool attn_only    = flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY;
+    // TAIL_ONLY: the compressed K caches + the rings, WITHOUT kv_raw (a FULL-
+    // mode read clears kv_raw first, which would wipe the restored per-token
+    // rows; and the tail prefill does not recompute the compressed caches).
+    const bool tail_only    = flags & LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY;
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
-    const uint32_t mode    = partial_only ? DSV4_STATE_MODE_PARTIAL : DSV4_STATE_MODE_FULL;
+    // FULL    = kv_raw + compressed + rings
+    // PARTIAL = kv_raw only                   (the in-memory checkpoint shape)
+    // TAIL    = compressed + rings            (no kv_raw)
+    const uint32_t mode    = (partial_only || attn_only) ? DSV4_STATE_MODE_PARTIAL
+                                 : tail_only             ? DSV4_STATE_MODE_TAIL
+                                                         : DSV4_STATE_MODE_FULL;
 
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    kv_raw->state_write(io, seq_id, flags);
+    // kv_raw is skipped only for TAIL_ONLY (see above)
+    if (!tail_only) {
+        kv_raw->state_write(io, seq_id, flags, pos_lo, pos_limit);
+    }
 
-    if (!partial_only) {
+    // the compressed K caches are prefix-style (not windowable): fully present
+    // or absent, written in FULL and TAIL_ONLY modes
+    if (!partial_only && !attn_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
@@ -1620,12 +1640,16 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
     }
 
-    csa_state->state_write(io, seq_id, flags, rs_idx);
-    hca_state->state_write(io, seq_id, flags, rs_idx);
-    lid_state->state_write(io, seq_id, flags, rs_idx);
+    // the ring states are written in all modes except ATTN_ONLY
+    if (!attn_only) {
+        csa_state->state_write(io, seq_id, flags, rs_idx);
+        hca_state->state_write(io, seq_id, flags, rs_idx);
+        lid_state->state_write(io, seq_id, flags, rs_idx);
+    }
 }
 
-void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    GGML_UNUSED(pos_lo);
     uint32_t magic;
     uint32_t version;
     uint32_t mode = DSV4_STATE_MODE_FULL;
@@ -1641,18 +1665,28 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     io.read(&mode, sizeof(mode));
-    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL) {
+    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL && mode != DSV4_STATE_MODE_TAIL) {
         throw std::runtime_error("DSV4 state mode mismatch");
     }
 
-    const bool partial_only = mode == DSV4_STATE_MODE_PARTIAL;
-    if (partial_only != !!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+    // verify the caller's flags match what the blob actually contains, and
+    // throw on disagreement: a mismatch would silently mis-parse (e.g. reading
+    // compressed rows as kv_raw rows) and garble the output.
+    const bool blob_has_raw  = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_PARTIAL);
+    const bool blob_has_comp = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_TAIL);
+    const bool blob_has_rings = (mode != DSV4_STATE_MODE_PARTIAL);
+    const bool flags_want_raw  = (flags & (LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
+    const bool flags_want_comp = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) == 0;
+    const bool flags_want_rings = (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY) == 0;
+    if (blob_has_raw != flags_want_raw || blob_has_comp != flags_want_comp || blob_has_rings != flags_want_rings) {
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    if (blob_has_raw) {
+        kv_raw->state_read(io, seq_id, flags, pos_lo, pos_limit);
+    }
 
-    if (!partial_only) {
+    if (blob_has_comp) {
         clear_compressed(seq_id, true);
 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
@@ -1660,15 +1694,21 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
     }
 
-    csa_state->state_read(io, seq_id, flags);
-    hca_state->state_read(io, seq_id, flags);
-    lid_state->state_read(io, seq_id, flags);
+    if (blob_has_rings) {
+        csa_state->state_read(io, seq_id, flags);
+        hca_state->state_read(io, seq_id, flags);
+        lid_state->state_read(io, seq_id, flags);
+    }
 
-    if (seq_id >= 0) {
-        GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
-    } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    // reset rs_idx only when the rings were reloaded: an ATTN_ONLY read leaves
+    // them untouched, and rs_idx is reset later by the TAIL_ONLY restore.
+    if (blob_has_rings) {
+        if (seq_id >= 0) {
+            GGML_ASSERT((uint32_t) seq_id < n_seq_max);
+            rs_idx[seq_id] = 0;
+        } else {
+            std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        }
     }
 }
 

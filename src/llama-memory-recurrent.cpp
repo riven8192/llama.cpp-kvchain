@@ -763,7 +763,7 @@ size_t llama_memory_recurrent::size_p_bytes() const {
     return size_p_bytes;
 }
 
-void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
     GGML_UNUSED(flags);
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
@@ -772,10 +772,20 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     // Count the number of cells with the specified seq_id
     // Find all the ranges of cells with this seq id (or all, when -1)
+    // NOTE: a cell outside [pos_lo, pos_limit) must close the current range,
+    // not just be skipped: with --parallel > 1 the ring interleaves cells of
+    // multiple slots, so a bare skip would let the range span the gap and trip
+    // the cell_count check below.
     uint32_t cell_range_begin = size;
     for (uint32_t i = 0; i < size; ++i) {
         const auto & cell = cells[i];
-        // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+        if (cell.pos < pos_lo || cell.pos >= pos_limit) {
+            if (cell_range_begin != size) {
+                cell_ranges.emplace_back(cell_range_begin, i);
+                cell_range_begin = size;
+            }
+            continue;
+        }
         if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
             ++cell_count;
             uint32_t rs_idx_cur = 0;
@@ -844,8 +854,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     state_write_data(io, cell_ranges_data);
 }
 
-void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
     GGML_UNUSED(flags);
+    GGML_UNUSED(pos_lo);
+    GGML_UNUSED(pos_limit); // the blob already contains only cells in [pos_lo, pos_limit)
 
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));

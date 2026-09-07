@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "kv-chain-store.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -107,6 +108,16 @@ enum slot_state {
 };
 
 struct server_slot; // forward declaration
+struct server_context_impl;
+
+// per-ubatch hook state: the prefilling slot the snapshots belong to
+struct kv_chain_ubatch_state {
+    server_context_impl * ctx = nullptr;
+    server_slot *         slot = nullptr;
+};
+
+// defined after server_context_impl (needs the full type)
+static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos);
 
 struct server_batch {
     llama_batch batch;
@@ -294,6 +305,18 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // prompt state restored from the disk hash-chain cache
+    bool kv_chain_restored = false;
+
+    // the full hash chain of this prompt, computed once at prompt arrival.
+    // both the restore walk and the per-ubatch save hook index this vector, so
+    // they can never disagree about a chunk's name.
+    std::vector<uint64_t> kv_chain_hashes;
+
+    // pos of the last chunk boundary saved; dedupes the MTP draft path, which
+    // re-decodes the same tokens and re-fires the ubatch hook at the same pos
+    size_t kv_chain_last_saved_pos = 0;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -370,6 +393,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        kv_chain_restored = false;
+        kv_chain_last_saved_pos = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -832,6 +857,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 
 struct server_context_impl {
     friend struct server_context;
+    friend void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos);
 
 public:
     // only use these pointers outside of this class:
@@ -913,6 +939,62 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<kv_chain_store> kv_chain;
+
+    // the slot whose prompt is currently being prefilled (at most one)
+    server_slot * kv_chain_prefill_slot = nullptr;
+    kv_chain_ubatch_state kv_chain_cb_state;
+
+    // called after each ubatch is committed; persists only at bs-aligned
+    // boundaries, so chunk k holds the state of the prefix [0, (k+1)*bs)
+    void kv_chain_save_prefill_ubatch(server_slot & slot, uint32_t n_pos_last) {
+        if (!kv_chain || kv_chain_prefill_slot != &slot) {
+            return;
+        }
+        const int pos_max = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max < 0) {
+            return;
+        }
+        const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
+        const size_t ubs = (size_t) kv_chain->ubatch_size();
+
+        // the MTP draft path re-decodes the same tokens and re-fires the hook
+        // at the same pos (on- or off-grid); a repeat is a no-op, so dedup
+        // first and let the ON/OFF-GRID log below fire exactly once per pos.
+        if (pos == slot.kv_chain_last_saved_pos) {
+            return;
+        }
+
+        // the hash chain is a fixed ubs-grid; only dump when pos is exactly a
+        // ubs-multiple (state-as-of k*ubs). off-grid boundaries are skipped.
+        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d pos%%ubs=%d %s\n",
+                (int) pos, (int) n_pos_last, (int) (pos % ubs),
+                (pos % ubs == 0) ? "ON-GRID" : "OFF-GRID");
+        if (pos % ubs != 0) {
+            return;
+        }
+        // the boundary at pos = k*ubs completes chunk (k-1), covering [(k-1)*ubs, k*ubs)
+        const size_t chunk_n = pos / ubs - 1;
+
+        const size_t n = slot.prompt.n_tokens();
+        if (pos > n) {
+            return;
+        }
+        const size_t chunk_lo = (size_t) chunk_n * ubs;
+        llama_tokens chunk_tokens;
+        chunk_tokens.reserve(ubs);
+        for (size_t i = chunk_lo; i < pos; ++i) {
+            chunk_tokens.push_back(slot.prompt.tokens[i]);
+        }
+        if (chunk_n >= slot.kv_chain_hashes.size()) {
+            return;
+        }
+        const uint64_t chunk_hash = slot.kv_chain_hashes[chunk_n];
+
+        kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
+                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // parent: logging only
+        slot.kv_chain_last_saved_pos = pos;
+    }
 
     server_metrics metrics;
 
@@ -1094,6 +1176,14 @@ private:
         {
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        // attach the per-ubatch kv-chain callback (snapshots state mid-prefill)
+        if (!params_base.kv_chain_dir.empty()) {
+            kv_chain_cb_state.ctx = this;
+            kv_chain_cb_state.slot = nullptr;
+            params_base.cb_ubatch      = kv_chain_cb_ubatch;
+            params_base.cb_ubatch_data = &kv_chain_cb_state;
         }
 
         llama_init = common_init_from_params(params_base);
@@ -1361,6 +1451,37 @@ private:
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        SRV_INF("kv-chain: params kv_chain_dir='%s', kv_chain_limit_gb=%d\n",
+                params_base.kv_chain_dir.c_str(), params_base.kv_chain_limit_gb);
+        if (!params_base.kv_chain_dir.empty()) {
+            // grid-safety guard: every ubatch boundary must land on the n_ubatch
+            // chunk grid or the hash chain desyncs. n_batch must be a multiple
+            // of n_ubatch, and the KV-full retry halves n_batch, so the ratio
+            // must survive arbitrary halvings: it must be a power of 2.
+            const int32_t n_b  = (int32_t) llama_n_batch (ctx_tgt);
+            const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_tgt);
+            const int32_t ratio = (n_ub > 0) ? n_b / n_ub : 0;
+            const bool grid_safe = (n_ub > 0) && (n_b % n_ub == 0) && (ratio & (ratio - 1)) == 0;
+            if (!grid_safe) {
+                common_log_flush(common_log_main());
+                std::fprintf(stderr, "kv-chain: FATAL: -b %d / -ub %d is not grid-safe "
+                        "(n_batch must be a power-of-2 multiple of n_ubatch, so that every "
+                        "ubatch boundary - including KV-full retry halvings - lands on the "
+                        "chunk grid). use e.g. -b == -ub, or -b 2048 -ub 512. exiting.\n",
+                        n_b, n_ub);
+                std::fflush(stderr);
+                std::exit(1);
+            }
+            SRV_INF("kv-chain: grid-safe: -b %d / -ub %d = %d (power of 2)\n", n_b, n_ub, ratio);
+            const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
+                ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
+                : 0;
+            // chunk stride = n_ubatch (not n_batch): the snapshots fire at ubatch
+            // boundaries, which land on the n_ubatch grid.
+            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes,
+                                                        n_ub, params_base, model_tgt);
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -2857,6 +2978,13 @@ private:
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
+                // log each whole-batch prompt decode (skips the per-token decode
+                // steps of generation)
+                if (n_tokens > 1 && batch.size() == n_batch) {
+                    SRV_INF("kv-chain[decode]: batch.size=%d off=%d n_tokens=%d n_batch=%d\n",
+                            (int) batch.size(), off, n_tokens, n_batch);
+                }
+
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
@@ -3128,6 +3256,14 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // arm the per-ubatch kv-chain snapshot: the hash chain is
+                        // computed once here, at prompt arrival, from the tokens.
+                        if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                            kv_chain_prefill_slot      = &slot;
+                            kv_chain_cb_state.slot   = &slot;
+                            slot.kv_chain_hashes = kv_chain->hash_chain(input_tokens.get_text_tokens());
+                        }
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3199,73 +3335,81 @@ private:
                             }
 
                             if (slot.task->params.cache_prompt) {
-                                // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                if (kv_chain) {
+                                    // the disk hash-chain cache is the only prefix cache;
+                                    // bypass the native in-memory common-prefix reuse so
+                                    // the restore path is the single source of truth.
+                                    SLT_WRN(slot, "%s", "kv-chain[storage]: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
+                                    n_past = 0;
+                                } else {
+                                    // reuse any previously computed tokens that are common with the new prompt
+                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                                // if there is an alora invoked, don't cache after the invocation start
-                                if (slot.alora_invocation_start > 0) {
-                                    SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
-                                    n_past = std::min(n_past, slot.alora_invocation_start - 1);
-                                }
-
-                                const auto n_cache_reuse = slot.task->params.n_cache_reuse;
-
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
-
-                                if (!can_cache_reuse && n_cache_reuse > 0) {
-                                    SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
-                                }
-
-                                // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
-                                    size_t head_c = n_past; // cache
-                                    size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
+                                    // if there is an alora invoked, don't cache after the invocation start
+                                    if (slot.alora_invocation_start > 0) {
+                                        SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
+                                        n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                     }
 
-                                    SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
+                                    const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                    while (head_c < slot.prompt.tokens.size() &&
-                                           head_p < input_tokens.size()) {
+                                    const bool can_cache_reuse =
+                                        llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                        !slot.prompt.tokens.has_mtmd;
 
-                                        size_t n_match = 0;
-                                        while (head_c + n_match < slot.prompt.tokens.size() &&
-                                               head_p + n_match < input_tokens.size()       &&
-                                               slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
-                                            n_match++;
+                                    if (!can_cache_reuse && n_cache_reuse > 0) {
+                                        SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    }
+
+                                    // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                    if (can_cache_reuse && n_cache_reuse > 0) {
+                                        GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+
+                                        size_t head_c = n_past; // cache
+                                        size_t head_p = n_past; // current prompt
+
+                                        if (mctx) {
+                                            // we should never reach this
+                                            GGML_ABORT("not supported by multimodal");
                                         }
 
-                                        if (n_match >= (size_t) n_cache_reuse) {
-                                            SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
-                                            //}
+                                        SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+                                        while (head_c < slot.prompt.tokens.size() &&
+                                               head_p < input_tokens.size()) {
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
-
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
+                                            size_t n_match = 0;
+                                            while (head_c + n_match < slot.prompt.tokens.size() &&
+                                                   head_p + n_match < input_tokens.size()       &&
+                                                   slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
+                                                n_match++;
                                             }
 
-                                            head_c += n_match;
-                                            head_p += n_match;
-                                        } else {
-                                            head_c += 1;
-                                        }
-                                    }
+                                            if (n_match >= (size_t) n_cache_reuse) {
+                                                SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
+                                                //for (size_t i = head_p; i < head_p + n_match; i++) {
+                                                //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
+                                                //}
 
-                                    SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                                const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+
+                                                slot.mem.seq_rm (slot.id, head_p, head_c);
+                                                slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+
+                                                for (size_t i = 0; i < n_match; i++) {
+                                                    slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
+                                                    n_past++;
+                                                }
+
+                                                head_c += n_match;
+                                                head_p += n_match;
+                                            } else {
+                                                head_c += 1;
+                                            }
+                                        }
+
+                                        SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
@@ -3383,8 +3527,116 @@ private:
                             }
                         }
 
+                        if (kv_chain) {
+                            SLT_INF(slot, "kv-chain[storage]: restore check: n_past=%d prompt.n_tokens=%d cache_prompt=%d has_mtmd=%d input_n=%zu\n",
+                                    n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
+                                    (int) input_tokens.has_mtmd, input_tokens.size());
+                        }
+                        // no need to require slot.prompt.n_tokens() == 0: in the
+                        // no-restart case the slot still holds the previous
+                        // prompt+response, but the pre-restore seq_rm wipes it.
+                        if (kv_chain && n_past == 0 && slot.task->params.cache_prompt) {
+                            // restore a saved prefix from the disk hash-chain cache.
+                            // has_mtmd reflects the model's capability, not whether
+                            // this prompt has media, so no guard on it here.
+                            size_t n_saved = 0;
+                            // get_text_tokens() (not get_tokens()): the latter
+                            // asserts !has_mtmd
+                            const llama_tokens text_tokens = input_tokens.get_text_tokens();
+                            const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
+                            if (!chunks.empty() && n_saved > 0) {
+                                // wipe all existing state first: in the no-restart case
+                                // this resets the previous prompt+response (per-token KV
+                                // cells and recurrent state) to a fresh-context state.
+                                slot.mem.seq_rm(slot.id, 0, -1);
+                                 // replay the chunks one file at a time (peak RAM = one
+                                 // file). each .kvcache holds the ATTN_ONLY rows of its
+                                 // window [k*ubs,(k+1)*ubs): chunk 0 wipes, the rest append.
+                                 // a read failure mid-replay discards the whole restore
+                                 // (the loaded rows would be orphaned) -> 100% re-prefill.
+                                 bool ok = true;
+                                 const size_t ubs = (size_t) kv_chain->ubatch_size();
+                                 size_t n_replayed = 0;
+                                 for (size_t k = 0; k < chunks.size() && ok; ++k) {
+                                     const llama_pos pos_lo    = (llama_pos) (k * ubs);
+                                     const llama_pos pos_hi    = (llama_pos) ((k + 1) * ubs);
+                                    std::vector<uint8_t> attn_blob;
+                                    if (!kv_chain->read_chunk_file(chunks[k].attn_file, attn_blob, chunks[k].tokens)) {
+                                        SLT_WRN(slot, "kv-chain[storage]: kv read failed/mismatch at chunk %zu, discarding restore\n", k);
+                                        ok = false;
+                                        break;
+                                    }
+                                    // ATTN_ONLY: the .kvcache blob was written with
+                                    // ATTN_ONLY, so the read must use the same flag.
+                                    const llama_state_seq_flags attn_flags =
+                                            (k == 0) ? LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY
+                                                    : (LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
+                                    const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
+                                            attn_blob.data(), attn_blob.size(), slot.id,
+                                            attn_flags, pos_lo, pos_hi);
+                                    attn_blob.clear();
+                                    attn_blob.shrink_to_fit();
+                                    // 0 = failure
+                                    if (n_attn == 0) {
+                                        SLT_WRN(slot, "kv-chain[storage]: attn restore failed at chunk %zu\n", k);
+                                        ok = false;
+                                        break;
+                                    }
+                                    n_replayed++;
+                                }
+                                if (!ok) {
+                                    // the attn rows loaded so far would be orphaned (the
+                                    // recurrent tail is only loaded after the loop), so
+                                    // wipe and fall back to a 100% prefill.
+                                    slot.mem.seq_rm(slot.id, 0, -1);
+                                    n_saved = 0;
+                                    n_replayed = 0;
+                                }
+                                // load the recurrent tail from the TAIL chunk's .rscache
+                                // (validated up front by load_prefix). TAIL_ONLY, the same
+                                // flag the blob was dumped with.
+                                if (ok && !chunks.empty()) {
+                                    std::vector<uint8_t> tail_recr;
+                                    const kv_chain_chunk & tail_chunk = chunks.back();
+                                    if (!tail_chunk.recr_file.empty()) {
+                                        if (!kv_chain->read_chunk_file(tail_chunk.recr_file, tail_recr, tail_chunk.tokens)) {
+                                            SLT_WRN(slot, "%s", "kv-chain[storage]: tail rs re-read failed at tail chunk, discarding restore");
+                                            ok = false;
+                                        } else {
+                                            const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
+                                                    tail_recr.data(), tail_recr.size(), slot.id,
+                                                    LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
+                                            tail_recr.clear();
+                                            tail_recr.shrink_to_fit();
+                                            if (n_recr == 0) {
+                                                SLT_WRN(slot, "%s", "kv-chain[storage]: recr restore failed at tail chunk");
+                                                ok = false;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (ok) {
+                                    for (size_t i = 0; i < n_saved && i < input_tokens.size(); ++i) {
+                                        slot.prompt.tokens.push_back(input_tokens[i]);
+                                    }
+                                    n_past = (int) n_saved;
+                                    slot.kv_chain_restored = true;
+                                    // the restore never covers the last token (load_prefix
+                                    // searches tokens[0, n-1)) -> something is left to prefill.
+                                    const size_t n_left = input_tokens.size() - (size_t) n_past;
+                                    GGML_ASSERT(n_left > 0);
+                                    SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
+                                            n_past, n_replayed, n_left);
+                                } else {
+                                    SLT_WRN(slot, "%s", "kv-chain[storage]: failed to restore chain, falling back to prefill");
+                                }
+                            }
+                        }
+
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                        // a restored prefix already has its last token in the cache, so it
+                        // must not be re-processed; skip the decrement in that case
+                        if (!slot.kv_chain_restored && n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
@@ -3425,7 +3677,9 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    // truncate any data at [p0, end)
                     slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.kv_chain_restored = false;
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3442,6 +3696,14 @@ private:
                     }
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+
+                    // disable context checkpoints when kv-chain is set: they are
+                    // redundant (the disk chain is the source of truth for prefix
+                    // reuse) and their early batch breaks fragment the prompt into
+                    // off-grid ubatches, desyncing the hash chain.
+                    if (kv_chain) {
+                        do_checkpoint = false;
+                    }
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -3572,7 +3834,9 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
-                    // entire prompt has been processed
+                    // entire prompt has been processed. a restored prefix never
+                    // covers the last token (it must be prefilled to produce
+                    // logits), so this batch always carries the re-prefilled tail.
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
@@ -3819,6 +4083,12 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // the prompt is fully committed; stop per-ubatch snapshots
+                if (kv_chain_prefill_slot == &slot) {
+                    kv_chain_prefill_slot = nullptr;
+                    kv_chain_cb_state.slot = nullptr;
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -4133,6 +4403,14 @@ private:
         }
     }
 };
+
+static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos_last) {
+    auto * s = static_cast<kv_chain_ubatch_state *>(user_data);
+    if (s == nullptr || s->ctx == nullptr || s->slot == nullptr) {
+        return;
+    }
+    s->ctx->kv_chain_save_prefill_ubatch(*s->slot, n_pos_last);
+}
 
 //
 // server_context (public API)

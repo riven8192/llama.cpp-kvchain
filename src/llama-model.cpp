@@ -3124,6 +3124,10 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+const char * llama_model_arch_name(const struct llama_model * model) {
+    return model ? llm_arch_name(model->arch) : "";
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
