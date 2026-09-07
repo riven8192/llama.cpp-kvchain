@@ -1,11 +1,8 @@
 # runtime artifacts
+*.log
+*.pid
 *.lock
-.llama-server.log
-.llama-server.log.*.log
-.llama-server.pid
-.llama-build.log
 .kv-cache/
-prompt-*.log
 
 # large prompt fixtures (pasted in for the ubatch-grid probe; not source)
 prompt_30k.txt
