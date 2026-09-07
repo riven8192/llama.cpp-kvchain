@@ -264,10 +264,6 @@ struct server_slot {
     // prompt state restored from the disk hash-chain cache
     bool kv_chain_restored = false;
 
-    // a disk restore covered the entire prompt (cannot happen: load_prefix caps
-    // the restore so at least one token is always left to prefill)
-    bool kv_chain_full_restore = false;
-
     // the full hash chain of this prompt, computed once at prompt arrival.
     // both the restore walk and the per-ubatch save hook index this vector, so
     // they can never disagree about a chunk's name.
@@ -354,7 +350,6 @@ struct server_slot {
 
         spec_is_replay = false;
         kv_chain_restored = false;
-        kv_chain_full_restore = false;
         kv_chain_last_saved_pos = 0;
 
         last_nl_pos    = 0;
@@ -3571,9 +3566,10 @@ private:
                                     }
                                     n_past = (int) n_saved;
                                     slot.kv_chain_restored = true;
-                                    slot.kv_chain_full_restore = (n_saved >= (size_t) slot.task->n_tokens());
-                                    const size_t n_left = (input_tokens.size() > (size_t) n_past)
-                                                       ? (input_tokens.size() - (size_t) n_past) : 0;
+                                    // the restore never covers the last token (load_prefix
+                                    // searches tokens[0, n-1)) -> something is left to prefill.
+                                    const size_t n_left = input_tokens.size() - (size_t) n_past;
+                                    GGML_ASSERT(n_left > 0);
                                     SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
                                             n_past, n_replayed, n_left);
                                 } else {
@@ -3783,15 +3779,10 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
-                    // entire prompt has been processed
+                    // entire prompt has been processed. a restored prefix never
+                    // covers the last token (it must be prefilled to produce
+                    // logits), so this batch always carries the re-prefilled tail.
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        // a full restore cannot happen (load_prefix caps it so at
-                        // least one token is always prefilled). do not reinstate a
-                        // no-forward-pass shortcut here: without a forward pass there
-                        // are no logits to sample.
-                        GGML_ASSERT(!slot.kv_chain_full_restore &&
-                                "kv-chain: full prompt restore must be capped in load_prefix");
-
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.size() > 0);
