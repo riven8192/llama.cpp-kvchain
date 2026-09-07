@@ -1966,11 +1966,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
 
-        // [EXPERIMENTAL] kv-chain hook: notify after this ubatch is fully
-        // committed so the caller can snapshot the state (the caller reads the
-        // position from the memory module, which is authoritative here).
-        // the 2nd arg is the position of the last token of this ubatch (the
-        // boundary just completed).
+        // kv-chain hook: notify after this ubatch is committed, with the
+        // position of its last token (the boundary just completed)
         if (cparams.cb_ubatch) {
             const llama_pos ub_last_pos = ubatch.n_tokens > 0 ? ubatch.pos[ubatch.n_tokens - 1] : -1;
             cparams.cb_ubatch(cparams.cb_ubatch_data, (uint32_t) ub_last_pos);
@@ -2972,14 +2969,10 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
-// the seq-state blob header is ONLY this magic: the source seq_id used to be
-// written right after it, but NOTHING ever consumed it (the read path loaded
-// it into a local and discarded it; the destination is the caller's dest_seq_id
-// argument). it was removed from the header. the magic value itself is kept
-// constant (0xaf143cd8) - the file-level KV_CHAIN_VERSION check in
-// kv-chain-store.cpp is the boundary that keeps old (seq_id-carrying) blobs
-// from being read; a raw blob fed directly to the state_seq_set API bypasses
-// that check, so local caches from before this change must be deleted.
+// the seq-state blob header carries only this magic (no source seq_id: nothing
+// ever consumed it; the destination is the caller's seq_id arg). the value is
+// kept constant across the seq_id removal - old (seq_id-carrying) local caches
+// must be deleted.
 static constexpr uint32_t io_magic_seq = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {

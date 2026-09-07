@@ -116,7 +116,6 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
-// the model's architecture as a string (e.g. "qwen35"), for cheap identity checks
 LLAMA_API const char * llama_model_arch_name(const struct llama_model * model);
 
 //

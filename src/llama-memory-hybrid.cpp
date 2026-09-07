@@ -188,13 +188,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
-    // FULL_ONLY / ATTN_ONLY: write ONLY the attn (per-token KV) part; PARTIAL_ONLY /
-    // TAIL_ONLY: write ONLY the recurrent part. on this hybrid the recurrent part is
-    // a separate mem_recr (not bundled into mem_attn), so "attn only" and "full
-    // only" both select mem_attn alone, and "tail only" and "partial only" both
-    // select mem_recr alone. (ATTN_ONLY/TAIL_ONLY diverge from FULL_ONLY/PARTIAL_ONLY
-    // only on caches like llama_kv_cache_dsv4, where the ring states are bundled
-    // into the "full" part.)
+    // here the recurrent part is a separate mem_recr, so FULL_ONLY/ATTN_ONLY
+    // select mem_attn alone and PARTIAL_ONLY/TAIL_ONLY select mem_recr alone.
     const bool write_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
     const bool write_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (write_attn) {

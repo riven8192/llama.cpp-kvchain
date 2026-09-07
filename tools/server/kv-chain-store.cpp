@@ -17,27 +17,9 @@
 namespace fs = std::filesystem;
 
 static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
-// the single version number for the kv-chain format: the chunk FILE layout AND
-// the root-hash metadata blob (both are fed into / checked against it).
-// v3: split into .kvcache + .rscache (one blob per file)
-// v4: .kvcache now holds an ATTN_ONLY blob (per-token KV rows only, no ring
-//     states) and .rscache now holds a TAIL_ONLY blob dumped via the plain
-//     llama_state_seq_get_data_ext (the full tail object: DSV4F compressed K
-//     caches + compressor rings, or Qwen Gated DeltaNet R/S). the .kvcache blob
-//     type changes for DSV4F (FULL_ONLY -> ATTN_ONLY), the .rscache call site
-//     moves from the windowed-ext to the plain-ext, and the tail flag changes
-//     (PARTIAL_ONLY -> TAIL_ONLY), so old files are a clean miss. bump whenever
-//     EITHER changes: an old file with a stale version is never read (version
-//     check), and the root hash changes, so old chunks are a clean miss.
-// v5: n_seq_max (--parallel) added to the root-hash metadata blob. the attn
-//     blob's n_stream scales with --parallel (with kv-unified off the cache has
-//     n_stream == n_seq_max parallel cell arrays), so a chunk file written by a
-//     server with a different --parallel used to fail restore with
-//     "state_read: n_stream mismatch" and fall back to a 100% prefill. baking
-//     it into the root hash turns that into a CLEAN MISS (different chain
-//     names, no files match). the version is ALSO hashed into the root, so a
-//     chain computed under an older version can never hit a file written by
-//     this one.
+// single version number for the kv-chain format: the chunk file layout AND the
+// root-hash metadata blob. bump on any change to either: a stale file is never
+// read (version check) and the root hash changes, so old chunks are a clean miss.
 static constexpr uint32_t KV_CHAIN_VERSION = 5;
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t ubatch_size,
@@ -59,9 +41,8 @@ kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32
         this->root_hash_ = 0;
         return;
     }
-    // remove stray .tmp files from an aborted previous run, then index existing chunks.
-    // flat dir: files from all models/configs live here; total_bytes_cur sums
-    // everything (eviction is global, LRU by mtime).
+    // remove stray .tmp files from an aborted previous run, then index existing
+    // chunks (eviction is global over the flat dir, LRU by mtime).
     for (const auto & entry : fs::directory_iterator(cache_dir, fs::directory_options::skip_permission_denied)) {
         if (!entry.is_regular_file()) {
             continue;
@@ -98,8 +79,6 @@ uint64_t kv_chain_store::fnv1a64(uint64_t h, const uint8_t * data, size_t len) {
 }
 
 uint64_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint64_t prev_hash) const {
-    // FNV-1a over this chunk's token ids, seeded by the parent hash (chain step).
-    // the full 64-bit result is kept (the on-disk header stores its low 32 bits).
     uint64_t h = 1469598103934665603ULL ^ prev_hash;
     for (auto t : chunk_tokens) {
         const uint8_t * p = reinterpret_cast<const uint8_t *>(&t);
@@ -112,9 +91,6 @@ uint64_t kv_chain_store::hash_chunk(const llama_tokens & chunk_tokens, uint64_t 
 }
 
 std::vector<uint64_t> kv_chain_store::hash_chain(const llama_tokens & tokens) const {
-    // the whole chain in one pass: chunk k = tokens[k*bs, (k+1)*bs), chained
-    // off the previous chunk's hash (0 for the root). computed once at prompt
-    // arrival; restore and save both index the result.
     std::vector<uint64_t> hashes;
     const size_t bs = (size_t) ubatch_size_;
     if (bs == 0 || tokens.empty()) {
@@ -122,9 +98,8 @@ std::vector<uint64_t> kv_chain_store::hash_chain(const llama_tokens & tokens) co
     }
     const size_t n_chunks = tokens.size() / bs;
     hashes.reserve(n_chunks);
-    // the root chunk chains off the ROOT hash (the metadata identity: model,
-    // config, version). this keeps different models/configs in disjoint hash
-    // namespaces even for identical leading tokens.
+    // chain chunk 0 off the root hash: keeps different models/configs in disjoint
+    // hash namespaces even for identical leading tokens.
     uint64_t prev = root_hash_;
     for (size_t k = 0; k < n_chunks; ++k) {
         const llama_tokens block(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
@@ -144,8 +119,8 @@ std::string kv_chain_store::hash_str(uint64_t h) {
     return s;
 }
 
-// feeds a field into a running FNV-1a hash. the field is length-prefixed (u64 LE)
-// so field boundaries are unambiguous (no "ab"+"cd" vs "a"+"bcd" collisions).
+// feeds a field into a running FNV-1a hash, length-prefixed (u64 LE) so field
+// boundaries are unambiguous.
 static uint64_t hash_field(uint64_t h, const void * data, size_t len) {
     uint8_t lbuf[8];
     for (int i = 0; i < 8; ++i) {
@@ -177,13 +152,8 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     md.type_k            = params.cache_type_k;
     md.type_v            = params.cache_type_v;
     md.rope_scaling_type = params.rope_scaling_type;
-    // --parallel becomes the ctx's n_seq_max (common/common.cpp: cparams.n_seq_max
-    // = params.n_parallel). with kv-unified off the attn cache has n_stream ==
-    // n_seq_max parallel cell arrays, so a different --parallel changes the attn
-    // blob LAYOUT -> it must change the root hash (clean miss, not a mismatch).
-    // the .rscache blob never carries n_stream (a single slot's R/S), but a
-    // clean miss is still the right semantics: cross-parallel reuse is not
-    // meaningful anyway.
+    // the attn blob's n_stream scales with --parallel, so a different value
+    // changes the blob layout -> it must change the root hash (clean miss).
     md.n_seq_max           = static_cast<uint32_t>(params.n_parallel > 0 ? params.n_parallel : 1);
     {
         // copy the float bits portably (memcpy, not a type-punned pointer cast)
@@ -219,8 +189,6 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     }
 
     // canonical serialization: every field, length-prefixed, in struct order.
-    // the model path is hashed as a string (path+size+mtime identifies the file
-    // content; a weight hash would take too long).
     uint64_t h = 1469598103934665603ULL;
     h = hash_le(h, static_cast<uint64_t>(md.format_version), 4);
     h = hash_le(h, static_cast<uint64_t>(md.chunk_size),       4);
@@ -252,9 +220,7 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
     }
 }
 
-// dumps one seq-state blob for the window [pos_lo, pos_hi) with the given
-// part-selection flags. used for the per-chunk .kvcache file (ATTN_ONLY =
-// per-token KV rows only). returns an empty vector on failure.
+// dumps one seq-state blob for the window [pos_lo, pos_hi). returns {} on failure.
 static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id,
                                         llama_pos pos_lo, llama_pos pos_hi, llama_state_seq_flags flags) {
     const size_t size = llama_state_seq_get_size_window_ext(ctx, seq_id, flags, pos_lo, pos_hi);
@@ -270,21 +236,14 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
     return blob;
 }
 
-// dumps the TAIL object via the PLAIN llama_state_seq_get_data_ext with
-// TAIL_ONLY (NOT the windowed variant, and NOT flags=0). it is a "last write
-// wins" state, only valid at exact chunk boundaries, and the restore only ever
-// loads the LAST chunk's copy.
-//
-// WHY TAIL_ONLY and NOT flags=0 (FULL): on llama_kv_cache_dsv4, a FULL-mode
-// blob STARTS with kv_raw (the per-token rows), and its state_read clears
-// kv_raw before loading it. the .rscache is loaded AFTER the per-chunk
-// .kvcache replay, so a FULL blob would WIPE the just-restored per-token rows
-// (garbled output). PARTIAL_ONLY is wrong the other way: it saves kv_raw +
-// rings but NOT the compressed K caches, while the tail prefill does NOT
-// recompute them (it only processes tokens >= n_saved) - so a PARTIAL_ONLY
-// tail also garbled DSV4F. TAIL_ONLY is the complement of the .kvcache files:
-// on dsv4 it is the compressed K caches + the compressor rings (no kv_raw);
-// on Qwen / pure-attn caches it behaves exactly like PARTIAL_ONLY.
+// dumps the TAIL object (the recurrent/fixed-size state, "last write wins",
+// valid only at chunk boundaries) via the plain get_data_ext with TAIL_ONLY.
+// TAIL_ONLY, not FULL (flags=0): on a DSV4 cache a FULL-mode blob starts with
+// kv_raw and its state_read clears kv_raw first, which would wipe the
+// per-token rows restored from the .kvcache files (loaded after this). it is
+// not PARTIAL_ONLY either: that omits the compressed K caches, which the tail
+// prefill does not recompute. TAIL_ONLY is the exact complement of the
+// per-chunk .kvcache files.
 static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) {
     const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
     if (size == 0) {
@@ -299,25 +258,19 @@ static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) 
     return blob;
 }
 
-// save one chunk covering the window [pos_lo, pos_hi). the .kvcache file holds
-// the ATTN_ONLY blob (per-token KV rows for exactly this window [pos_lo,
-// pos_hi), additive across chunks). the .rscache file holds the FULL tail
-// snapshot (kv_raw + the DSV4 compressed K caches + the compressor rings; on
-// Qwen, attn + recr), dumped via the plain _ext at this chunk boundary - a
-// "last write wins" state that is only valid at exact chunk boundaries, and the
-// restore loads only the LAST chunk's copy. chunk_tokens are the window's
-// tokens, stored verbatim in both file headers.
+// save one chunk covering the window [pos_lo, pos_hi): the .kvcache file gets
+// the ATTN_ONLY rows for exactly this window (additive across chunks), the
+// .rscache file gets the tail snapshot (only the last chunk's copy is ever
+// read). chunk_tokens are stored verbatim in both headers.
 bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
                           uint64_t chunk_hash, const llama_tokens & chunk_tokens,
-                          uint64_t parent_hash /* = 0, [DEBUG] logging only */) {
+                          uint64_t parent_hash /* = 0, logging only */) {
     if (!enabled() || ctx == nullptr || chunk_tokens.empty() || pos_hi <= pos_lo) {
         return false;
     }
 
-    // ATTN_ONLY (not FULL_ONLY): on a DSV4 cache FULL_ONLY would also emit the
-    // compressor ring states, which must NOT be in the per-chunk file (they are
-    // the tail object stored separately in .rscache). on Qwen / pure-attn caches
-    // ATTN_ONLY behaves identically to FULL_ONLY.
+    // ATTN_ONLY, not FULL_ONLY: on a DSV4 cache FULL_ONLY would also emit the
+    // compressor ring states, which belong in the .rscache tail, not here.
     std::vector<uint8_t> attn = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY);
     std::vector<uint8_t> recr = dump_tail(ctx, seq_id);
     if (attn.empty() || recr.empty()) {
@@ -327,9 +280,6 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
 
     const fs::path dir = fs::path(root_dir);
 
-    // [DEBUG] every save attempt: the hash the file will be named by (and the
-    // parent it was computed from), plus whether both files already existed
-    // (idempotent skip) or were written.
     SRV_INF("kv-chain[storage]: saving chunk hash=%s parent=%s tokens=[%d..%d) existing=(kv=%d rs=%d)\n",
             hash_str(chunk_hash).c_str(), hash_str(parent_hash).c_str(),
             (int) pos_lo, (int) pos_hi,
@@ -339,9 +289,8 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
     return write_chunk(dir, chunk_hash, chunk_tokens, attn, recr);
 }
 
-// writes both chunk files (.kvcache + .rscache) if not present.
-// idempotent: if one file already exists, only the missing one is written
-// (handles crash-between-the-two-writes). returns true if anything was written.
+// writes both chunk files if not present; idempotent (a crash between the two
+// writes only re-writes the missing one). returns true if anything was written.
 bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
                                   const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr) {
     const std::string stem = hash_str(chunk_hash);
@@ -354,8 +303,7 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
         return false;
     }
 
-    // per-file header overhead: magic + version + hash32 + n_tokens + tokens + blob_size
-    // (no trailing checksum - see read_chunk_file)
+    // per-file header: magic + version + hash32 + n_tokens + tokens + blob_size
     const uint64_t hdr_bytes = 4 * sizeof(uint32_t) + sizeof(llama_token) * chunk_tokens.size()
                               + sizeof(uint32_t);
     const uint64_t kv_entry = attn.size() + hdr_bytes;
@@ -416,8 +364,6 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
             fs::remove(tmp, ec);
             return false;
         }
-        // no trailing checksum: read_chunk_file does not verify one (we trust
-        // the storage device; verifying costs a full pass over every recr file).
         f.close();
     }
 
@@ -430,17 +376,9 @@ bool kv_chain_store::write_chunk_file(const fs::path & tmp, const fs::path & fil
     return true;
 }
 
-// reads + validates ONE chunk file (.kvcache or .rscache) and returns the blob.
-// the header's token IDs must match expected_tokens verbatim (collision guard:
-// a hash collision or a stale file is a clean miss, not a garbage restore).
-// returns false if missing/corrupt/token-mismatch.
-//
-// MEMORY: this is the ONLY place a chunk file's contents are materialized. the
-// restore calls it once per file and frees the blob before the next (see
-// load_prefix / the server-context replay loop), so peak RAM = one file (~16
-// MiB attn, ~150 MiB for the tail rs) - never the whole chain. the header is
-// parsed from a small fixed buffer; the blob is streamed straight into
-// out_blob (no second copy).
+// reads + validates one chunk file and returns the blob. the header's token
+// IDs must match expected_tokens verbatim (a collision/stale file is a clean
+// miss, not a garbage restore). returns false if missing/corrupt/mismatched.
 bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob,
                                      const llama_tokens & expected_tokens) const {
     std::ifstream f(file, std::ios::binary);
@@ -455,8 +393,6 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     }
     f.seekg(0, std::ios::beg);
 
-    // header is fixed-size up to n_tokens; the token array follows. read the
-    // 4 u32s first, then the tokens, then the blob_size u32.
     uint32_t hdr[4];
     f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
     if (!f) {
@@ -464,20 +400,16 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
     }
     const uint32_t magic   = hdr[0];
     const uint32_t version = hdr[1];
-    // hdr[2] = hash32 (the file name; not re-verified here - the name IS the hash)
+    // hdr[2] = hash32 (the file name; not re-verified - the name IS the hash)
     const uint32_t n_tokens = hdr[3];
-    // NOTE: there is NO trailing checksum in the file. it was removed from the
-    // writer because verifying it costs a full pass over every (multi-hundred-
-    // MiB) recr file in the chain, which dominated the restore time. we trust
-    // the storage device; a silent bit-flip would surface as garbage model
-    // output, not as a clean cache miss - accepted trade-off for performance
-    // (the size checks below still catch layout corruption).
+    // no trailing checksum: verifying one costs a full pass over every recr
+    // file, which dominated restore time; we trust the storage device.
     if (magic != KV_CHAIN_MAGIC || version != KV_CHAIN_VERSION) {
         SRV_WRN("kv-chain[storage]: bad magic/version in %s (magic=%08x version=%u), ignoring\n",
                 file.string().c_str(), magic, version);
         return false;
     }
-    // bound the token count before allocating (n_tokens * 4 bytes must fit the file)
+    // bound n_tokens before allocating
     if (n_tokens == 0 || (uint64_t) n_tokens > (file_size - min_size) / sizeof(llama_token)) {
         return false;
     }
@@ -497,14 +429,13 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
                 file.string().c_str(), (unsigned long long) hdr_len, blob_size, (unsigned long long) file_size);
         return false;
     }
-    // token IDs must match the prompt verbatim (self-describing files)
+    // the token IDs must match the prompt verbatim
     if (file_tokens.size() != expected_tokens.size() ||
         std::memcmp(file_tokens.data(), expected_tokens.data(), sizeof(llama_token) * n_tokens) != 0) {
         SRV_WRN("kv-chain[storage]: token mismatch in %s (n=%u vs %zu), treating as miss\n",
                 file.string().c_str(), n_tokens, expected_tokens.size());
         return false;
     }
-    // stream the blob straight out (one copy: disk -> out_blob)
     out_blob.resize(blob_size);
     if (blob_size > 0) {
         f.read(reinterpret_cast<char *>(out_blob.data()), blob_size);
@@ -517,11 +448,8 @@ bool kv_chain_store::read_chunk_file(const fs::path & file, std::vector<uint8_t>
 
 void kv_chain_store::evict_oldest(uint64_t need_bytes) {
     std::error_code ec;
-    // flat scan of the cache dir over BOTH .kvcache and .rscache files.
-    // sorted by mtime ascending; delete from the front until we have room.
-    // no tree-integrity checks: deleting an old rs file just lowers `usable`
-    // for chains that would have used it; deleting a kv file shortens the kv
-    // chain. both are benign "cache ends here" on the next restore.
+    // delete oldest (by mtime) until we have room. no tree-integrity checks:
+    // an evicted file just shortens the chain on the next restore.
     const fs::path cache_dir = fs::path(root_dir);
     struct ent { fs::path p; uint64_t size; std::filesystem::file_time_type mtime; };
     std::vector<ent> all;
@@ -548,8 +476,7 @@ void kv_chain_store::evict_oldest(uint64_t need_bytes) {
     }
 }
 
-// sets the mtime+atime of every file in `files` to "now" (utimensat).
-// a failure on any single file is non-fatal (the file may have been evicted).
+// sets atime+mtime of every file to "now"; a per-file failure is non-fatal.
 static void touch_chain_files(const std::vector<fs::path> & files) {
     if (files.empty()) {
         return;
@@ -577,26 +504,19 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         return chunks;
     }
 
-    // TWO-PHASE restore. the chunk files are large (~2 MiB attn + ~150 MiB
-    // recr per 32-token chunk), so the expensive part is reading them - not
-    // finding them. therefore:
-    //   phase 1 (find): walk the hash chain with fs::exists() ONLY - no file
-    //     contents are read. this locates the chain break (first missing kv
-    //     file) and `usable` = the last chunk whose rs file is present.
-    //   phase 2 (read): read file contents ONLY for the chunks we will replay:
-    //     the .kvcache of every chunk in [0, usable), and the .rscache of
-    //     chunk (usable-1) ALONE - the recurrent state is a tail object (last
-    //     write wins), so the earlier rs files are superseded and never read.
-    // a failed read mid-way is a benign "cache ends here" (eviction race).
+    // two phases, because the files are large and reading dominates:
+    //   phase 1 (find): walk the chain with fs::exists() only - locate the break
+    //     (first missing kv file) and usable = last chunk with an rs file.
+    //   phase 2 (plan): resolve file paths for the replay; only the TAIL rs file
+    //     is read here (it is validated up front). the caller streams the
+    //     .kvcache files one at a time; a read failure mid-replay discards the
+    //     whole restore (100% re-prefill), since the loaded rows would be orphaned.
     const size_t bs = (size_t) ubatch_size_;
     const size_t n_chunks = tokens.size() / bs;
 
-    // the chain was computed once at prompt arrival; this walk only LOOKS files
-    // up by the precomputed names. (recomputing here would be a second source of
-    // truth - the save hook indexes the same vector, so the two can never drift)
     const std::vector<uint64_t> hashes = hash_chain(tokens);
 
-    // ---- phase 1: exists-only walk ----------------------------------------
+    // phase 1: exists-only walk
     std::vector<std::string> stems;          // per found chunk: file name stem
     std::vector<bool> rs_present;            // per found chunk: rs file exists
     size_t n_kv_found = 0;
@@ -605,8 +525,6 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         const std::string stem = hash_str(hashes[k]);
         const bool kv_exists = fs::exists(dir / (stem + ".kvcache"));
         const bool rs_exists = kv_exists && fs::exists(dir / (stem + ".rscache"));
-        // [DEBUG] every find attempt: the precomputed name for chunk k and what
-        // is on disk for it. a 'kv=0' here means the walk stops.
         SRV_DBG("kv-chain[storage]: chunk %zu hash=%s kv=%d rs=%d\n", k, stem.c_str(),
                 (int) kv_exists, (int) rs_exists);
         if (!kv_exists) {
@@ -620,26 +538,11 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         }
     }
 
-    // NEVER restore the whole prompt: always leave at least one token to prefill.
-    //
-    // Logits are NOT state - they are the OUTPUT of a forward pass and are not in
-    // the cache files. A restore that covers all N prompt tokens leaves nothing to
-    // run a forward pass over, so no logits are ever produced for the sampler:
-    // the slot skips sampling entirely (i_batch == -1) or trips
-    // "corrupt output buffer (n_outputs=0)" -> GGML_ABORT in llama_get_logits_ith.
-    // That only happens when the prompt length is an exact multiple of bs (so the
-    // final chunk ends exactly at the last prompt token).
-    //
-    // Fix: drop the last chunk, re-prefilling bs tokens. Rejected alternatives:
-    // rolling back one token needs an invertible recurrent state (Gated DeltaNet
-    // is not; llama_memory_recurrent::seq_rm's bounded rollback needs n_rs_seq > 0,
-    // which is speculative-decoding-only and 0 here), and re-running the last token
-    // on top of the restored state + reloading the rs blob to repair the corrupted
-    // recurrent state works but is a lot of machinery for a rare case.
-    //
-    // The cost is negligible: this triggers only when len % bs == 0, i.e. 1 prompt
-    // in bs. Amortized it adds ~1 token of prefill per request - it just shifts the
-    // reuse threshold by one, and the len % bs == bs-1 case already prefills bs-1.
+    // never restore the whole prompt: logits are not cached state, they come
+    // from a forward pass, so at least one token must always be re-prefilled.
+    // only an exact multiple of bs covers the whole prompt, so drop the last
+    // chunk in that case. (rolling the recurrent state back one token is not
+    // possible: it is non-invertible and only valid at chunk boundaries)
     if (usable == n_chunks && n_chunks > 0 && tokens.size() % bs == 0) {
         usable--;
         SRV_INF("kv-chain[storage]: prompt length %zu is an exact multiple of the chunk size %zu; "
@@ -654,27 +557,16 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         return chunks;
     }
 
-    // ---- phase 2: resolve the replay plan (NO blob data is read here) ------
-    // the matched chunks are returned as file PATHS only; the caller replays
-    // them one at a time (read file -> set_data -> free, next file), so the
-    // whole chain is never materialized in RAM at once (on a 128 GB box running
-    // a 110 GB model, the old "read everything first" behavior peaked at ~2x
-    // the chain size in RAM).
-    //
-    // validation happens in TWO places, with different failure semantics:
-    //   * the TAIL .rscache is validated HERE (cheap: one 150 MiB read, and its
-    //     failure mode is special - the recurrent tail is a single fixed-size
-    //     object with no earlier fallback, so a bad tail discards the ENTIRE
-    //     restore and the corrupt file is deleted).
-    //   * the per-chunk .kvcache files are validated by the CALLER during the
-    //     replay (one read each, streamed). a .kvcache that fails to open/parse
-    //     mid-replay is a benign "cache ends here" (eviction race, manual
-    //     deletion): the caller truncates the restore at the last chunk with a
-    //     valid rs file (rs_present[] is exposed for that) and prefills the rest.
+    // phase 2: resolve the replay plan (no blob data is read here except the
+    // tail rs, validated up front: it is a single fixed-size object with no
+    // earlier fallback, so a bad tail discards the whole restore, and the
+    // corrupt file is deleted). the per-chunk .kvcache files are validated by
+    // the caller during the replay; a read failure there discards the whole
+    // restore too (the loaded rows would be orphaned - no valid recurrent
+    // state to resume from), i.e. 100% re-prefill.
     stems.resize(usable);
     rs_present.resize(usable);
-    // expose for the caller's mid-replay fallback (vector<uint8_t>, not
-    // vector<bool>: the latter's proxy references are non-const-assignable)
+    // (vector<uint8_t>, not vector<bool>: the latter's proxies are not const-assignable)
     last_rs_present_.resize(usable);
     for (size_t k = 0; k < usable; ++k) {
         last_rs_present_[k] = rs_present[k] ? 1 : 0;
@@ -682,11 +574,11 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
 
     const fs::path rs_file_tail = dir / (stems[usable - 1] + ".rscache");
     const llama_tokens tail_block(tokens.begin() + (usable - 1) * bs, tokens.begin() + usable * bs);
-    std::vector<uint8_t> tail_blob; // validated here, then freed; the CALLER re-reads the file at replay time
+    std::vector<uint8_t> tail_blob; // validated here, then freed; the caller re-reads at replay time
     if (!read_chunk_file(rs_file_tail, tail_blob, tail_block)) {
         SRV_WRN("kv-chain[storage]: load_prefix: rs read failed/mismatch at tail chunk %zu, discarding entire restore\n", usable - 1);
-        // if the file is still on disk it is corrupt/stale: delete it so
-        // it is not re-read (and re-deleted) on the next restore.
+        // if still on disk it is corrupt/stale: delete it so it is not re-read
+        // (and re-deleted) on every restore.
         std::error_code dec;
         if (fs::exists(rs_file_tail, dec) && fs::remove(rs_file_tail, dec)) {
             SRV_WRN("kv-chain[storage]: load_prefix: deleted corrupt rs file %s\n", rs_file_tail.filename().string().c_str());
@@ -708,18 +600,10 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     }
     *n_tokens = usable * bs;
 
-    // touch exactly the files that will be read and replayed:
-    // chunks[0..usable-1]'s .kvcache + the .rscache of the TAIL chunk
-    // (usable-1), PLUS the .rscache of every chunk index that is a multiple
-    // of KV_CHAIN_RS_TOUCH_STRIDE below the tail (0, 8, 16, ... < usable-1,
-    // plus the tail itself if it happens to land on the grid).
-    // WHY: a future prompt may fork off this chain at one of those
-    // intermediate boundaries (a shorter shared prefix). if we only touched
-    // the tail rs file, LRU eviction would prune the intermediate rs files
-    // even though a fork at that boundary still needs its recurrent state -
-    // the fork would silently degrade to a full re-prefill of the shared
-    // trunk. touching the grid-stride rs files keeps the most useful fork
-    // points alive without paying for every chunk's rs file.
+    // touch the replayed .kvcache files + the tail rs + every 8th rs file below
+    // the tail: a future prompt may fork at one of those intermediate
+    // boundaries, and only its rs file is needed to restore the recurrent
+    // state there.
     {
         static constexpr size_t KV_CHAIN_RS_TOUCH_STRIDE = 8;
         std::vector<fs::path> to_touch;

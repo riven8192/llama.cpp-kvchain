@@ -67,9 +67,7 @@ enum slot_state {
 struct server_slot; // forward declaration
 struct server_context_impl;
 
-// per-ubatch hook state: the context snapshots the prefilling slot's state
-// after each ubatch is committed, so each saved chunk holds a self-consistent
-// (rows, recurrent) prefix that can be restored and resumed from
+// per-ubatch hook state: the prefilling slot the snapshots belong to
 struct kv_chain_ubatch_state {
     server_context_impl * ctx = nullptr;
     server_slot *         slot = nullptr;
@@ -263,31 +261,20 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
-    // set when the prompt state was restored from the disk hash-chain cache;
-    // the truncating seq_rm() must be skipped in that case, because the
-    // restored recurrent state cannot be rolled back to an arbitrary position
+    // prompt state restored from the disk hash-chain cache
     bool kv_chain_restored = false;
 
-    // set when a disk restore covered the entire prompt (nothing left to
-    // prefill); the slot starts decoding instead of going through DONE_PROMPT
+    // a disk restore covered the entire prompt (cannot happen: load_prefix caps
+    // the restore so at least one token is always left to prefill)
     bool kv_chain_full_restore = false;
 
-    // the FULL hash chain of THIS prompt, computed once at prompt arrival
-    // (kv_chain_store::hash_chain). hashes[k] names the file for chunk k.
+    // the full hash chain of this prompt, computed once at prompt arrival.
     // both the restore walk and the per-ubatch save hook index this vector, so
-    // they can never disagree about a chunk's name. empty when kv-chain is off
-    // or the prompt has no complete chunk.
+    // they can never disagree about a chunk's name.
     std::vector<uint64_t> kv_chain_hashes;
 
-    // the `pos` (tokens committed) of the last chunk boundary this slot saved.
-    // the per-ubatch hook can fire TWICE for the same boundary when MTP
-    // speculative decoding is on: after the target prefill pass, the MTP draft
-    // path (common_speculative_impl_draft_mtp::process) re-runs llama_decode on
-    // the SAME tokens, which fires cb_ubatch a second time with the identical
-    // pos. without this dedupe the second call would re-dump the whole chunk
-    // blob (~150 MiB) before kv_chain_store::save finds the files already
-    // exist and skips the write. normal prefill always advances pos, so this
-    // can only ever match the MTP double-fire.
+    // pos of the last chunk boundary saved; dedupes the MTP draft path, which
+    // re-decodes the same tokens and re-fires the ubatch hook at the same pos
     size_t kv_chain_last_saved_pos = 0;
 
     server_prompt prompt;
@@ -911,16 +898,12 @@ private:
     std::unique_ptr<server_prompt_cache> prompt_cache;
     std::unique_ptr<kv_chain_store> kv_chain;
 
-    // the slot whose prompt is currently being prefilled; the per-ubatch
-    // callback snapshots its state. with --parallel 1 there is at most one.
+    // the slot whose prompt is currently being prefilled (at most one)
     server_slot * kv_chain_prefill_slot = nullptr;
     kv_chain_ubatch_state kv_chain_cb_state;
 
-    // snapshot the prefilling slot's state after a ubatch is committed. the
-    // callback fires after every internal ubatch, but we only persist at
-    // n_ubatch-aligned boundaries (and the final position), so chunk k holds the
-    // state of the prefix [0, k*n_ubatch]. the position is read from the memory
-    // module (authoritative); the token list is sliced to match.
+    // called after each ubatch is committed; persists only at bs-aligned
+    // boundaries, so chunk k holds the state of the prefix [0, (k+1)*bs)
     void kv_chain_save_prefill_ubatch(server_slot & slot, uint32_t n_pos_last) {
         if (!kv_chain || kv_chain_prefill_slot != &slot) {
             return;
@@ -932,39 +915,18 @@ private:
         const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
         const size_t bs  = (size_t) kv_chain->ubatch_size();
 
-        // [DEBUG] log every ubatch boundary during prefill so we can see the
-        // real ubatch split and whether it lands on the bs-grid. this is the
-        // investigation for the mid-prompt ragged-ubatch problem: if a ubatch
-        // boundary falls off-grid mid-prompt, the hash chain desyncs. run with
-        // -ub 256 -b 256 and a long prompt.
-        //   pos            = seq_pos_max+1 = tokens committed so far (memory module, authoritative)
-        //   cb_n_pos_last  = ubatch.pos[last] passed by llama_decode (the boundary just completed)
-        // NOTE: the per-ubatch n_tokens/pos-range used to be stashed in
-        // kv_chain_cb_state by llama_decode's hook, but the struct layout in
-        // llama-context.cpp does not match this one (different leading fields),
-        // so those reads were always 0/-1. the authoritative signal is `pos`
-        // (from the memory module) and `cb_n_pos_last` (the boundary arg).
         SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d pos%%bs=%d %s\n",
                 (int) pos, (int) n_pos_last, (int) (pos % bs),
                 (pos % bs == 0) ? "ON-GRID" : "OFF-GRID");
 
-        // chunk boundaries are a fixed bs-grid (chunk k covers [k*bs, (k+1)*bs)).
-        // the hash chain is built from the token list alone, so it only works if
-        // both save and load agree on this grid. the runtime ubatch split does not
-        // always land on the grid (it is "chaotic" near the tail / for short
-        // prompts), so we only dump when pos is EXACTLY a bs-multiple - that is
-        // the only case where the model has computed state-as-of k*bs and the
-        // boundary is reproducible. off-grid edges are skipped.
+        // the hash chain is a fixed bs-grid; only dump when pos is exactly a
+        // bs-multiple (state-as-of k*bs). off-grid boundaries are skipped.
         if (pos % bs != 0) {
             return;
         }
-        // the boundary at pos = k*bs completes chunk (k-1), which covers
-        // [(k-1)*bs, k*bs). e.g. pos=32 completes chunk 0 = [0,32).
+        // the boundary at pos = k*bs completes chunk (k-1), covering [(k-1)*bs, k*bs)
         const size_t chunk_n = pos / bs - 1;
 
-        // MTP double-fire dedupe: the draft path re-decodes the same tokens and
-        // re-fires this hook at the identical pos (see kv_chain_last_saved_pos).
-        // the chunk was already dumped by the target pass, so skip.
         if (pos == slot.kv_chain_last_saved_pos) {
             SLT_INF(slot, "kv-chain[ubatch]: pos=%d already saved (MTP draft re-fire), skipping\n", (int) pos);
             return;
@@ -974,27 +936,19 @@ private:
         if (pos > n) {
             return;
         }
-        // the chunk's own tokens are [chunk_lo, pos) = [chunk_n*bs, (chunk_n+1)*bs)
         const size_t chunk_lo = (size_t) chunk_n * bs;
         llama_tokens chunk_tokens;
         chunk_tokens.reserve(bs);
         for (size_t i = chunk_lo; i < pos; ++i) {
             chunk_tokens.push_back(slot.prompt.tokens[i]);
         }
-        // the chunk's file name comes from the chain computed at prompt
-        // arrival (slot.kv_chain_hashes). NO hashing here: the restore walk
-        // uses the same vector, so save and find can never diverge.
         if (chunk_n >= slot.kv_chain_hashes.size()) {
-            return; // should not happen: chunk_n < prompt.n_tokens/bs == chain size
+            return;
         }
         const uint64_t chunk_hash = slot.kv_chain_hashes[chunk_n];
 
-        // dump only THIS chunk's window [chunk_lo, pos): the attn rows and the
-        // recurrent rows for exactly these bs positions. no full-prefix
-        // duplication - each chunk file is a constant size, and on restore the
-        // chunks are replayed in order (attn appends, recurrent overwrites).
         kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
-                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // [DEBUG] parent for logging only
+                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // parent: logging only
         slot.kv_chain_last_saved_pos = pos;
     }
 
@@ -1468,17 +1422,10 @@ private:
         SRV_INF("kv-chain: params kv_chain_dir='%s', kv_chain_limit_gb=%d\n",
                 params_base.kv_chain_dir.c_str(), params_base.kv_chain_limit_gb);
         if (!params_base.kv_chain_dir.empty()) {
-            // GRID-SAFETY GUARD (fatal): the hash chain only stays in sync if EVERY
-            // ubatch boundary is a multiple of the chunk stride (n_ubatch). two things
-            // can break that:
-            //  (1) a single llama_decode of n_batch tokens splits into n_batch/n_ubatch
-            //      ubatches - all on-grid only if n_batch is a multiple of n_ubatch;
-            //  (2) on KV-full the server RETRIES with n_batch /= 2 and re-slices the SAME
-            //      tokens - a mid-prompt retry re-decodes those tokens in a smaller slice,
-            //      so the halved size must ALSO be a multiple of n_ubatch, i.e.
-            //      n_batch/n_ubatch must survive arbitrary halvings => power of 2.
-            // an off-grid boundary would desync the hash chain (wrong chunk hashes,
-            // silent garbage restore), so we refuse to start instead.
+            // grid-safety guard: every ubatch boundary must land on the n_ubatch
+            // chunk grid or the hash chain desyncs. n_batch must be a multiple
+            // of n_ubatch, and the KV-full retry halves n_batch, so the ratio
+            // must survive arbitrary halvings: it must be a power of 2.
             const int32_t n_b  = (int32_t) llama_n_batch (ctx_tgt);
             const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_tgt);
             const int32_t ratio = (n_ub > 0) ? n_b / n_ub : 0;
@@ -1497,16 +1444,8 @@ private:
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
                 : 0;
-            // the chunk stride MUST be n_ubatch (NOT n_batch): the per-ubatch
-            // snapshot fires at every UBatch boundary, and those boundaries land
-            // on the n_ubatch grid - not the n_batch grid. using n_batch as the
-            // stride would desync the chain whenever -b != -ub (e.g. -b 2048
-            // -ub 1024: a boundary at pos=1024 is on-grid for the ubatches but
-            // 1024 % 2048 != 0, so the save hook would skip it and the chunk
-            // hash grid would not match the files written). the grid-safety
-            // guard above (n_b/n_ub power of 2) is exactly what keeps every
-            // ubatch boundary on the n_ubatch chunk grid, including the KV-full
-            // retry halvings.
+            // chunk stride = n_ubatch (not n_batch): the snapshots fire at ubatch
+            // boundaries, which land on the n_ubatch grid.
             kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes,
                                                         n_ub, params_base, model_tgt);
         }
@@ -2988,18 +2927,8 @@ private:
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
-                // [DEBUG] log each highlevel decode() call that processes a
-                // PROMPT slice (n_tokens > 1). counting these shows whether ONE
-                // prompt is fed to llama_decode in a single call or sliced into
-                // many (n_batch = llama_n_batch, the -b value; off = running
-                // offset). the n_tokens > 1 guard skips the per-token decode
-                // calls (n_tokens == 1) that fire during generation, which would
-                // otherwise spam the console one line per output token. the
-                // batch.size == n_batch guard skips the small multi-token decode
-                // batches (speculative / n_batch < batch.size) that are not
-                // whole-batch prefill slices - those are not interesting for the
-                // ubatch-grid investigation and would otherwise spam one line per
-                // decode step.
+                // log each whole-batch prompt decode (skips the per-token decode
+                // steps of generation)
                 if (n_tokens > 1 && batch.size() == n_batch) {
                     SRV_INF("kv-chain[decode]: batch.size=%d off=%d n_tokens=%d n_batch=%d\n",
                             (int) batch.size(), off, n_tokens, n_batch);
@@ -3276,12 +3205,8 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        // arm the per-ubatch kv-chain snapshot for this slot.
-                        // the hash chain is computed ONCE here, at prompt
-                        // arrival, from the prompt tokens: the restore walk and
-                        // the save hook both index this vector (a chunk's file
-                        // name is a pure function of the prompt, so it must not
-                        // depend on runtime state).
+                        // arm the per-ubatch kv-chain snapshot: the hash chain is
+                        // computed once here, at prompt arrival, from the tokens.
                         if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
                             kv_chain_prefill_slot      = &slot;
                             kv_chain_cb_state.slot   = &slot;
@@ -3360,16 +3285,9 @@ private:
 
                             if (slot.task->params.cache_prompt) {
                                 if (kv_chain) {
-                                    // the disk hash-chain cache is the only prefix cache: it is
-                                    // consulted below (load_prefix) and covers the whole prompt
-                                    // from position 0. the native in-memory common-prefix reuse
-                                    // would otherwise set n_past to the LCP with the previous
-                                    // prompt (e.g. a divergent re-run reusing a stale in-memory
-                                    // prefix that the disk chain does not have), which would
-                                    // desync n_past from the restored chain. keep n_past == 0
-                                    // here so the kv-chain restore path is the single source of
-                                    // truth. the UNEXPECTED warning below is the last-resort
-                                    // check that this branch is the only prefix-cache path.
+                                    // the disk hash-chain cache is the only prefix cache;
+                                    // bypass the native in-memory common-prefix reuse so
+                                    // the restore path is the single source of truth.
                                     SLT_WRN(slot, "%s", "kv-chain[storage]: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
                                     n_past = 0;
                                 } else {
@@ -3563,49 +3481,28 @@ private:
                                     n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
                                     (int) input_tokens.has_mtmd, input_tokens.size());
                         }
-                        // note: we do NOT require slot.prompt.n_tokens() == 0 here.
-                        // in the no-restart case, the slot's prompt.tokens still
-                        // holds the previous prompt+response (reset() doesn't
-                        // clear it). the pre-restore seq_rm(0, -1) wipes the KV
-                        // cache regardless, so the stale tokens are irrelevant.
+                        // no need to require slot.prompt.n_tokens() == 0: in the
+                        // no-restart case the slot still holds the previous
+                        // prompt+response, but the pre-restore seq_rm wipes it.
                         if (kv_chain && n_past == 0 && slot.task->params.cache_prompt) {
                             // restore a saved prefix from the disk hash-chain cache.
-                            // note: we do NOT guard on input_tokens.has_mtmd here because
-                            // it reflects the MODEL's capability (mctx != nullptr), not
-                            // whether THIS prompt actually contains media. a text-only
-                            // prompt to a multimodal-capable model has has_mtmd=true but
-                            // no actual media chunks, and the kv-chain restore is still
-                            // valid (all tokens are text, no image/audio rows in the KV).
+                            // has_mtmd reflects the model's capability, not whether
+                            // this prompt has media, so no guard on it here.
                             size_t n_saved = 0;
-                            // get_text_tokens() (not get_tokens()): the latter asserts !has_mtmd,
-                            // but has_mtmd reflects the model's capability (mctx != nullptr, true
-                            // when an mmproj file is present), NOT whether this prompt has media.
-                            // a text-only prompt to a multimodal-capable model has has_mtmd=true
-                            // but no LLAMA_TOKEN_NULL entries, so get_text_tokens() returns all tokens.
+                            // get_text_tokens() (not get_tokens()): the latter
+                            // asserts !has_mtmd
                             const llama_tokens text_tokens = input_tokens.get_text_tokens();
                             const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
                             if (!chunks.empty() && n_saved > 0) {
-                                // wipe ALL existing state for this seq before restoring.
-                                // in the no-restart case the cache still holds the previous
-                                // prompt+response tokens; seq_rm(0, -1) resets both the
-                                // per-token KV cells AND the recurrent state (rs_idx -> 0,
-                                // cells freed, head updated). this makes the no-restart
-                                // case equivalent to a fresh context (restart).
+                                // wipe all existing state first: in the no-restart case
+                                // this resets the previous prompt+response (per-token KV
+                                // cells and recurrent state) to a fresh-context state.
                                 slot.mem.seq_rm(slot.id, 0, -1);
-                                // replay the matched chunks in order, ONE FILE AT A TIME:
-                                // read the .kvcache, set_data, free it, next chunk. the
-                                // whole chain is never in RAM at once (see kv_chain_chunk:
-                                // on a resource-constrained box the old "read everything
-                                // first" behavior peaked at ~2x the chain size).
-                                // each chunk's .kvcache holds the ATTN_ONLY rows for its
-                                // own window [k*bs,(k+1)*bs). attn: chunk 0 wipes (APPEND
-                                // cleared) any stale cells, later chunks append (APPEND set)
-                                // so all positions accumulate.
-                                // a .kvcache that fails to open/validate MID-replay is a
-                                // benign "cache ends here" (eviction race / manual
-                                // deletion): truncate at the deepest loaded chunk whose rs
-                                // file is present (kv_chain->last_rs_present() - its rs IS
-                                // the valid recurrent tail) and prefill the rest.
+                                // replay the chunks one file at a time (peak RAM = one
+                                // file). each .kvcache holds the ATTN_ONLY rows of its
+                                // window [k*bs,(k+1)*bs): chunk 0 wipes, the rest append.
+                                // a read failure mid-replay discards the whole restore
+                                // (the loaded rows would be orphaned) -> 100% re-prefill.
                                 bool ok = true;
                                 const size_t bs = (size_t) kv_chain->ubatch_size();
                                 size_t n_replayed = 0;
@@ -3614,14 +3511,12 @@ private:
                                     const llama_pos pos_hi    = (llama_pos) ((k + 1) * bs);
                                     std::vector<uint8_t> attn_blob;
                                     if (!kv_chain->read_chunk_file(chunks[k].attn_file, attn_blob, chunks[k].tokens)) {
-                                        SLT_WRN(slot, "kv-chain[storage]: kv read failed/mismatch at chunk %zu, cache ends here\n", k);
+                                        SLT_WRN(slot, "kv-chain[storage]: kv read failed/mismatch at chunk %zu, discarding restore\n", k);
                                         ok = false;
                                         break;
                                     }
-                                    // ATTN_ONLY (not FULL_ONLY): the .kvcache blob was written
-                                    // with ATTN_ONLY, so the read must use the same flag. on a
-                                    // DSV4 cache FULL_ONLY would try to read ring bytes that are
-                                    // not in the blob.
+                                    // ATTN_ONLY: the .kvcache blob was written with
+                                    // ATTN_ONLY, so the read must use the same flag.
                                     const llama_state_seq_flags attn_flags =
                                             (k == 0) ? LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY
                                                     : (LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
@@ -3630,8 +3525,7 @@ private:
                                             attn_flags, pos_lo, pos_hi);
                                     attn_blob.clear();
                                     attn_blob.shrink_to_fit();
-                                    // set_data_window_ext returns the bytes CONSUMED from the
-                                    // blob (= blob size for a well-formed file); 0 = failure.
+                                    // 0 = failure
                                     if (n_attn == 0) {
                                         SLT_WRN(slot, "kv-chain[storage]: attn restore failed at chunk %zu\n", k);
                                         ok = false;
@@ -3640,32 +3534,16 @@ private:
                                     n_replayed++;
                                 }
                                 if (!ok) {
-                                    // mid-replay failure. the streaming replay has a
-                                    // different failure invariant than the old
-                                    // read-all-first code: by the time a .kvcache read
-                                    // (or set_data) fails at chunk k, the attn rows of
-                                    // chunks [0,k) are ALREADY in the cache, but the
-                                    // recurrent tail is NOT (it is only loaded after
-                                    // the loop). those rows are orphaned - there is no
-                                    // valid recurrent state to resume from, so a
-                                    // partial restore would produce garbage. wipe the
-                                    // seq (same as the pre-restore wipe) and fall back
-                                    // to a 100% prefill.
+                                    // the attn rows loaded so far would be orphaned (the
+                                    // recurrent tail is only loaded after the loop), so
+                                    // wipe and fall back to a 100% prefill.
                                     slot.mem.seq_rm(slot.id, 0, -1);
                                     n_saved = 0;
                                     n_replayed = 0;
                                 }
-                                // load the recurrent tail from the TAIL chunk's .rscache.
-                                // load_prefix() already validated the tail rs file (and
-                                // discarded the whole restore if it was bad), so we only
-                                // reach here with a valid tail. read it now (one 150 MiB
-                                // read, freed immediately after).
-                                // TAIL_ONLY (not PARTIAL_ONLY): the .rscache blob was dumped
-                                // with TAIL_ONLY. on a DSV4 cache that is the compressed K
-                                // caches + the rings, WITHOUT kv_raw - loading it with
-                                // PARTIAL_ONLY would make state_read expect kv_raw bytes and
-                                // mis-parse (silent garbage). the plain set_data_ext (no
-                                // window) is what the blob was serialized with.
+                                // load the recurrent tail from the TAIL chunk's .rscache
+                                // (validated up front by load_prefix). TAIL_ONLY, the same
+                                // flag the blob was dumped with.
                                 if (ok && !chunks.empty()) {
                                     std::vector<uint8_t> tail_recr;
                                     const kv_chain_chunk & tail_chunk = chunks.back();
@@ -3698,8 +3576,6 @@ private:
                                     SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
                                             n_past, n_replayed, n_left);
                                 } else {
-                                    // the pre-restore seq_rm(0, -1) already wiped the seq;
-                                    // n_past stays 0 -> 100% prefill.
                                     SLT_WRN(slot, "%s", "kv-chain[storage]: failed to restore chain, falling back to prefill");
                                 }
                             }
@@ -3749,13 +3625,7 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    // truncate any data at [p0, end). in the kv-chain-restored case,
-                    // p0 == n_saved (the restored prefix length). the pre-restore
-                    // seq_rm(0, -1) already cleared everything, so this is typically
-                    // a no-op. but if the restore wrote to [0, n_saved) and there
-                    // was data beyond that (shouldn't happen after the pre-wipe),
-                    // this cleans it up. safe: seq_rm only touches cells in [p0, -1),
-                    // never the recurrent tail at position n_saved.
+                    // truncate any data at [p0, end)
                     slot.mem.seq_rm(slot.id, p0, -1);
                     slot.kv_chain_restored = false;
 
@@ -3775,18 +3645,10 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
-                    // [kv-chain] context checkpoints are redundant AND harmful when the
-                    // disk hash-chain cache is enabled: (1) they are a weaker, in-memory,
-                    // single-session version of the same "save point" the disk chain
-                    // provides (and the chain survives restart + is shared across
-                    // sessions); (2) the checkpoint logic BREAKS the prompt batch early
-                    // (checkpoint_offsets = {4+n_ubatch, 4}), which fragments the tail
-                    // into ragged, off-grid ubatches (e.g. 1675/2044/4 instead of
-                    // 2048/2048) and desyncs the hash chain - we lose whole chunks of
-                    // reuse. for a 150K-token prompt the first checkpoint break can
-                    // strand most of the prefix. so when kv_chain is set, disable
-                    // checkpoints entirely (the disk chain is the source of truth for
-                    // prefix reuse). with kv-chain off this runs exactly as upstream.
+                    // disable context checkpoints when kv-chain is set: they are
+                    // redundant (the disk chain is the source of truth for prefix
+                    // reuse) and their early batch breaks fragment the prompt into
+                    // off-grid ubatches, desyncing the hash chain.
                     if (kv_chain) {
                         do_checkpoint = false;
                     }
@@ -3922,16 +3784,10 @@ private:
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
-                        // DEAD PATH: load_prefix() caps the restore so at least one
-                        // token is always left to prefill (see NOTES.md 4b), so a
-                        // full restore can no longer happen. it is kept as a hard
-                        // failure rather than removed because the "skip the forward
-                        // pass and go straight to GENERATING" shortcut that used to
-                        // live here is silently WRONG: with no forward pass there are
-                        // no logits, so the slot never samples (i_batch == -1) or
-                        // trips "corrupt output buffer (n_outputs=0)" -> GGML_ABORT.
-                        // if this ever fires again, fix the cap in load_prefix - do
-                        // NOT reinstate a no-forward-pass shortcut here.
+                        // a full restore cannot happen (load_prefix caps it so at
+                        // least one token is always prefilled). do not reinstate a
+                        // no-forward-pass shortcut here: without a forward pass there
+                        // are no logits to sample.
                         GGML_ASSERT(!slot.kv_chain_full_restore &&
                                 "kv-chain: full prompt restore must be capped in load_prefix");
 
@@ -4494,9 +4350,6 @@ static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos_last) {
     if (s == nullptr || s->ctx == nullptr || s->slot == nullptr) {
         return;
     }
-    // [DEBUG] n_pos_last = position of the last token of the ubatch that just
-    // committed (the boundary). the hook also reads the authoritative pos from
-    // the memory module; logging both lets us see if they ever disagree.
     s->ctx->kv_chain_save_prefill_ubatch(*s->slot, n_pos_last);
 }
 

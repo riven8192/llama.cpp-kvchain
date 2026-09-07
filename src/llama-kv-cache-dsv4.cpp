@@ -22,8 +22,8 @@ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
-// no kv_raw, no compressed K rows, no rings (the pure recurrent tail). written
-// by TAIL_ONLY on caches with no compressed part; dsv4 itself never emits it.
+// compressed K rows + rings, no kv_raw. dsv4 never emits this on its own; it is
+// the TAIL_ONLY mode (the per-chunk files already hold kv_raw).
 static constexpr uint32_t DSV4_STATE_MODE_TAIL     = 2;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
@@ -1537,27 +1537,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
 
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    // ATTN_ONLY: serialize ONLY the per-token KV (kv_raw), never the ring states
-    // and never the compressed K caches. the ring states are the "tail object"
-    // the kv-chain disk cache stores separately in the .rscache file; the
-    // compressed K caches are restored verbatim from the SAME tail blob (they
-    // are prefix-style rows the tail prefill does NOT recompute - it only
-    // processes tokens >= n_saved). FULL_ONLY would drag the rings into the
-    // per-chunk .kvcache file, which must hold only the additive per-token rows.
+    // ATTN_ONLY: only the per-token KV (kv_raw) - never the rings or the
+    // compressed K caches (both are the "tail object", stored separately).
     const bool attn_only    = flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY;
-    // TAIL_ONLY: the .rscache tail object. on dsv4 this is the compressed K
-    // caches + the ring states - WITHOUT kv_raw (the per-chunk .kvcache files
-    // already hold it, and repeating it here would double the per-chunk cost
-    // AND desync the restore: state_read clears kv_raw on a FULL-mode blob,
-    // which would wipe the just-restored per-token rows).
+    // TAIL_ONLY: the compressed K caches + the rings, WITHOUT kv_raw (a FULL-
+    // mode read clears kv_raw first, which would wipe the restored per-token
+    // rows; and the tail prefill does not recompute the compressed caches).
     const bool tail_only    = flags & LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY;
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
-    // FULL    = kv_raw + compressed + rings   (a complete snapshot)
+    // FULL    = kv_raw + compressed + rings
     // PARTIAL = kv_raw only                   (the in-memory checkpoint shape)
-    // ATTN    = kv_raw only                   (the per-chunk .kvcache file)
-    // TAIL    = compressed + rings            (the .rscache file)
+    // TAIL    = compressed + rings            (no kv_raw)
     const uint32_t mode    = (partial_only || attn_only) ? DSV4_STATE_MODE_PARTIAL
                                  : tail_only             ? DSV4_STATE_MODE_TAIL
                                                          : DSV4_STATE_MODE_FULL;
@@ -1566,18 +1558,13 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    // kv_raw is skipped ONLY for TAIL_ONLY (the .rscache file): the per-chunk
-    // .kvcache files already hold the per-token rows, and a FULL-mode blob read
-    // clears kv_raw first, which would wipe the just-restored rows. for every
-    // other mode the kv_raw part is written (FULL: full prefix, PARTIAL/ATTN:
-    // the pos_lo/pos_limit window).
+    // kv_raw is skipped only for TAIL_ONLY (see above)
     if (!tail_only) {
         kv_raw->state_write(io, seq_id, flags, pos_lo, pos_limit);
     }
 
-    // the compressed K caches are written in FULL and TAIL_ONLY modes. they are
-    // PREFIX-style (row i covers [i*ratio, (i+1)*ratio)) - NOT windowable - so
-    // they are either fully present or absent.
+    // the compressed K caches are prefix-style (not windowable): fully present
+    // or absent, written in FULL and TAIL_ONLY modes
     if (!partial_only && !attn_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
@@ -1594,10 +1581,7 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
     }
 
-    // the ring states are written in FULL, PARTIAL_ONLY and TAIL_ONLY modes, but
-    // NOT in ATTN_ONLY (the per-chunk .kvcache file holds only kv_raw rows).
-    // they are ring-buffered at rs_idx[seq_id] (the compressor's current
-    // persistent plane); on read they are restored verbatim.
+    // the ring states are written in all modes except ATTN_ONLY
     if (!attn_only) {
         csa_state->state_write(io, seq_id, flags, rs_idx);
         hca_state->state_write(io, seq_id, flags, rs_idx);
@@ -1626,17 +1610,12 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state mode mismatch");
     }
 
-    // the blob layout is fixed by the on-disk mode byte; the flags only select
-    // which parts the CALLER wants to touch. verify the caller's expectation
-    // matches what the blob actually contains, and throw on disagreement so a
-    // format/flag mismatch is LOUD instead of a silent mis-parse (reading
-    // compressed rows as kv_raw rows garbles the output with no error).
+    // verify the caller's flags match what the blob actually contains, and
+    // throw on disagreement: a mismatch would silently mis-parse (e.g. reading
+    // compressed rows as kv_raw rows) and garble the output.
     const bool blob_has_raw  = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_PARTIAL);
     const bool blob_has_comp = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_TAIL);
     const bool blob_has_rings = (mode != DSV4_STATE_MODE_PARTIAL);
-    // a PARTIAL-mode blob = kv_raw only (the per-chunk .kvcache shape): the
-    // reader wants exactly that whether it was written by ATTN_ONLY or by
-    // PARTIAL_ONLY (the in-memory checkpoint shape, kept for compatibility).
     const bool flags_want_raw  = (flags & (LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
     const bool flags_want_comp = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) == 0;
     const bool flags_want_rings = (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY) == 0;
@@ -1664,10 +1643,8 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         lid_state->state_read(io, seq_id, flags);
     }
 
-    // reset the recurrent ring index only when the ring states were actually
-    // reloaded. for an ATTN_ONLY / kv_raw-only read (the per-chunk .kvcache
-    // replay) the rings are untouched, so rs_idx must keep its value - it is
-    // reset later by the TAIL_ONLY restore of the tail .rscache file.
+    // reset rs_idx only when the rings were reloaded: an ATTN_ONLY read leaves
+    // them untouched, and rs_idx is reset later by the TAIL_ONLY restore.
     if (blob_has_rings) {
         if (seq_id >= 0) {
             GGML_ASSERT((uint32_t) seq_id < n_seq_max);

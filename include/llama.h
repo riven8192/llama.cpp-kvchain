@@ -387,9 +387,8 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
-        // [EXPERIMENTAL] called after each ubatch is processed by llama_decode
-        // n_pos = the position just completed (last pos of the ubatch)
-        // used by the kv-chain disk cache to snapshot the state per ubatch
+        // called after each ubatch is processed by llama_decode, with the
+        // position of the ubatch's last token (the boundary just completed)
         void (* cb_ubatch)(void * user_data, uint32_t n_pos);
         void *              cb_ubatch_data;
 
@@ -908,33 +907,20 @@ extern "C" {
 // work only with partial states, such as SWA KV cache or recurrent cache (e.g. Mamba)
 #define LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY 1
 
-// inverse of PARTIAL_ONLY: work only with the full (per-token KV) cache, skipping the recurrent state.
-// used by the kv-chain disk cache to snapshot the attn rows of a chunk separately from the recurrent rows.
+// inverse of PARTIAL_ONLY: work only with the full (per-token KV) cache, skipping the recurrent state
 #define LLAMA_STATE_SEQ_FLAGS_FULL_ONLY 4
 
-// like FULL_ONLY, but for hybrid / multi-group caches that bundle a per-token KV
-// cache TOGETHER WITH a fixed-size recurrent / compressor ring state in a single
-// state_write (e.g. llama_kv_cache_dsv4, where FULL_ONLY would otherwise emit
-// kv_raw + the ring states), ATTN_ONLY serializes ONLY the per-token KV part
-// (kv_raw on dsv4), never the rings. the rings are the "tail object" the kv-chain
-// disk cache stores separately in the .rscache file. on the plain hybrid (Qwen)
-// and pure-attn caches, ATTN_ONLY behaves exactly like FULL_ONLY. used by the
-// kv-chain disk cache to build the per-chunk .kvcache file.
+// like FULL_ONLY, but never includes the fixed-size recurrent / ring state even
+// on caches that bundle it into the full part (e.g. llama_kv_cache_dsv4);
+// behaves like FULL_ONLY on the plain hybrid and pure-attn caches.
 #define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY 16
 
-// inverse of ATTN_ONLY: everything EXCEPT the per-token KV part. on
-// llama_kv_cache_dsv4 this is the three compressor K caches (prefix rows) + the
-// compressor ring states - the complete "tail object" the kv-chain disk cache
-// stores in the .rscache file (the .kvcache chunk files already hold the
-// per-token kv_raw rows, so this blob must NOT repeat them). the restore loads
-// it with the SAME flag (plain set_data_ext), so the compressed prefix rows are
-// restored verbatim instead of being left to recompute. on the plain hybrid
-// (Qwen) and pure-attn caches TAIL_ONLY behaves exactly like PARTIAL_ONLY.
+// inverse of ATTN_ONLY: everything except the per-token KV part. on
+// llama_kv_cache_dsv4 this is the compressed K caches + the ring states; on
+// the plain hybrid and pure-attn caches it behaves like PARTIAL_ONLY.
 #define LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY 32
 
-// on restore (state_read), do NOT clear the destination seq's cells first; append the restored
-// cells to whatever is already present. used by the kv-chain disk cache to stream chunk files:
-// the first chunk is restored with this flag CLEAR (wipes any stale cells), later chunks with it SET.
+// on restore (state_read), do not clear the destination seq's cells first; append to them
 #define LLAMA_STATE_SEQ_FLAGS_APPEND 8
 
 // Keeps the tensor data on device buffers (i.e. not accessible in host memory, but faster save/load).
@@ -948,8 +934,7 @@ extern "C" {
                     llama_seq_id   seq_id,
             llama_state_seq_flags   flags);
 
-    // size of the seq state blob for the window [pos_lo, pos_limit) with the given
-    // part-selection flags (used to size the buffer before llama_state_seq_get_data_window_ext)
+    // size of the seq state blob for the window [pos_lo, pos_limit)
     LLAMA_API size_t llama_state_seq_get_size_window_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,
@@ -971,9 +956,7 @@ extern "C" {
                      llama_seq_id   dest_seq_id,
             llama_state_seq_flags   flags);
 
-    // [EXPERIMENTAL] like the _ext above, but only (de)serialize cells with pos_lo <= pos < pos_limit.
-    // used by the kv-chain disk cache to snapshot a single chunk's window at a ubatch boundary.
-    // pass pos_lo = 0, pos_limit = INT32_MAX for the full prefix (original _prefix_ext behavior).
+    // like the _ext above, but only (de)serialize cells with pos_lo <= pos < pos_limit
     LLAMA_API size_t llama_state_seq_get_data_window_ext(
             struct llama_context * ctx,
                           uint8_t * dst,
@@ -992,8 +975,7 @@ extern "C" {
                           llama_pos pos_lo,
                           llama_pos pos_limit);
 
-    // [EXPERIMENTAL] like the _ext above, but only (de)serialize cells with pos < pos_limit.
-    // used by the kv-chain disk cache to snapshot a prompt prefix at a ubatch boundary.
+    // like the _ext above, but only (de)serialize cells with pos < pos_limit
     LLAMA_API size_t llama_state_seq_get_data_prefix_ext(
             struct llama_context * ctx,
                           uint8_t * dst,
