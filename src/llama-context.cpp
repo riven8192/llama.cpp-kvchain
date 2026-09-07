@@ -2972,13 +2972,18 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
-static constexpr uint32_t io_magic = 0xaf143cd8;
+// the seq-state blob header is ONLY this magic: the source seq_id used to be
+// written right after it, but NOTHING ever consumed it (the read path loaded
+// it into a local and discarded it; the destination is the caller's dest_seq_id
+// argument). it was removed from the header - the magic was bumped from the old
+// 0xaf143cd8 so a new binary rejects old blobs (which carry the extra 4 bytes)
+// instead of mis-parsing them.
+static constexpr uint32_t io_magic_seq = 0xaf143cd9;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
-        io.write(&seq_id, sizeof(seq_id));
+        io.write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data(io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -2990,8 +2995,7 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
 size_t llama_context::state_seq_get_size_window(llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
-        io.write(&seq_id, sizeof(seq_id));
+        io.write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data_window(io, seq_id, flags, pos_lo, pos_limit);
     } catch (const std::exception & err) {
@@ -3009,8 +3013,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
-        io->write(&seq_id, sizeof(seq_id));
+        io->write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -3022,21 +3025,16 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
+        // create a temporary io to read the magic
         io = std::make_unique<llama_io_read_host>(src, size);
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id]);
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
     }
@@ -3044,12 +3042,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
 
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -3067,8 +3062,7 @@ size_t llama_context::state_seq_get_data_prefix(llama_seq_id seq_id, uint8_t * d
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
-        io->write(&seq_id, sizeof(seq_id));
+        io->write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data(*io, seq_id, flags, pos_limit);
     } catch (const std::exception & err) {
@@ -3083,12 +3077,9 @@ size_t llama_context::state_seq_set_data_prefix(llama_seq_id seq_id, const uint8
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
 
         return state_seq_read_data(*io, seq_id, flags, pos_limit);
     } catch (const std::exception & err) {
@@ -3106,8 +3097,7 @@ size_t llama_context::state_seq_get_data_window(llama_seq_id seq_id, uint8_t * d
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
-        io->write(&seq_id, sizeof(seq_id));
+        io->write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data_window(*io, seq_id, flags, pos_lo, pos_limit);
     } catch (const std::exception & err) {
@@ -3122,12 +3112,9 @@ size_t llama_context::state_seq_set_data_window(llama_seq_id seq_id, const uint8
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
 
         return state_seq_read_data_window(*io, seq_id, flags, pos_lo, pos_limit);
     } catch (const std::exception & err) {

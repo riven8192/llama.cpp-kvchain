@@ -41,8 +41,10 @@ struct kv_chain_chunk {
 // there is NO trailing checksum: verifying one costs a full pass over every
 // (multi-hundred-MiB) recr file in the chain, which dominated restore time.
 // we trust the storage device (see read_chunk_file in the .cpp).
-// the blob is a self-contained seq-state blob (carries its own io_magic,
-// src_seq, module header) so it can be fed straight to the state_seq_set API.
+// the blob is a self-contained seq-state blob (carries its own io_magic +
+// module header; NO source seq_id - it was inert and was removed from the
+// header, see io_magic_seq in src/llama-context.cpp) so it can be fed straight
+// to the state_seq_set API (the destination is the caller's seq_id arg).
 //
 // root_hash = FNV-1a64 over a canonical metadata blob. everything in the blob
 // must affect the numeric content or LAYOUT of cached KV values, so that any
