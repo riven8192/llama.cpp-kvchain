@@ -1,4 +1,5 @@
 # runtime artifacts
+*.lock
 .llama-server.log
 .llama-server.log.*.log
 .llama-server.pid
