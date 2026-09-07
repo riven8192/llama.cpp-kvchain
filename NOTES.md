@@ -20,9 +20,10 @@ are NOT in the .rscache (the .kvcache files already carry them, and a FULL-mode
 blob read would clear kv_raw and wipe the just-restored rows). Restore works
 both after a restart AND in the same session (no-restart): the pre-restore
 `seq_rm(0, -1)` properly resets the recurrent module's internal state. A
-restore NEVER covers the whole prompt — `load_prefix` caps it so at least one
-token is always re-prefilled (logits are not cacheable; a forward pass has to
-produce them). The restore STREAMS: `load_prefix` only validates the tail
+restore NEVER covers the whole prompt — `load_prefix` searches the chain over
+`tokens[0, n-1)` only, so the last token is always re-prefilled (logits are not
+cacheable; a forward pass has to produce them). The restore STREAMS:
+`load_prefix` only validates the tail
 .rscache and returns file paths; the replay loop reads each .kvcache one at a
 time (read -> set_data -> free), so peak RAM = one file, never the whole
 chain (matters on a 128 GB box running an 110 GB model).
@@ -38,25 +39,27 @@ chain (matters on a 128 GB box running an 110 GB model).
   the two diverge only on dsv4, where FULL_ONLY drags in the rings) /
   `TAIL_ONLY` (everything except per-token KV) / `APPEND` (restore without
   seq_rm), per-ubatch hook `llama_context_params.cb_ubatch`.
-- State plumbing: `src/llama-context.cpp` (hook fired in `decode`'s ubatch loop,
-  ~line 1976), `src/llama-memory.h` (virtuals take `pos_lo`/`pos_limit`),
+- State plumbing: `src/llama-context.cpp` (hook fired in `decode`'s ubatch loop),
+  `src/llama-memory.h` (virtuals take `pos_lo`/`pos_limit`),
   `src/llama-kv-cache.cpp` (window filter + APPEND),
   `src/llama-memory-recurrent.cpp` (window filter),
   `src/llama-memory-hybrid{,-iswa}.cpp` (FULL_ONLY/PARTIAL_ONLY selection).
 - Server integration: `tools/server/server-context.cpp`
-  - save path: `kv_chain_save_prefill_ubatch` (~line 912), armed per slot,
-    dumps only when pos is on the bs-grid
-  - restore path: SLOT_STATE_STARTED block (~line 3520), replays matched chunks
-  - native in-memory prefix caching is bypassed when kv_chain is set (~3352)
-  - context checkpoints are disabled when kv_chain is set (~3730, keeps the
+  - save path: `kv_chain_save_prefill_ubatch`, armed per slot,
+    dumps only when pos is on the ubs-grid; the MTP draft re-fire at the same
+    pos is deduped (and its ON/OFF-GRID log suppressed) via
+    `slot.kv_chain_last_saved_pos`
+  - restore path: SLOT_STATE_STARTED block, replays matched chunks
+  - native in-memory prefix caching is bypassed when kv_chain is set
+  - context checkpoints are disabled when kv_chain is set (keeps the
     ubatch grid on-stride; chunk files make them redundant anyway)
   - grid-safety startup guard: `-b`/`-ub` must have a power-of-2 ratio or the
-    server exits(1) (~1467)
+    server exits(1)
 
 ## 2. Design in one paragraph
 
-Chunk k = tokens `[k*bs,(k+1)*bs)`, `bs == --ubatch`. Each chunk file stores
-ONLY its own window (attn rows for exactly bs positions) — constant file size,
+Chunk k = tokens `[k*ubs,(k+1)*ubs)`, `ubs == --ubatch`. Each chunk file stores
+ONLY its own window (attn rows for exactly ubs positions) — constant file size,
 no duplication, and NO trailing checksum (verifying one costs a full pass over
 every (multi-hundred-MiB) recr file and dominated restore time; we trust the
 storage device). The .kvcache blob is ATTN_ONLY (per-token KV rows only); the
@@ -109,7 +112,9 @@ recorded here, because those are what a regression changes:
 - `evict_kvcache`    : chain breaks at chunk 2 -> cached_tokens 64
 - `forked_chains`    : exactly 0/352/96/352 + rs-touch gap pattern
 - `ubatch_edge`      : 0/192, 0/256, 0/192 at -ub 64 (the middle pair is the
-                       255/257 control; the 192s are the exact-multiple cap)
+                        255/257 control; the 192s come from searching
+                        tokens[0, n-1) - the 256-token prompt's last token is
+                        never restored)
 - `dsv4f`            : cached_tokens 0/352, 6/6 phrases. NOT part of the runner
                        (different model, same port/cache dir - never run it
                        concurrently with the Qwen tests)
@@ -171,15 +176,14 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
 
 ### On-disk layout for DSV4F
 
-   - <hash>.kvcache per chunk = ATTN_ONLY blob = kv_raw window [k*bs,(k+1)*bs),
+   - <hash>.kvcache per chunk = ATTN_ONLY blob = kv_raw window [k*ubs,(k+1)*ubs),
      additive, APPEND on restore (chunk 0 wipes). [exactly what Qwen uses]
    - <hash>.rscache per boundary = TAIL_ONLY blob = compressed K caches + rings.
      Fixed-size tail, last wins. the restore loads ONLY the last chunk's copy.
-   - Restore: append all matched .kvcache chunks, then set_data_ext(TAIL_ONLY)
-     the last .rscache, set n_past, and prefill the remainder. The remainder is
-     never empty: load_prefix caps the restore so at least one token is always
-     left to prefill - a forward pass is required to produce logits (the reason
-     is commented at the cap in kv-chain-store.cpp load_prefix).
+    - Restore: append all matched .kvcache chunks, then set_data_ext(TAIL_ONLY)
+      the last .rscache, set n_past, and prefill the remainder. The remainder is
+      never empty: load_prefix searches tokens[0, n-1) (the last token is always
+      re-prefilled, since a forward pass is required to produce logits).
 
 ## 5. Quirks / gotchas
 
@@ -224,8 +228,8 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
 - With MTP speculative decoding enabled, the `cb_ubatch` hook fires TWICE at
   every completed boundary (once for the target prefill, once from the MTP
   draft path re-decoding the same tokens). the save hook dedupes on
-  `slot.kv_chain_last_saved_pos`, so the second fire is a no-op (log line only,
-  no re-dump).
+  `slot.kv_chain_last_saved_pos` BEFORE its ON/OFF-GRID log, so the second fire
+  is a silent no-op (no re-dump, no duplicate log line).
 - Model-file mtime in the metadata blob uses std::filesystem's
   last_write_time (different epoch than unix time, logs as a negative number).
   Consistent across runs so the root hash is stable; do not "fix" it without
