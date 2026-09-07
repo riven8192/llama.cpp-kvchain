@@ -913,32 +913,33 @@ private:
             return;
         }
         const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
-        const size_t bs  = (size_t) kv_chain->ubatch_size();
+        const size_t ubs = (size_t) kv_chain->ubatch_size();
 
-        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d pos%%bs=%d %s\n",
-                (int) pos, (int) n_pos_last, (int) (pos % bs),
-                (pos % bs == 0) ? "ON-GRID" : "OFF-GRID");
-
-        // the hash chain is a fixed bs-grid; only dump when pos is exactly a
-        // bs-multiple (state-as-of k*bs). off-grid boundaries are skipped.
-        if (pos % bs != 0) {
-            return;
-        }
-        // the boundary at pos = k*bs completes chunk (k-1), covering [(k-1)*bs, k*bs)
-        const size_t chunk_n = pos / bs - 1;
-
+        // the MTP draft path re-decodes the same tokens and re-fires the hook
+        // at the same pos (on- or off-grid); a repeat is a no-op, so dedup
+        // first and let the ON/OFF-GRID log below fire exactly once per pos.
         if (pos == slot.kv_chain_last_saved_pos) {
-            SLT_INF(slot, "kv-chain[ubatch]: pos=%d already saved (MTP draft re-fire), skipping\n", (int) pos);
             return;
         }
+
+        // the hash chain is a fixed ubs-grid; only dump when pos is exactly a
+        // ubs-multiple (state-as-of k*ubs). off-grid boundaries are skipped.
+        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d pos%%ubs=%d %s\n",
+                (int) pos, (int) n_pos_last, (int) (pos % ubs),
+                (pos % ubs == 0) ? "ON-GRID" : "OFF-GRID");
+        if (pos % ubs != 0) {
+            return;
+        }
+        // the boundary at pos = k*ubs completes chunk (k-1), covering [(k-1)*ubs, k*ubs)
+        const size_t chunk_n = pos / ubs - 1;
 
         const size_t n = slot.prompt.n_tokens();
         if (pos > n) {
             return;
         }
-        const size_t chunk_lo = (size_t) chunk_n * bs;
+        const size_t chunk_lo = (size_t) chunk_n * ubs;
         llama_tokens chunk_tokens;
-        chunk_tokens.reserve(bs);
+        chunk_tokens.reserve(ubs);
         for (size_t i = chunk_lo; i < pos; ++i) {
             chunk_tokens.push_back(slot.prompt.tokens[i]);
         }
@@ -3498,17 +3499,17 @@ private:
                                 // this resets the previous prompt+response (per-token KV
                                 // cells and recurrent state) to a fresh-context state.
                                 slot.mem.seq_rm(slot.id, 0, -1);
-                                // replay the chunks one file at a time (peak RAM = one
-                                // file). each .kvcache holds the ATTN_ONLY rows of its
-                                // window [k*bs,(k+1)*bs): chunk 0 wipes, the rest append.
-                                // a read failure mid-replay discards the whole restore
-                                // (the loaded rows would be orphaned) -> 100% re-prefill.
-                                bool ok = true;
-                                const size_t bs = (size_t) kv_chain->ubatch_size();
-                                size_t n_replayed = 0;
-                                for (size_t k = 0; k < chunks.size() && ok; ++k) {
-                                    const llama_pos pos_lo    = (llama_pos) (k * bs);
-                                    const llama_pos pos_hi    = (llama_pos) ((k + 1) * bs);
+                                 // replay the chunks one file at a time (peak RAM = one
+                                 // file). each .kvcache holds the ATTN_ONLY rows of its
+                                 // window [k*ubs,(k+1)*ubs): chunk 0 wipes, the rest append.
+                                 // a read failure mid-replay discards the whole restore
+                                 // (the loaded rows would be orphaned) -> 100% re-prefill.
+                                 bool ok = true;
+                                 const size_t ubs = (size_t) kv_chain->ubatch_size();
+                                 size_t n_replayed = 0;
+                                 for (size_t k = 0; k < chunks.size() && ok; ++k) {
+                                     const llama_pos pos_lo    = (llama_pos) (k * ubs);
+                                     const llama_pos pos_hi    = (llama_pos) ((k + 1) * ubs);
                                     std::vector<uint8_t> attn_blob;
                                     if (!kv_chain->read_chunk_file(chunks[k].attn_file, attn_blob, chunks[k].tokens)) {
                                         SLT_WRN(slot, "kv-chain[storage]: kv read failed/mismatch at chunk %zu, discarding restore\n", k);

@@ -74,6 +74,8 @@ public:
     // finds the longest saved prefix matching the prompt. walks the chain,
     // stopping at the first missing file. returns the matched chunks in order
     // (empty on miss) and sets *n_tokens = prefix length (= n_chunks*bs).
+    // the LAST token is never restored: logits come from a forward pass, so it
+    // must always be re-prefilled (the chain is searched over tokens[0, n-1)).
     std::vector<kv_chain_chunk> load_prefix(const llama_tokens & tokens, size_t * n_tokens) const;
 
     // reads + validates one chunk file (header magic/version + the token IDs

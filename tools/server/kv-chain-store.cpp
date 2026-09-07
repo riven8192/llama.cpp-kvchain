@@ -511,10 +511,13 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     //     is read here (it is validated up front). the caller streams the
     //     .kvcache files one at a time; a read failure mid-replay discards the
     //     whole restore (100% re-prefill), since the loaded rows would be orphaned.
-    const size_t bs = (size_t) ubatch_size_;
-    const size_t n_chunks = tokens.size() / bs;
+    const size_t ubs = (size_t) ubatch_size_;
 
-    const std::vector<uint64_t> hashes = hash_chain(tokens);
+    // the last token is never restored: it must be prefilled to produce logits.
+    const size_t n_search = (tokens.size() > 0) ? tokens.size() - 1 : 0;
+    const std::vector<uint64_t> hashes = hash_chain(std::vector<llama_token>(
+            tokens.begin(), tokens.begin() + n_search));
+    const size_t n_chunks = n_search / ubs;
 
     // phase 1: exists-only walk
     std::vector<std::string> stems;          // per found chunk: file name stem
@@ -536,19 +539,6 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         if (rs_exists) {
             usable = k + 1;
         }
-    }
-
-    // never restore the whole prompt: logits are not cached state, they come
-    // from a forward pass, so at least one token must always be re-prefilled.
-    // only an exact multiple of bs covers the whole prompt, so drop the last
-    // chunk in that case. (rolling the recurrent state back one token is not
-    // possible: it is non-invertible and only valid at chunk boundaries)
-    if (usable == n_chunks && n_chunks > 0 && tokens.size() % bs == 0) {
-        usable--;
-        SRV_INF("kv-chain[storage]: prompt length %zu is an exact multiple of the chunk size %zu; "
-                "capping the restore at %zu chunks so the last chunk is re-prefilled "
-                "(a forward pass is required to produce logits)\n",
-                tokens.size(), bs, usable);
     }
 
     *n_tokens = 0;
@@ -573,7 +563,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     }
 
     const fs::path rs_file_tail = dir / (stems[usable - 1] + ".rscache");
-    const llama_tokens tail_block(tokens.begin() + (usable - 1) * bs, tokens.begin() + usable * bs);
+    const llama_tokens tail_block(tokens.begin() + (usable - 1) * ubs, tokens.begin() + usable * ubs);
     std::vector<uint8_t> tail_blob; // validated here, then freed; the caller re-reads at replay time
     if (!read_chunk_file(rs_file_tail, tail_blob, tail_block)) {
         SRV_WRN("kv-chain[storage]: load_prefix: rs read failed/mismatch at tail chunk %zu, discarding entire restore\n", usable - 1);
@@ -592,13 +582,13 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     for (size_t k = 0; k < usable; ++k) {
         kv_chain_chunk chunk;
         chunk.attn_file = dir / (stems[k] + ".kvcache");
-        chunk.tokens.assign(tokens.begin() + k * bs, tokens.begin() + (k + 1) * bs);
+        chunk.tokens.assign(tokens.begin() + k * ubs, tokens.begin() + (k + 1) * ubs);
         if (k + 1 == usable) {
             chunk.recr_file = rs_file_tail; // TAIL chunk only (validated above)
         }
         chunks.push_back(std::move(chunk));
     }
-    *n_tokens = usable * bs;
+    *n_tokens = usable * ubs;
 
     // touch the replayed .kvcache files + the tail rs + every 8th rs file below
     // the tail: a future prompt may fork at one of those intermediate
