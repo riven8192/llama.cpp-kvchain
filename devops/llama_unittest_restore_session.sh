@@ -64,6 +64,9 @@ if [[ "${RESTORED}" -lt 256 ]]; then
   PASS=0
 fi
 
+
+./llama_prompt_response_analysis.sh ./prompt-1.log ./prompt-2.log
+
 # verify both file types exist on disk
 KV_COUNT=$(find "${KV_CACHE_DIR}" -name '*.kvcache' 2>/dev/null | wc -l)
 RS_COUNT=$(find "${KV_CACHE_DIR}" -name '*.rscache' 2>/dev/null | wc -l)

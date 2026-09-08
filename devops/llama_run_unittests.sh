@@ -25,6 +25,7 @@ fi
 # do NOT run the dsv4-flash test here, because the OOM-monitor job will kill
 # random processes to free resources, when opencode/qwen 3.8 are also running.
 TESTS=(
+    smoke_test
     restore_restart    # full-chain restore across a server restart
     no_kvchain         # zero-behavior-change control (feature disabled)
     restore_session    # full-chain restore, same session (no restart)

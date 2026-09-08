@@ -32,9 +32,9 @@ RUN_ARGS_STR="${RUN_ARGS[*]:-}"
 run_server() {
     # llama_run.sh waits for the server to be ready before returning
     if [ -n "${RUN_ARGS_STR}" ]; then
-        "${DEVS}/llama_run.sh" --keep-cache -- "${RUN_ARGS[@]}"
+        "${DEVS}/llama_run.sh" --keep-cache "$@" -- "${RUN_ARGS[@]}"
     else
-        "${DEVS}/llama_run.sh" --keep-cache
+        "${DEVS}/llama_run.sh" --keep-cache "$@"
     fi
 }
 
@@ -68,6 +68,12 @@ for step in "${PROMPTS[@]}"; do
 
         echo "=== [restart] ==="
         run_server
+        echo ""
+    elif [ "${step}" = '[restart-no-kv]' ]; then
+        start_counter="$((start_counter + 1))"
+
+        echo "=== [restart-no-kv] ==="
+        run_server --no-kv-chain
         echo ""
     elif [[ "${step}" == \[cmd:* ]]; then
         # extract the script path: [cmd:path/to/script.sh]
