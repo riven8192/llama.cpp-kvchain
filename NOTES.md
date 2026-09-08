@@ -1,8 +1,29 @@
 # Hash-chain KV cache - current state
 
-Base: llama.cpp b10520, branch `hash-chain-kv`. Local hack, not upstream-grade
-(see `../docs/project-plan.md` for the design). The code is the source of truth
-for HOW things work; this file only holds what/where + test results + quirks.
+Base: llama.cpp **v0.4.0** (tag `v0.4.0`, 5266f24da), branch `hash-chain-kv`.
+Local hack, not upstream-grade (see `../docs/project-plan.md` for the design).
+The code is the source of truth for HOW things work; this file only holds
+what/where + test results + quirks.
+
+REBASE NOTE (v0.4.0): the branch was rebased onto v0.4.0 (~289 upstream
+commits) as a single squash-merge of our final state onto the tag (NOT a
+commit-by-commit rebase — the intermediates only conflicted on superseded
+code). Upstream design changes we had to absorb:
+  - `llama_kv_cache::state_read` was split into `state_read` (delegating) +
+    `state_read_sinfo`, and `state_read_meta` gained a `sinfo_in` param (the
+    qwen4exp mirror-cache feature). Our `pos_lo`/`pos_limit` window + `append`
+    flag were threaded through both new signatures.
+  - Two NEW cache classes appeared since our old base and needed the same
+    signature update: `llama_kv_cache_dsa_iswa` (DSA+SWA) and
+    `llama_memory_hybrid_idx` (the qwen4exp QSA indexer, which also calls
+    `state_read_sinfo`). Both are descoped archs (see project-plan) — we only
+    made them compile + thread the window, matching the iswa/hybrid pattern.
+  - **The one real bug from the rebase**: our `append` (LLAMA_STATE_SEQ_FLAGS_APPEND)
+    was dropped in the `state_read` wrapper (it hardcoded `append=false` when
+    delegating to `state_read_sinfo`), so every chunk after the first did
+    `seq_rm()` and wiped the earlier chunks' cells -> restored K/V empty ->
+    garbage output. Fixed by deriving `append` from `flags`. (See the comment
+    at the `state_read` override in src/llama-kv-cache.cpp.)
 Model: Qwen3.8-27B (16 full-attn layers + 48 Gated DeltaNet recurrent layers),
 selected via `LLAMA_HF_REF` (devops/env.sh, default
 `unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL`) — passed to llama-server as `-hf`, which
@@ -123,6 +144,14 @@ recorded here, because those are what a regression changes:
 Helper: `devops/llama_make_exact_prompt_len.sh <N>` converges a prompt to
 exactly N tokens (binary search over the passage length, needs a running
 server; prints the prompt between `[` and `]`).
+
+**Smoke test** (fast debugging, NOT in the runner): `devops/llama_unittest_smoketest.sh`
+sends a short "name 10 colors" prompt twice (prime + restore) and checks the two
+responses are identical. Model-capability independent (works on the 4B too), so
+it isolates the restore mechanics from the repeat-passage fidelity the 4B
+can't do. N.B.: its own PASS/FAIL uses `md5sum` of the WHOLE prompt-N.log, which
+includes the `cached_tokens` line (0 vs 352) -> it reports FAIL even when the
+responses match; judge it by the two one-liners it prints, not the exit code.
 
 **Qwen3-4B (pure full-attn, arch `qwen3`, no recurrent layers)**: the kv-chain
 mechanics work (restore loads, cached_tokens correct), but the passage-
