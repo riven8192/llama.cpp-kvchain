@@ -1,5 +1,15 @@
 # Hash-chain KV cache - current state
 
+NEXT SESSION (open thread): the 27B is fully deterministic (smoke_test all 4
+responses identical). The 4B diverges from the cold baseline after ~50 tokens on
+a LONG generation — but the no-kv-chain native repeat diverges just as much, so
+it's a 4B restored-prefix long-gen numerics issue, not a kv-chain bug. Short
+responses match byte-for-byte on the 4B. If it matters: figure out why a restored
+prefix (any kind) makes the 4B's long generation non-deterministic (suspects:
+flash-attn accumulation order, or the 4B's logits being marginally different
+once a long context is present). Low priority — the 27B (the target model) is
+clean. See the "Qwen3-4B" note in section 4 for the details.
+
 Base: llama.cpp **v0.4.0** (tag `v0.4.0`, 5266f24da), branch `hash-chain-kv`.
 Local hack, not upstream-grade (see `../docs/project-plan.md` for the design).
 The code is the source of truth for HOW things work; this file only holds
@@ -145,20 +155,31 @@ Helper: `devops/llama_make_exact_prompt_len.sh <N>` converges a prompt to
 exactly N tokens (binary search over the passage length, needs a running
 server; prints the prompt between `[` and `]`).
 
-**Smoke test** (fast debugging, NOT in the runner): `devops/llama_unittest_smoketest.sh`
-sends a short "name 10 colors" prompt twice (prime + restore) and checks the two
-responses are identical. Model-capability independent (works on the 4B too), so
-it isolates the restore mechanics from the repeat-passage fidelity the 4B
-can't do. N.B.: its own PASS/FAIL uses `md5sum` of the WHOLE prompt-N.log, which
-includes the `cached_tokens` line (0 vs 352) -> it reports FAIL even when the
-responses match; judge it by the two one-liners it prints, not the exit code.
+**Smoke test** (fast, IN the runner as `smoke_test`, runs first):
+`devops/llama_unittest_smoke_test.sh`. Runs one prompt (a long "repeat the
+passage" one, `-c 512`) FOUR ways and asserts all four responses are
+byte-identical (via `devops/llama_prompt_response_analysis.sh`, which strips the
+`cached_tokens` line and md5s the text):
+  - prompt 1,2 : kv-chain DISABLED (`[restart-no-kv]`) — cold prime + native
+                 in-memory prefix repeat (the baseline)
+  - prompt 3,4 : kv-chain ENABLED — cold prime (saves the chain) + restore
+This is the strongest oracle: it proves the kv-chain restore matches the
+non-kv-chain path, and (because prompts 1&2 are the no-kv baseline) it also
+exposes any non-determinism that is NOT kv-chain-specific. The `[restart-no-kv]`
+directive (llama_test.sh) restarts the server without `--kv-chain-dir`.
 
 **Qwen3-4B (pure full-attn, arch `qwen3`, no recurrent layers)**: the kv-chain
-mechanics work (restore loads, cached_tokens correct), but the passage-
-repetition test FAILS because the 4B doesn't follow the "repeat word for word"
-instruction reliably — it paraphrases/confirms instead. This is a model-
-capability issue, NOT a kv-chain bug. The arch fix (see quirks) is what makes
-the 4B not emit garbage; the test prompt is just too demanding for it.
+mechanics work (restore loads, cached_tokens correct), but the 4B is
+NON-DETERMINISTIC on a LONG generation when a prefix is restored — the token
+stream diverges from the cold baseline after ~50 tokens. Crucially, the
+no-kv-chain native repeat (prompt 2) diverges from the cold prime (prompt 1)
+JUST as much as the kv-chain restore (prompt 4) does from the no-kv prime
+(prompt 3) — so the divergence is a 4B long-gen/restored-prefix numerics issue,
+NOT a kv-chain bug (the 27B is fully deterministic: all 4 identical). Short
+responses (e.g. "name 10 colors") DO match byte-for-byte on the 4B, which is why
+the short-prompt check passes but a long-prompt one fails. The passage-
+repetition unittest FAILS on the 4B for the same reason (it paraphrases). The
+arch fix (see quirks) is what keeps the 4B from emitting outright garbage.
 
 Tests run with `--reasoning off --reasoning-budget 0` (llama_run.sh) and
 `temperature: 0` (llama_prompt.sh): reasoning models otherwise burn the whole
