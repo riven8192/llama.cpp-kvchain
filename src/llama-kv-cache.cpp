@@ -2135,7 +2135,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
-    state_read_sinfo(io, seq_id, flags, pos_lo, pos_limit, nullptr, nullptr, false);
+    // the kv-chain restore passes APPEND for chunks after the first (so earlier
+    // chunks' cells are not wiped). it is carried in the flags, not a separate arg.
+    const bool append = (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) != 0;
+    state_read_sinfo(io, seq_id, flags, pos_lo, pos_limit, nullptr, nullptr, append);
 }
 
 void llama_kv_cache::state_read_sinfo(
