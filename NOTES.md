@@ -86,6 +86,14 @@ chain (matters on a 128 GB box running an 110 GB model).
     ubatch grid on-stride; chunk files make them redundant anyway)
   - grid-safety startup guard: `-b`/`-ub` must have a power-of-2 ratio or the
     server exits(1)
+  - `--parallel > 1` grid exclusivity: `kv_chain_pick_chunk_slot()` runs as a
+    separate pre_decode phase (between the decode-token fill and the prompt
+    loop); on an empty batch it picks one slot with a full ubs chunk left to
+    prefill and makes it the SOLE provider of that batch, so its ubatches stay
+    on the ubs-grid (with n_stream > 1, split_equal would otherwise mix other
+    slots' tokens into its ubatches and desync the grid). the fill loop caps the
+    chosen slot at one ubs chunk and the rest of the prompt at the remaining
+    batch room.
 
 ## 2. Design in one paragraph
 
@@ -147,8 +155,16 @@ recorded here, because those are what a regression changes:
                         tokens[0, n-1) - the 256-token prompt's last token is
                         never restored)
 - `dsv4f`            : cached_tokens 0/352, 6/6 phrases. NOT part of the runner
-                       (different model, same port/cache dir - never run it
-                       concurrently with the Qwen tests)
+                        (different model, same port/cache dir - never run it
+                        concurrently with the Qwen tests)
+- `parallel_slot`    : `-np 2`, forced `id_slot`, prompt A killed mid-prefill,
+                        prompt B (longer, shares A's prefix) must restore a full
+                        chunk prefix and both reply 'OK'. NOT part of the runner
+                        (it kills a connection mid-flight). asserts: B's
+                        cached_tokens is a multiple of ubs, ON-GRID ubatch count
+                        == the number of complete chunks prefilled, and
+                        pos == cb_n_pos_last+1 for every pure (non-re-fired)
+                        ubatch line.
 - grid-safety guard  : `-b 96 -ub 32` -> FATAL + exit(1)
 
 Helper: `devops/llama_make_exact_prompt_len.sh <N>` converges a prompt to
@@ -237,16 +253,27 @@ Why TAIL_ONLY (and not PARTIAL_ONLY, and not FULL):
 
 ## 5. Quirks / gotchas
 
-- `--parallel > 1` is supported: `n_seq_max` (= `--parallel`) is baked into the
-  kv-chain ROOT HASH (kv-chain-store.cpp `compute_root_hash`,
-  `kv_chain_metadata`), so a chunk file written by a server with a different
-  --parallel is a CLEAN MISS (different chain names), not the old
-  `state_read: n_stream mismatch` fallback. Do NOT restructure the attn
-  `state_write`/`state_read` per-stream loop to make the blob stream-agnostic:
-  that loop is load-bearing and shared by all llama state-seq callers, and a
-  previous attempt at it serialized the whole recurrent ring (~16 GB files).
-  Cross-parallel REUSE of chunk files is deliberately unsupported (the .rscache
-  is one slot's R/S). tested by `llama_unittest_parallel.sh`.
+- `--parallel > 1` is supported. two separate concerns:
+  - identity: `n_seq_max` (= `--parallel`) is baked into the kv-chain ROOT HASH
+    (kv-chain-store.cpp `compute_root_hash`, `kv_chain_metadata`), so a chunk
+    file written by a server with a different --parallel is a CLEAN MISS
+    (different chain names), not the old `state_read: n_stream mismatch`
+    fallback. cross-parallel REUSE of chunk files is deliberately unsupported
+    (the .rscache is one slot's R/S). tested by `llama_unittest_parallel.sh`.
+  - grid: with n_stream > 1, `split_equal` mixes other slots' tokens into a
+    prefill slot's ubatches, which would desync the ubs-grid. `pre_decode`
+    therefore runs a pick phase (`kv_chain_pick_chunk_slot`): on an empty batch
+    it makes ONE slot with a full ubs chunk left the sole provider of that
+    batch (the prompt loop skips the others, the fill loop caps it at one ubs
+    chunk), so its chunk boundaries stay on-grid. a slot that cannot get an
+    empty batch (decode tokens / another tail are already in it) simply yields
+    the iteration and retries next round. the `remaining_after_restore` estimate
+    subtracts the expected restore for a STARTED slot (restore pending) but not
+    for a PROCESSING_PROMPT slot (already restored). tested by
+    `llama_unittest_parallel_slot.sh`. Do NOT restructure the attn
+    `state_write`/`state_read` per-stream loop to make the blob stream-agnostic:
+    that loop is load-bearing and shared by all llama state-seq callers, and a
+    previous attempt at it serialized the whole recurrent ring (~16 GB files).
 - The recurrent window filter (llama-memory-recurrent.cpp `state_write`) must
   CLOSE the open cell range on an out-of-window cell, not just `continue`:
   with --parallel > 1 the recurrent ring interleaves cells of multiple slots,

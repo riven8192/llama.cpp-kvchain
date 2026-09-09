@@ -3,6 +3,7 @@
 *.pid
 *.lock
 .kv-cache/
+parallel-slot-*.json
 
 # large prompt fixtures (pasted in for the ubatch-grid probe; not source)
 prompt_30k.txt

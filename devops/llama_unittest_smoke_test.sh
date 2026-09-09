@@ -4,7 +4,12 @@ DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${DEVS}/env.sh"
 
 PASSAGE=$(cat "${DEVS}/prompt_7sentences.txt")
-PROMPT="${PASSAGE} -- ignore the above text, please only reply with listing 10 colors"
+
+# trigger short response
+# PROMPT="${PASSAGE} -- ignore the above text, please only reply with listing 10 colors"
+
+# trigger long response
+PROMPT="please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
 
 echo "=== smoke-test (naming colors) ==="
 LLAMA_CTX=512 "${DEVS}/llama_test.sh" \

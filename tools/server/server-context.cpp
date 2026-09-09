@@ -107,6 +107,20 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+// verbose kv-chain debugging: human-readable slot state name (for the [slots]
+// trace lines). a switch (not an array) so a missed state is a compile error.
+static const char * kv_chain_state_name(slot_state s) {
+    switch (s) {
+        case SLOT_STATE_IDLE:              return "IDLE";
+        case SLOT_STATE_WAIT_OTHER:        return "WAIT_OTHER";
+        case SLOT_STATE_STARTED:           return "STARTED";
+        case SLOT_STATE_PROCESSING_PROMPT: return "PROC_PROMPT";
+        case SLOT_STATE_DONE_PROMPT:       return "DONE_PROMPT";
+        case SLOT_STATE_GENERATING:        return "GENERATING";
+    }
+    return "?";
+}
+
 struct server_slot; // forward declaration
 struct server_context_impl;
 
@@ -945,6 +959,12 @@ private:
     server_slot * kv_chain_prefill_slot = nullptr;
     kv_chain_ubatch_state kv_chain_cb_state;
 
+    // set by kv_chain_pick_chunk_slot() when this iteration's batch is EXCLUSIVE
+    // to one slot (a kv-chain chunk save is due, on an empty batch); cleared at
+    // the end of the iteration. while set, the prompt loop lets only this slot
+    // add tokens, so its ubatches stay on the ubs-grid.
+    server_slot * kv_chain_chunk_slot = nullptr;
+
     // called after each ubatch is committed; persists only at bs-aligned
     // boundaries, so chunk k holds the state of the prefix [0, (k+1)*bs)
     void kv_chain_save_prefill_ubatch(server_slot & slot, uint32_t n_pos_last) {
@@ -994,6 +1014,109 @@ private:
         kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
                        chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // parent: logging only
         slot.kv_chain_last_saved_pos = pos;
+    }
+
+    // kv-chain chunk exclusivity (a separate pre_decode phase, run BETWEEN the
+    // decode-token fill and the prompt loop): with --parallel > 1 the KV cache
+    // has n_stream = n_seq_max, so llama's split_equal MIXES other slots' tokens
+    // (decode tails, other prompts' heads) into the prefill slot's ubatches.
+    // that breaks the ubs-grid: a chunk's boundary no longer lands on a multiple
+    // of ubs, the save hook skips it, and the chunk file is never written (a
+    // missing chunk then caps the whole chain on the next restore).
+    //
+    // fix: when the batch is still EMPTY, pick ONE slot that has a full ubs
+    // chunk left to prefill, and let it be the SOLE provider of this batch
+    // (the prompt loop skips every other slot, and the decode tokens were
+    // already deferred). it then fills exactly ubs tokens, so its absolute pos
+    // advances by a whole chunk and the boundary is on-grid. if the batch is
+    // NOT empty (decode tokens / a tail are already in it), pick nothing: that
+    // slot's chunk is deferred to a later, empty-batch iteration. awaiting an
+    // empty batch is deliberate - it is what keeps [prompt_a_tail,
+    // prompt_b_head] from ever sharing a ubatch.
+    //
+    // remaining_after_restore() = (task.n_tokens - prompt.n_tokens) -
+    //   (hash_chain.size() * ubs). at pick time a STARTED slot has NOT yet run
+    // its inline restore (that happens in the prompt loop below), so
+    // prompt.n_tokens() is pre-restore and we subtract the chunks we expect to
+    // restore (hash_chain.size()*ubs). for a PROCESSING_PROMPT slot the restore
+    // already ran (prompt.n_tokens() is post-restore), so subtracting again
+    // under-counts - but that is safe: the estimate is a LOWER bound on the true
+    // remaining, so the only failure mode is "miss a chunk save" (the slot
+    // prefills its tail normally), never "claim a chunk that is not there"
+    // (which would desync the grid).
+    //
+    // returns the chosen slot, or nullptr for the normal mixed path. last match
+    // wins (arbitrary, but deterministic).
+    server_slot * kv_chain_pick_chunk_slot() {
+        if (!kv_chain) {
+            return nullptr;
+        }
+        // VERBOSE TRACE: dump every slot's state so we can follow the prefill
+        // over time without a debugger. pos_max = absolute KV pos of the last
+        // committed token (-1 = none); pos_before = where the next token lands;
+        // raw_left = task.n_tokens - prompt.n_tokens (pre-restore for STARTED);
+        // remaining = raw_left - (hash_chain*ubs), the pick's decision input.
+        {
+            const size_t ubs = (size_t) kv_chain->ubatch_size();
+            std::string desc;
+            for (auto & slot : slots) {
+                const int pos_max = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                const size_t raw_left = (slot.task && slot.task->n_tokens() > (int32_t) slot.prompt.n_tokens())
+                    ? (size_t) (slot.task->n_tokens() - (int32_t) slot.prompt.n_tokens()) : 0;
+                // mirror the pick: STARTED subtracts the expected restore, PROC_PROMPT does not
+                const size_t restored = (slot.state == SLOT_STATE_STARTED)
+                    ? slot.kv_chain_hashes.size() * ubs : 0;
+                const size_t remaining = raw_left > restored ? raw_left - restored : 0;
+                if (!desc.empty()) desc += " | ";
+                desc += string_format("s%d[%s pmax=%d posb=%zu rawL=%zu rest=%zu rem=%zu]",
+                        slot.id, kv_chain_state_name(slot.state), pos_max,
+                        (pos_max >= 0) ? (size_t) pos_max + 1 : 0, raw_left, restored, remaining);
+            }
+            SRV_INF("kv-chain[slots]: batch.size=%d  %s\n", batch.size(), desc.c_str());
+        }
+        // the batch must be empty so the chosen slot starts at batch-position 0
+        // (its absolute pos then advances by whole ubs chunks, on-grid).
+        if (batch.size() != 0) {
+            return nullptr;
+        }
+        const size_t ubs = (size_t) kv_chain->ubatch_size();
+        server_slot * chosen = nullptr;
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
+                continue;
+            }
+            if (slot.task == nullptr || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+                continue; // only completion tasks are armed with a hash chain
+            }
+            // tokens left to prefill, AFTER the on-disk prefix is restored.
+            //   STARTED           : restore has NOT run yet, prompt.n_tokens() is
+            //                       pre-restore -> subtract the chunks we expect to
+            //                       restore (hash_chain.size()*ubs, an upper bound).
+            //   PROCESSING_PROMPT : restore ALREADY ran, prompt.n_tokens() is
+            //                       post-restore -> subtract NOTHING (rest=0).
+            // subtracting the full chain for a PROC_PROMPT slot (the old bug)
+            // over-counted the restore when only part of the chain was on disk,
+            // clamped remaining to 0, and starved the slot of further chunk saves.
+            const size_t raw_left  = (slot.task->n_tokens() > (int32_t) slot.prompt.n_tokens())
+                ? (size_t) (slot.task->n_tokens() - (int32_t) slot.prompt.n_tokens())
+                : 0;
+            const size_t restored  = (slot.state == SLOT_STATE_STARTED)
+                ? slot.kv_chain_hashes.size() * ubs
+                : 0;
+            const size_t remaining = raw_left > restored ? raw_left - restored : 0;
+            if (remaining < ubs) {
+                SRV_INF("kv-chain[pick]: slot %d skip: remaining_after_restore=%zu < ubs=%zu (tail)\n",
+                        slot.id, remaining, ubs);
+                continue;
+            }
+            SRV_INF("kv-chain[pick]: slot %d eligible: remaining_after_restore=%zu >= ubs=%zu\n",
+                    slot.id, remaining, ubs);
+            chosen = &slot; // last match wins
+        }
+        if (chosen) {
+            SRV_INF("kv-chain[pick]: slot %d WINS chunk exclusivity (batch empty)\n", chosen->id);
+        }
+        return chosen;
     }
 
     server_metrics metrics;
@@ -3207,14 +3330,28 @@ private:
             }
         });
 
+        // process in chunks of params.n_batch
+        int32_t n_batch  = llama_n_batch(ctx_tgt);
+        int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // kv-chain chunk exclusivity, decided in its OWN phase (see
+        // kv_chain_pick_chunk_slot): if the batch is empty, one slot with a full
+        // ubs chunk left to prefill becomes the SOLE provider of this batch, so
+        // its ubatches stay on the ubs-grid. this must run AFTER the decode
+        // tokens are (or are not) added, because it only fires on an empty
+        // batch. while a slot is chosen, the prompt loop skips every other
+        // slot; the decode tokens were deferred so the batch is clean.
+        kv_chain_chunk_slot = nullptr;
+
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
-        int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        // kv-chain: pick the chunk-exclusive slot now that the decode tokens
+        // have been added (the batch is either empty or it is not - a chunk save
+        // is only possible on the empty case).
+        kv_chain_chunk_slot = kv_chain_pick_chunk_slot();
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3224,6 +3361,16 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
+                if (kv_chain_chunk_slot && &slot != kv_chain_chunk_slot) {
+                    // VERBOSE: a prefill/decode slot is being held out so the
+                    // chunk slot owns the batch. this is the "await empty batch"
+                    // policy in action - the held slot retries next iteration.
+                    if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_GENERATING) {
+                        SRV_INF("kv-chain[fill]: slot %d [%s] HELD OUT (chunk_slot=%d owns batch)\n",
+                                slot.id, kv_chain_state_name(slot.state), kv_chain_chunk_slot->id);
+                    }
+                    return; // this iteration's batch belongs to the chunk-save slot
+                }
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -3766,8 +3913,39 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
-                    // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // add prompt tokens for processing in the current batch.
+                    // the chunk-exclusive slot (picked by kv_chain_pick_chunk_slot
+                    // on an empty batch) adds exactly one full ubs chunk: it starts
+                    // at batch-position 0, so ubs tokens land the boundary on the
+                    // ubs-grid. adding more would push the next boundary off-grid;
+                    // adding fewer would leave a partial chunk that is never saved.
+                    // the rest prefills on subsequent iterations (the batch is empty
+                    // each round, so the slot is re-picked when a chunk is due).
+                    // how many tokens THIS slot may add to the batch this iteration:
+                    //   chunk-exclusive slot : exactly one full ubs chunk (it is the
+                    //                          sole provider, batch starts empty).
+                    //   any other slot       : the remaining room in the batch
+                    //                          (n_batch - batch.size()), so a slot
+                    //                          that starts filling after another slot
+                    //                          fills the batch adds ZERO and retries
+                    //                          next iteration. this is the v0.4.0
+                    //                          `batch.size() < n_batch` guard, which
+                    //                          the earlier `batch.size()-n_tokens_prev
+                    //                          < n_fill_limit` rewrite dropped - that
+                    //                          let a slot over-fill past the batch cap
+                    //                          (push_back ran after batch.add returned
+                    //                          false), advancing prompt.n_tokens() past
+                    //                          the tokens actually computed -> a KV hole
+                    //                          and a garbled response.
+                    size_t n_fill_limit = (size_t) n_batch - (size_t) batch.size(); // remaining batch room
+                    if (kv_chain_chunk_slot == &slot) {
+                        n_fill_limit = (size_t) kv_chain->ubatch_size(); // one full ubs chunk
+                        SRV_INF("kv-chain[fill]: slot %d chunk-exclusive, capping fill at %zu (one full ubs chunk)\n",
+                                slot.id, n_fill_limit);
+                    }
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           (size_t) batch.size() - (size_t) n_tokens_prev < n_fill_limit &&
+                           batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3888,6 +4066,34 @@ private:
                 }
             });
         }
+
+        if (kv_chain && batch.size() > 0) {
+            // VERBOSE TRACE: per-slot token count + pos range + is_prompt/output
+            // breakdown, so a mixed batch (two slots in one ubatch) is obvious.
+            // "P" = prompt tokens, "O" = output/logits tokens, "D" = decode.
+            struct agg { int n = 0; int n_prompt = 0; int n_out = 0; int pmin = INT32_MAX; int pmax = INT32_MIN; };
+            std::map<int32_t, agg> per_slot;
+            for (const auto & t : batch.tokens) {
+                auto & a = per_slot[t.id_slot];
+                a.n++;
+                if (t.is_prompt) a.n_prompt++;
+                if (t.output)    a.n_out++;
+                if (t.pos < a.pmin) a.pmin = t.pos;
+                if (t.pos > a.pmax) a.pmax = t.pos;
+            }
+            std::string desc;
+            for (const auto & [sid, a] : per_slot) {
+                if (!desc.empty()) desc += " ";
+                desc += string_format("s%d:%d(p%d/o%d,pos[%d..%d])", sid, a.n, a.n_prompt, a.n_out,
+                        a.n ? a.pmin : -1, a.n ? a.pmax : -1);
+            }
+            SRV_INF("kv-chain[batch]: size=%d chunk_slot=%s  %s\n",
+                    batch.size(),
+                    kv_chain_chunk_slot ? ("slot " + std::to_string(kv_chain_chunk_slot->id)).c_str() : "none",
+                    desc.c_str());
+        }
+
+        kv_chain_chunk_slot = nullptr; // the pick only lasts this iteration
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -4083,6 +4289,14 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // VERBOSE: prefill finished -> decode. log the absolute pos so we
+                // can see how far the prompt actually advanced (vs task.n_tokens).
+                if (kv_chain) {
+                    const int pmax = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    SRV_INF("kv-chain[lifecycle]: slot %d -> GENERATING (prefill done) pos_max=%d task_n=%d prompt_n=%d\n",
+                            slot.id, pmax, slot.task ? slot.task->n_tokens() : -1, slot.prompt.n_tokens());
+                }
 
                 // the prompt is fully committed; stop per-ubatch snapshots
                 if (kv_chain_prefill_slot == &slot) {
