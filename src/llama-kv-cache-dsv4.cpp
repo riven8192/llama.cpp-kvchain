@@ -22,8 +22,12 @@ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
-// compressed K rows + rings, no kv_raw. dsv4 never emits this on its own; it is
-// the TAIL_ONLY mode (the per-chunk files already hold kv_raw).
+// rings only, no kv_raw, no compressed K caches. dsv4 never emits this on its
+// own; it is the TAIL_ONLY mode. the comp K caches are NOT in the tail: they
+// grow with the context (prefix-style, n_rows = pos/ratio), which made every
+// .rscache file ~context-sized. the remainder prefill rebuilds all comp rows
+// for tokens >= n_saved (dsv4_build_comp_plan emits a state write for every
+// (pos+1)%ratio==0 token it runs), so the tail only needs the fixed-size rings.
 static constexpr uint32_t DSV4_STATE_MODE_TAIL     = 2;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
@@ -1599,16 +1603,19 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     // ATTN_ONLY: only the per-token KV (kv_raw) - never the rings or the
     // compressed K caches (both are the "tail object", stored separately).
     const bool attn_only    = flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY;
-    // TAIL_ONLY: the compressed K caches + the rings, WITHOUT kv_raw (a FULL-
-    // mode read clears kv_raw first, which would wipe the restored per-token
-    // rows; and the tail prefill does not recompute the compressed caches).
+    // TAIL_ONLY: the rings only, WITHOUT kv_raw or the compressed K caches.
+    // a FULL-mode read clears kv_raw first (it would wipe the restored
+    // per-token rows), and the comp caches are prefix-style: their row count
+    // grows with the context, so storing them made every tail file
+    // ~context-sized. the remainder prefill rebuilds all comp rows for
+    // tokens >= n_saved, so the fixed-size rings are all the tail needs.
     const bool tail_only    = flags & LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY;
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
     // FULL    = kv_raw + compressed + rings
     // PARTIAL = kv_raw only                   (the in-memory checkpoint shape)
-    // TAIL    = compressed + rings            (no kv_raw)
+    // TAIL    = rings only                    (no kv_raw, no compressed)
     const uint32_t mode    = (partial_only || attn_only) ? DSV4_STATE_MODE_PARTIAL
                                  : tail_only             ? DSV4_STATE_MODE_TAIL
                                                          : DSV4_STATE_MODE_FULL;
@@ -1623,8 +1630,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
 
     // the compressed K caches are prefix-style (not windowable): fully present
-    // or absent, written in FULL and TAIL_ONLY modes
-    if (!partial_only && !attn_only) {
+    // or absent. written ONLY in FULL mode - TAIL_ONLY must stay rings-only
+    // (constant size): the comp row count scales with the context length.
+    if (!partial_only && !attn_only && !tail_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
@@ -1671,12 +1679,13 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
 
     // verify the caller's flags match what the blob actually contains, and
     // throw on disagreement: a mismatch would silently mis-parse (e.g. reading
-    // compressed rows as kv_raw rows) and garble the output.
+    // compressed rows as kv_raw rows) and garble the output. the comp K caches
+    // are in FULL blobs only (TAIL = rings only, see state_write).
     const bool blob_has_raw  = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_PARTIAL);
-    const bool blob_has_comp = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_TAIL);
+    const bool blob_has_comp = (mode == DSV4_STATE_MODE_FULL);
     const bool blob_has_rings = (mode != DSV4_STATE_MODE_PARTIAL);
     const bool flags_want_raw  = (flags & (LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
-    const bool flags_want_comp = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) == 0;
+    const bool flags_want_comp = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
     const bool flags_want_rings = (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY) == 0;
     if (blob_has_raw != flags_want_raw || blob_has_comp != flags_want_comp || blob_has_rings != flags_want_rings) {
         throw std::runtime_error("DSV4 state flags mismatch");
