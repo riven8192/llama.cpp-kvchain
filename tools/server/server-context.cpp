@@ -3691,11 +3691,15 @@ private:
                             // asserts !has_mtmd
                             const llama_tokens text_tokens = input_tokens.get_text_tokens();
                             const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
+                            SLT_INF(slot, "kv-chain[restore]: load_prefix -> %zu chunks, n_saved=%zu (input_n=%zu)\n",
+                                    chunks.size(), n_saved, input_tokens.size());
                             if (!chunks.empty() && n_saved > 0) {
                                 // wipe all existing state first: in the no-restart case
                                 // this resets the previous prompt+response (per-token KV
                                 // cells and recurrent state) to a fresh-context state.
                                 slot.mem.seq_rm(slot.id, 0, -1);
+                                SLT_INF(slot, "kv-chain[restore]: seq_rm(0,-1) done, replaying %zu .kvcache chunks (ubs=%zu)\n",
+                                        chunks.size(), (size_t) kv_chain->ubatch_size());
                                  // replay the chunks one file at a time (peak RAM = one
                                  // file). each .kvcache holds the ATTN_ONLY rows of its
                                  // window [k*ubs,(k+1)*ubs): chunk 0 wipes, the rest append.
@@ -3721,6 +3725,9 @@ private:
                                     const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
                                             attn_blob.data(), attn_blob.size(), slot.id,
                                             attn_flags, pos_lo, pos_hi);
+                                    SLT_INF(slot, "kv-chain[restore]: chunk %zu set_data(ATTN_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                            k, (k == 0) ? "" : "|APPEND", (int) pos_lo, (int) pos_hi,
+                                            attn_blob.size(), n_attn);
                                     attn_blob.clear();
                                     attn_blob.shrink_to_fit();
                                     // 0 = failure
@@ -3753,6 +3760,8 @@ private:
                                             const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
                                                     tail_recr.data(), tail_recr.size(), slot.id,
                                                     LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
+                                            SLT_INF(slot, "kv-chain[restore]: tail set_data(TAIL_ONLY) blob=%zu -> %zu bytes (this is the dsv4 rings-only / qwen recr blob)\n",
+                                                    tail_recr.size(), n_recr);
                                             tail_recr.clear();
                                             tail_recr.shrink_to_fit();
                                             if (n_recr == 0) {

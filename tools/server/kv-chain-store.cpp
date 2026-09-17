@@ -241,11 +241,13 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
 // TAIL_ONLY, not FULL (flags=0): on a DSV4 cache a FULL-mode blob starts with
 // kv_raw and its state_read clears kv_raw first, which would wipe the
 // per-token rows restored from the .kvcache files (loaded after this). on DSV4
-// TAIL_ONLY is the compressor RING states only (fixed-size); the compressed K
-// caches are NOT in it - they grow with the context (prefix-style,
-// n_rows = pos/ratio) and would make every .rscache file ~context-sized. the
-// remainder prefill rebuilds all comp rows for tokens >= n_saved, so the
-// rings are all the tail needs (see llama-kv-cache-dsv4.cpp DSV4_STATE_MODE_TAIL).
+// TAIL_ONLY is the compressed K caches + the compressor RING states (no kv_raw).
+// the comp caches MUST be in the tail: the attention over a restored prefix
+// attends over the prefix's completed comp rows, and the remainder prefill only
+// rebuilds comp rows for tokens >= n_saved - a rings-only tail leaves them
+// empty -> garbage. cost: the comp section is prefix-style, so .rscache files
+// grow with the context (disk bloat, not a bug). see llama-kv-cache-dsv4.cpp
+// DSV4_STATE_MODE_TAIL.
 static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) {
     const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
     if (size == 0) {

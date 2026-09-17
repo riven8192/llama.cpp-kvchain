@@ -31,7 +31,7 @@ set -euo pipefail
 DEVS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # pick the DSV4F model (export so env.sh's `: "${LLAMA_HF_REF:=...}"` keeps it)
-export LLAMA_HF_REF="unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_XXS"
+export LLAMA_HF_REF="unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_S"
 
 . "${DEVS}/env.sh"
 

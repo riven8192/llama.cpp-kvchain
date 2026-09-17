@@ -208,11 +208,32 @@ The disk hash-chain cache supports DeepSeek-V4-Flash (arch `deepseek4`,
 `llama_kv_cache_dsv4`). Qwen paths stay green (run `llama_run_unittests.sh` on
 the 27B after every change). the `dsv4f` test covers DSV4F restore fidelity.
 
-**STATUS: the rings-only tail is NOT yet tested on DSV4F.** the change below
-(rings-only .rscache) was verified against the Qwen suite only (all 8 PASS);
-the DSV4F model cannot run concurrently with Qwen on this box, so
-`llama_unittest_dsv4f.sh` must be run manually after deploying the build. the
-version numbers were deliberately NOT bumped yet (bump once, at the end).
+**STATUS: rings-only tail was WRONG and is reverted.** TAIL_ONLY is back to
+comp K caches + rings (the known-correct version). A rings-only .rscache was
+tested on DSV4F and produced repetitive/garbage output. Root cause (proven
+with diagnostic logging, see below): the attention over a RESTORED prefix
+attends over the prefix's completed comp rows (n_visible ~ pos/ratio), and the
+remainder prefill only rebuilds comp rows for tokens >= n_saved - so a
+rings-only tail leaves the prefix comp rows EMPTY -> the attention over the
+restored prefix sees zeros -> the repetition collapses into a loop. The rings
+only hold the 8-token overlap window, NOT the 88 completed CSA comp rows. The
+comp caches therefore MUST be in the tail .rscache. The disk bloat (.rscache
+~context-sized, e.g. ~500 MiB each at 70K tokens) is the real open problem -
+it is a disk-space issue, not a correctness one, and is LRU-bounded by
+--kv-chain-limit-gb. Fixing it WITHOUT breaking restore is a separate, harder
+task (options: only the tail file carries comp + intermediates rings-only with
+a restore that tolerates a comp-less intermediate; or dedupe comp rows across
+the chain). NOT attempted yet. version numbers deliberately NOT bumped yet
+(bump once, at the end).
+
+**diagnostics (kept, in src/llama-kv-cache-dsv4.cpp + server-context.cpp):**
+`dsv4[compplan]` (per ubatch per compressor: window resolution, read_annot
+tagging each gather RING/SCRATCH/ZERO), `dsv4[state_write]`/`dsv4[state_read]`
+(mode + comp row counts), `kv-chain[restore]` (SLT_INF in server-context.cpp:
+load_prefix, seq_rm, per-chunk + tail set_data). NOTE: these use LLAMA_LOG_WARN
+(not LLAMA_LOG_INFO) because LLAMA_LOG_INFO maps to verbosity TRACE=4 which is
+above the default -lv 3 threshold and gets dropped; LLAMA_LOG_WARN (verbosity
+2) passes.
 
 ### How DSV4F differs from Qwen
 
@@ -230,52 +251,45 @@ DSV4F is NOT that shape. `llama_kv_cache_dsv4` owns FIVE groups
   - ATTN_ONLY (16): per-token KV part only. on dsv4 = kv_raw (NOT the rings,
     NOT the compressed caches). on the hybrid / pure-attn caches == FULL_ONLY.
     used for the per-chunk .kvcache file.
-  - TAIL_ONLY (32): everything EXCEPT the per-token KV, EXCEPT the compressed
-    K caches. on dsv4 = the three compressor RING states only (NOT kv_raw,
-    NOT the compressed caches). on the hybrid / pure-attn caches ==
-    PARTIAL_ONLY. used for the .rscache tail file.
+  - TAIL_ONLY (32): everything EXCEPT the per-token KV. on dsv4 = the three
+    compressed K caches + the three compressor RING states (NOT kv_raw). on
+    the hybrid / pure-attn caches == PARTIAL_ONLY. used for the .rscache tail
+    file.
 
-Why TAIL_ONLY is rings-only (and not PARTIAL_ONLY, and not FULL):
+Why TAIL_ONLY includes the comp caches (and is not PARTIAL_ONLY, and not FULL):
   - FULL (flags=0) writes kv_raw FIRST, and its state_read CLEARS kv_raw before
     loading it. the .rscache is loaded AFTER the per-chunk .kvcache replay, so a
     FULL blob would WIPE the just-restored per-token rows -> garbled output.
-  - the compressed K caches were originally bundled into TAIL_ONLY (the tail
-    prefill does not recompute the comp rows for tokens < n_saved). BUG: they
-    are prefix-style, so their row count = pos/ratio GROWS WITH THE CONTEXT -
-    every .rscache (including the tail) was ~context-sized (~500 MiB each at
-    70K tokens) instead of fixed-size. inference was unaffected (the tail file
-    always held the complete, correct comp prefix), so it was pure disk waste.
-  - FIX: TAIL_ONLY = rings only (constant size). this relies on the remainder
-    prefill (tokens >= n_saved) REBUILDING all comp rows it processes:
-    dsv4_build_comp_plan emits a state write at cache_off + pos/ratio for every
-    (pos+1)%ratio==0 token in a ubatch, and the restore always leaves a
-    non-empty remainder (load_prefix searches tokens[0, n-1)). the ring
-    snapshot at the tail boundary + the rebuilt comp rows = the full state.
-    NOTE: the rings carry the compressor's running state (overlap windows /
-    partial-block accumulators); a rings-only tail restores those, and the
-    comp rows for the remainder come from the prefill - whether that is fully
-    equivalent to a cold prefill is exactly what the dsv4f test must confirm.
+  - the comp caches MUST be in the tail (this is why TAIL != PARTIAL_ONLY):
+    the attention over a restored prefix attends over the prefix's completed
+    comp rows (n_visible ~ pos/ratio), and the remainder prefill only rebuilds
+    comp rows for tokens >= n_saved. a PARTIAL_ONLY (or rings-only) tail leaves
+    the prefix comp rows empty -> the attention over the restored prefix sees
+    zeros -> garbage. verified empirically: a rings-only tail produced a
+    repetitive loop on the dsv4f test.
   - the read side verifies the on-disk mode byte matches the requested
     part-selection (FULL/PARTIAL/ATTN/TAIL) and THROWS on mismatch, so a
     format/flag error is loud, not silent garbage.
-  - SIDE NOTE (pre-existing, not introduced by this change): the comp-K read
-    validates n_rows <= kv_size (the cache's TOTAL capacity, = n_ctx/ratio),
-    not against the prompt length. with the old comp-in-TAIL files, a tail
-    written at a long context would throw (and discard the whole restore) on a
-    server configured with a smaller n_ctx. rings-only files have no such
-    context-dependent section.
+  - the comp section is prefix-style (n_rows = pos/ratio), so .rscache files
+    grow with the context (~500 MiB each at 70K tokens). disk bloat, LRU-bounded.
+  - SIDE NOTE (pre-existing): the comp-K read validates n_rows <= kv_size (the
+    cache's TOTAL capacity, = n_ctx/ratio), not against the prompt length. a
+    tail written at a long context would throw (discard the restore) on a
+    server configured with a smaller n_ctx.
 
 ### On-disk layout for DSV4F
 
    - <hash>.kvcache per chunk = ATTN_ONLY blob = kv_raw window [k*ubs,(k+1)*ubs),
      additive, APPEND on restore (chunk 0 wipes). [exactly what Qwen uses]
-   - <hash>.rscache per boundary = TAIL_ONLY blob = RINGS ONLY (fixed-size).
-     Last write wins; the restore loads ONLY the last chunk's copy.
+   - <hash>.rscache per boundary = TAIL_ONLY blob = comp K caches + rings
+     (NO kv_raw). Last write wins; the restore loads ONLY the last chunk's copy.
+     ~context-sized (the comp section is prefix-style).
    - Restore: append all matched .kvcache chunks, then set_data_ext(TAIL_ONLY)
-     the last .rscache, set n_past, and prefill the remainder (which rebuilds
-     the compressed K rows for tokens >= n_saved). The remainder is never
-     empty: load_prefix searches tokens[0, n-1) (the last token is always
-     re-prefilled, since a forward pass is required to produce logits).
+     the last .rscache (restores the comp caches + rings), set n_past, and
+     prefill the remainder (which rebuilds the comp rows for tokens >= n_saved
+     and overwrites the now-stale tail-of-ring). The remainder is never empty:
+     load_prefix searches tokens[0, n-1) (the last token is always re-prefilled,
+     since a forward pass is required to produce logits).
 
 ## 5. Quirks / gotchas
 
