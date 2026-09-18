@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_model_arch_name (kv-chain dsv4 ubatch guard)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1597,6 +1598,22 @@ private:
                 std::exit(1);
             }
             SRV_INF("kv-chain: grid-safe: -b %d / -ub %d = %d (power of 2)\n", n_b, n_ub, ratio);
+            // dsv4 (deepseek4) extra guard: its largest compressor ring is
+            // state_size 128 (hca), and the per-chunk comp window maps to
+            // [pos_lo/128, pos_limit/128) rows - a non-multiple-of-128 ubatch
+            // would make the comp window bounds non-integral / misaligned. the
+            // arch is known here (model_tgt is loaded), so hard-fail on a
+            // mis-config rather than save/restore a broken chain.
+            if (model_tgt != nullptr &&
+                std::string(llama_model_arch_name(model_tgt)) == "deepseek4" &&
+                (n_ub % 128) != 0) {
+                common_log_flush(common_log_main());
+                std::fprintf(stderr, "kv-chain: FATAL: dsv4 (deepseek4) requires -ub to be a "
+                        "multiple of 128 (the largest compressor ring state_size), got -ub %d. "
+                        "use e.g. -ub 128 / -b 128. exiting.\n", n_ub);
+                std::fflush(stderr);
+                std::exit(1);
+            }
             const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
                 ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
                 : 0;
@@ -3738,8 +3755,41 @@ private:
                                     }
                                     n_replayed++;
                                 }
+                                // replay the .cmcache chunks (dsv4 only): each holds the
+                                // COMP_ONLY comp rows of its window, additive across chunks
+                                // like the attn rows (chunk 0 clears the comp caches, the
+                                // rest APPEND). this rebuilds the prefix's completed comp
+                                // rows that the attention over the restored prefix needs.
+                                if (ok && kv_chain->has_comp()) {
+                                    for (size_t k = 0; k < chunks.size() && ok; ++k) {
+                                        const llama_pos pos_lo = (llama_pos) (k * ubs);
+                                        const llama_pos pos_hi = (llama_pos) ((k + 1) * ubs);
+                                        std::vector<uint8_t> cm_blob;
+                                        if (!kv_chain->read_chunk_file(chunks[k].cm_file, cm_blob, chunks[k].tokens)) {
+                                            SLT_WRN(slot, "kv-chain[storage]: cm read failed/mismatch at chunk %zu, discarding restore\n", k);
+                                            ok = false;
+                                            break;
+                                        }
+                                        const llama_state_seq_flags cm_flags =
+                                                (k == 0) ? LLAMA_STATE_SEQ_FLAGS_COMP_ONLY
+                                                         : (LLAMA_STATE_SEQ_FLAGS_COMP_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
+                                        const size_t n_cm = llama_state_seq_set_data_window_ext(ctx_tgt,
+                                                cm_blob.data(), cm_blob.size(), slot.id,
+                                                cm_flags, pos_lo, pos_hi);
+                                        SLT_INF(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                                k, (k == 0) ? "" : "|APPEND", (int) pos_lo, (int) pos_hi,
+                                                cm_blob.size(), n_cm);
+                                        cm_blob.clear();
+                                        cm_blob.shrink_to_fit();
+                                        if (n_cm == 0) {
+                                            SLT_WRN(slot, "kv-chain[storage]: comp restore failed at chunk %zu\n", k);
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
                                 if (!ok) {
-                                    // the attn rows loaded so far would be orphaned (the
+                                    // the rows loaded so far would be orphaned (the
                                     // recurrent tail is only loaded after the loop), so
                                     // wipe and fall back to a 100% prefill.
                                     slot.mem.seq_rm(slot.id, 0, -1);

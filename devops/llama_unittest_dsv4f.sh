@@ -36,7 +36,8 @@ export LLAMA_HF_REF="unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_S"
 . "${DEVS}/env.sh"
 
 # --- the distinctive passage (same as llama_unittest_restore_restart.sh) ---
-PASSAGE=$( cat "${DEVS}/prompt_7sentences.txt" )
+FILLER2="$( cat "${DEVS}/prompt_30k.txt" | tail -n 50 )"
+PASSAGE="$( cat "${DEVS}/prompt_7sentences.txt" )"
 
 # distinctive phrases spread across the passage
 CHECKS=(
@@ -52,7 +53,8 @@ echo "model: ${LLAMA_HF_REF}"
 echo "passage word count: $(echo ${PASSAGE} | wc -w)"
 echo "checking ${#CHECKS[@]} distinctive phrases"
 
-PROMPT="please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
+PROMPT="${FILLER2} ---- ignore everything prior to this split ---- please repeat this entire passage exactly, word for word, with no additions or omissions: '${PASSAGE}'"
+
 
 echo ""
 echo "=== prompt (first 200 chars) ==="
@@ -67,7 +69,7 @@ echo ""
 # NOTE: llama_test.sh flushes the cache dir AFTER the first server start, so a
 # bare 2-prompt run would prime the cache and then wipe it - the [restart] is
 # what makes the restore actually happen.
-"${DEVS}/llama_test.sh" "${PROMPT}" "[restart]" "${PROMPT}" -- -ub 32 -b 32
+"${DEVS}/llama_test.sh" "${PROMPT}" "${PROMPT}" -- -ub 128 -b 128
 
 echo ""
 echo "=== analysis ==="

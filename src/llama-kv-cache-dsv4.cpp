@@ -12,25 +12,32 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
-#include <sstream>
 #include <stdexcept>
 
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+// v2: the TAIL blob lost its comp K caches (they moved to the per-chunk
+// COMP_ONLY blobs), and MODE_COMP was added. old (comp-carrying) tail blobs
+// would mis-parse, so the version must change.
+static constexpr uint32_t DSV4_STATE_VERSION       = 2;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
-// comp K caches + rings, no kv_raw. dsv4 never emits this on its own; it is
-// the TAIL_ONLY mode. the comp K caches ARE in the tail (and MUST be): the
-// attention over a restored prefix attends over the prefix's completed comp
-// rows, and the remainder prefill only rebuilds comp rows for tokens >= n_saved
-// - a rings-only tail leaves the prefix comp rows empty -> garbage output.
-// cost: the comp section is prefix-style (n_rows = pos/ratio), so .rscache
-// files grow with the context (~context-sized). disk bloat, not a bug.
+// rings only, no kv_raw, no comp. it is the TAIL_ONLY mode. the comp K caches
+// are NOT in the tail anymore: they are prefix-style (row i covers tokens
+// [i*ratio, (i+1)*ratio)) and ADDITIVE across chunks, so they are stored as
+// per-chunk COMP_ONLY blobs (DSV4_STATE_MODE_COMP) and replayed with APPEND -
+// the same trick as the per-token rows. (an earlier rings-only tail was wrong
+// only because the comp rows were nowhere; with the COMP_ONLY blobs they are
+// restored chunk by chunk.)
 static constexpr uint32_t DSV4_STATE_MODE_TAIL     = 2;
-static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
+// comp K caches only (csa/hca/lid), no kv_raw, no rings. it is the COMP_ONLY
+// mode: a per-chunk blob holding exactly the window's comp rows.
+static constexpr uint32_t DSV4_STATE_MODE_COMP     = 3;
+// v3: the k-cache section header gains row_lo (the windowed COMP blobs store
+// rows [row_lo, row_lo+n_rows) at an offset, not from 0).
+static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 3;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
@@ -337,6 +344,94 @@ static void dsv4_state_read_tensor_streams(
     }
 }
 
+// like dsv4_state_write_tensor_streams, but copies the rows [row_lo, row_lo+n_rows)
+// (not [0, n_rows)): the windowed COMP_ONLY k-cache blobs.
+static void dsv4_state_write_tensor_streams_window(
+        llama_io_write_i & io,
+        ggml_tensor      * tensor,
+        uint32_t           tensor_rows,
+        uint32_t           row_lo,
+        uint32_t           n_rows,
+        uint32_t           s0,
+        uint32_t           ns,
+        const std::vector<uint32_t> * stream_ids = nullptr) {
+    const int32_t  type_i   = (int32_t) tensor->type;
+    const uint64_t ne0      = tensor->ne[0];
+    const uint64_t rows     = n_rows;
+    const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+
+    if ((uint64_t) row_lo + n_rows > tensor_rows) {
+        throw std::runtime_error("DSV4 state tensor window exceeds storage");
+    }
+
+    io.write(&type_i,   sizeof(type_i));
+    io.write(&ne0,      sizeof(ne0));
+    io.write(&rows,     sizeof(rows));
+    io.write(&row_size, sizeof(row_size));
+
+    const size_t stream_stride = (size_t) tensor_rows*row_size;
+    const size_t size          = (size_t) n_rows*row_size;
+    if (size == 0) {
+        return;
+    }
+
+    if (stream_ids && stream_ids->size() != ns) {
+        throw std::runtime_error("DSV4 state tensor stream map size mismatch");
+    }
+
+    for (uint32_t s = 0; s < ns; ++s) {
+        const uint32_t stream = stream_ids ? (*stream_ids)[s] : s0 + s;
+        if ((int64_t) stream >= tensor->ne[2]) {
+            throw std::runtime_error("DSV4 state tensor stream out of range");
+        }
+        const size_t offset = (size_t) stream*stream_stride + (size_t) row_lo*row_size;
+        io.write_tensor(tensor, offset, size);
+    }
+}
+
+// like dsv4_state_read_tensor_streams, but copies the rows into
+// [row_lo, row_lo+n_rows) (not [0, n_rows)): the windowed COMP_ONLY k-cache blobs.
+static void dsv4_state_read_tensor_streams_window(
+        llama_io_read_i & io,
+        ggml_tensor     * tensor,
+        uint32_t          tensor_rows,
+        uint32_t          row_lo,
+        uint32_t          n_rows,
+        uint32_t          s0,
+        uint32_t          ns) {
+    int32_t  type_i_ref;
+    uint64_t ne0_ref;
+    uint64_t rows_ref;
+    uint64_t row_size_ref;
+
+    io.read(&type_i_ref,   sizeof(type_i_ref));
+    io.read(&ne0_ref,      sizeof(ne0_ref));
+    io.read(&rows_ref,     sizeof(rows_ref));
+    io.read(&row_size_ref, sizeof(row_size_ref));
+
+    const int32_t  type_i   = (int32_t) tensor->type;
+    const uint64_t ne0      = tensor->ne[0];
+    const uint64_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+
+    if (type_i != type_i_ref || ne0 != ne0_ref || n_rows != rows_ref || row_size != row_size_ref) {
+        throw std::runtime_error("DSV4 state tensor metadata mismatch");
+    }
+    if ((uint64_t) row_lo + n_rows > tensor_rows) {
+        throw std::runtime_error("DSV4 state tensor window exceeds storage");
+    }
+
+    const size_t stream_stride = (size_t) tensor_rows*row_size;
+    const size_t size          = (size_t) n_rows*row_size;
+    if (size == 0) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < ns; ++s) {
+        const size_t offset = (size_t) (s0 + s)*stream_stride + (size_t) row_lo*row_size;
+        io.read_tensor(tensor, offset, size);
+    }
+}
+
 static void dsv4_state_write_k_cache(
         llama_io_write_i    & io,
         const llama_kv_cache * kv,
@@ -358,7 +453,9 @@ static void dsv4_state_write_k_cache(
         throw std::runtime_error("DSV4 K-cache state row count exceeds cache size");
     }
 
+    const uint32_t row_lo = 0; // the FULL/TAIL blobs always store rows from 0
     io.write(&version, sizeof(version));
+    io.write(&row_lo,  sizeof(row_lo));
     io.write(&n_rows,  sizeof(n_rows));
     io.write(&ns,      sizeof(ns));
     io.write(&n_layer, sizeof(n_layer));
@@ -366,6 +463,42 @@ static void dsv4_state_write_k_cache(
     for (uint32_t il : layer_ids) {
         io.write(&il, sizeof(il));
         dsv4_state_write_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows, s0, ns);
+    }
+}
+
+// like dsv4_state_write_k_cache, but stores exactly the window's rows
+// [row_lo, row_lo+n_rows): the COMP_ONLY blobs (per-chunk comp deltas).
+static void dsv4_state_write_k_cache_window(
+        llama_io_write_i    & io,
+        const llama_kv_cache * kv,
+        llama_seq_id          seq_id,
+        llama_state_seq_flags flags,
+        uint32_t              row_lo,
+        uint32_t              n_rows) {
+    GGML_UNUSED(flags);
+
+    uint32_t s0;
+    uint32_t ns;
+    dsv4_state_src_stream_range(kv->get_n_stream(), seq_id, s0, ns);
+
+    const uint32_t version = DSV4_K_CACHE_STATE_VER;
+    const uint32_t kv_size = kv->get_size();
+    const auto layer_ids = kv->get_layer_ids();
+    const uint32_t n_layer = layer_ids.size();
+
+    if ((uint64_t) row_lo + n_rows > kv_size) {
+        throw std::runtime_error("DSV4 K-cache state window exceeds cache size");
+    }
+
+    io.write(&version, sizeof(version));
+    io.write(&row_lo,  sizeof(row_lo));
+    io.write(&n_rows,  sizeof(n_rows));
+    io.write(&ns,      sizeof(ns));
+    io.write(&n_layer, sizeof(n_layer));
+
+    for (uint32_t il : layer_ids) {
+        io.write(&il, sizeof(il));
+        dsv4_state_write_tensor_streams_window(io, kv->get_k_storage(il), kv_size, row_lo, n_rows, s0, ns);
     }
 }
 
@@ -377,11 +510,15 @@ static void dsv4_state_read_k_cache(
     GGML_UNUSED(flags);
 
     uint32_t version;
+    uint32_t row_lo_ref = 0; // v3 header field; v1/v2 blobs have no row_lo (they start at 0)
     uint32_t n_rows_ref;
     uint32_t ns;
     uint32_t n_layer_ref;
 
-    io.read(&version,     sizeof(version));
+    io.read(&version, sizeof(version));
+    if (version != 1) {
+        io.read(&row_lo_ref, sizeof(row_lo_ref));
+    }
     io.read(&n_rows_ref,  sizeof(n_rows_ref));
     io.read(&ns,          sizeof(ns));
     io.read(&n_layer_ref, sizeof(n_layer_ref));
@@ -395,7 +532,7 @@ static void dsv4_state_read_k_cache(
         LLAMA_LOG_INFO("kv size ref %d kv %d\n", n_rows_ref, kv_size);
         throw std::runtime_error("DSV4 K-cache state size mismatch");
     }
-    if (n_rows_ref > kv_size) {
+    if ((uint64_t) row_lo_ref + n_rows_ref > kv_size) {
         LLAMA_LOG_INFO("kv rows ref %d kv %d\n", n_rows_ref, kv_size);
         throw std::runtime_error("DSV4 K-cache state size mismatch");
     }
@@ -419,19 +556,57 @@ static void dsv4_state_read_k_cache(
     }
 }
 
-static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
-    std::ostringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i > 0) {
-            ss << ", ";
-        }
-        ss << values[i];
-    }
-    ss << "]";
-    return ss.str();
-}
+// like dsv4_state_read_k_cache, but copies the window's rows into
+// [row_lo_ref, row_lo_ref+n_rows_ref) (the COMP_ONLY blobs; row_lo_ref comes
+// from the v3 header, so an APPEND replay lands the rows at the right offset).
+static void dsv4_state_read_k_cache_window(
+        llama_io_read_i  & io,
+        llama_kv_cache   * kv,
+        llama_seq_id       seq_id,
+        llama_state_seq_flags flags) {
+    GGML_UNUSED(flags);
 
+    uint32_t version;
+    uint32_t row_lo_ref = 0;
+    uint32_t n_rows_ref;
+    uint32_t ns;
+    uint32_t n_layer_ref;
+
+    io.read(&version, sizeof(version));
+    if (version != 1) {
+        io.read(&row_lo_ref, sizeof(row_lo_ref));
+    }
+    io.read(&n_rows_ref,  sizeof(n_rows_ref));
+    io.read(&ns,          sizeof(ns));
+    io.read(&n_layer_ref, sizeof(n_layer_ref));
+
+    if (version != DSV4_K_CACHE_STATE_VER) {
+        throw std::runtime_error("DSV4 K-cache state version mismatch");
+    }
+
+    const uint32_t kv_size = kv->get_size();
+    if ((uint64_t) row_lo_ref + n_rows_ref > kv_size) {
+        throw std::runtime_error("DSV4 K-cache state window exceeds cache size");
+    }
+
+    uint32_t s0;
+    dsv4_state_dst_stream_range(kv->get_n_stream(), seq_id, ns, s0);
+
+    const auto layer_ids = kv->get_layer_ids();
+    if (n_layer_ref != layer_ids.size()) {
+        throw std::runtime_error("DSV4 K-cache layer count mismatch");
+    }
+
+    for (uint32_t il : layer_ids) {
+        uint32_t il_ref;
+        io.read(&il_ref, sizeof(il_ref));
+        if (il_ref != il) {
+            throw std::runtime_error("DSV4 K-cache layer id mismatch");
+        }
+
+        dsv4_state_read_tensor_streams_window(io, kv->get_k_storage(il), kv_size, row_lo_ref, n_rows_ref, s0, ns);
+    }
+}
 
 static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         const llama_ubatch & ubatch,
@@ -721,53 +896,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                     plan.state_snapshot_dst_idxs.push_back((int32_t) (dst_plane + stream_off + r));
                 }
             }
-        }
-    }
-
-    {
-        // kv-chain diagnostics: dump the comp-plan's window resolution so we can
-        // see, for the FIRST completed block of a ubatch, where its prev/cur
-        // windows resolve (scratch row = a token in THIS ubatch, or ring row =
-        // pos%state_size, or the synthetic zero row). a rings-only tail restore
-        // diverges from a cold prefill iff a window that SHOULD come from the
-        // prefix instead resolves to a ring row that the restore left wrong.
-        const char * tag = ratio == DSV4_CSA_RATIO ? "csa" : ratio == DSV4_HCA_RATIO ? "hca" : "lid";
-        const int pos_lo = ubatch.n_tokens > 0 ? ubatch.pos[0] : -1;
-        const int pos_hi = ubatch.n_tokens > 0 ? ubatch.pos[ubatch.n_tokens - 1] : -1;
-        LLAMA_LOG_WARN("dsv4[compplan] %s overlap=%d ratio=%u state_size=%u n_tokens=%u pos=[%d..%d] n_write=%zu n_visible_max=%lld\n",
-                tag, (int) overlap, ratio, state_size, ubatch.n_tokens,
-                pos_lo, pos_hi, plan.state_write_idxs.size(), (long long) plan.n_kv);
-        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
-            const uint32_t rollback = seq_id >= 0 && (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
-            LLAMA_LOG_WARN("dsv4[compplan]   seq %d rollback=%u\n", seq_id, rollback);
-        }
-        std::vector<int32_t> write_idx_i32(plan.state_write_idxs.begin(), plan.state_write_idxs.end());
-        LLAMA_LOG_WARN("dsv4[compplan]   persist_dst=%s write_idx=%s write_pos=%s\n",
-                dsv4_plan_positions(plan.state_persist_dst_idxs).c_str(),
-                dsv4_plan_positions(write_idx_i32).c_str(),
-                dsv4_plan_positions(plan.state_write_pos).c_str());
-        if (overlap) {
-            // state_read_idxs layout: [prev-half (ratio*n_blocks) | cur-half]
-            const size_t n_read = plan.state_read_idxs.size();
-            const size_t half = n_read / 2;
-            LLAMA_LOG_WARN("dsv4[compplan]   read_prev=%s\n", dsv4_plan_positions(std::vector<int32_t>(plan.state_read_idxs.begin(), plan.state_read_idxs.begin() + half)).c_str());
-            LLAMA_LOG_WARN("dsv4[compplan]   read_cur =%s\n", dsv4_plan_positions(std::vector<int32_t>(plan.state_read_idxs.begin() + half, plan.state_read_idxs.end())).c_str());
-        } else {
-            LLAMA_LOG_WARN("dsv4[compplan]   read=%s\n", dsv4_plan_positions(plan.state_read_idxs).c_str());
-        }
-        // annotate each read idx: <state_rows = scratch (token in this ubatch),
-        // >= state_rows+ubatch.n_tokens = synthetic zero row, else ring row.
-        if (!plan.state_read_idxs.empty()) {
-            std::string annot;
-            for (size_t i = 0; i < plan.state_read_idxs.size(); ++i) {
-                const int32_t r = plan.state_read_idxs[i];
-                const char * kind = (r >= (int32_t)(state_rows + ubatch.n_tokens)) ? "ZERO"
-                                : (r >= (int32_t) state_rows) ? "SCRATCH" : "RING";
-                if (!annot.empty()) annot += ",";
-                annot += std::to_string(r) + ":" + kind;
-            }
-            LLAMA_LOG_WARN("dsv4[compplan]   read_annot=[%s]\n", annot.c_str());
         }
     }
 
@@ -1634,25 +1762,54 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     // ATTN_ONLY: only the per-token KV (kv_raw) - never the rings or the
     // compressed K caches (both are the "tail object", stored separately).
     const bool attn_only    = flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY;
-    // TAIL_ONLY: the comp K caches + the rings, WITHOUT kv_raw. a FULL-mode
-    // read clears kv_raw first (it would wipe the restored per-token rows), so
-    // the tail must exclude kv_raw. the comp caches ARE included (see
-    // DSV4_STATE_MODE_TAIL): the attention over the restored prefix needs the
-    // prefix's completed comp rows. cost: .rscache files grow with the context.
+    // TAIL_ONLY: the rings ONLY, WITHOUT kv_raw and WITHOUT the comp K caches.
+    // a FULL-mode read clears kv_raw first (it would wipe the restored
+    // per-token rows), so the tail must exclude kv_raw. the comp caches are
+    // NOT in the tail either: they are prefix-style and additive, so they are
+    // stored per-chunk as COMP_ONLY blobs (see the comp_only branch below).
     const bool tail_only    = flags & LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY;
+    // COMP_ONLY: the comp K caches for the window [pos_lo, pos_limit) only, no
+    // kv_raw, no rings. row i of a comp cache covers tokens [i*ratio,
+    // (i+1)*ratio), so the window maps to rows [pos_lo/ratio, pos_limit/ratio).
+    const bool comp_only    = flags & LLAMA_STATE_SEQ_FLAGS_COMP_ONLY;
 
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
     // FULL    = kv_raw + compressed + rings
     // PARTIAL = kv_raw only                   (the in-memory checkpoint shape)
-    // TAIL    = compressed + rings            (no kv_raw)
-    const uint32_t mode    = (partial_only || attn_only) ? DSV4_STATE_MODE_PARTIAL
-                                 : tail_only             ? DSV4_STATE_MODE_TAIL
-                                                         : DSV4_STATE_MODE_FULL;
+    // TAIL    = rings only                    (no kv_raw, no comp)
+    // COMP    = the window's comp rows only   (no kv_raw, no rings)
+    const uint32_t mode    = comp_only                      ? DSV4_STATE_MODE_COMP
+                                 : (partial_only || attn_only) ? DSV4_STATE_MODE_PARTIAL
+                                 : tail_only                      ? DSV4_STATE_MODE_TAIL
+                                                                  : DSV4_STATE_MODE_FULL;
 
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
+
+    // COMP_ONLY: the window's comp rows only, then stop (no kv_raw, no rings).
+    // the comp caches are prefix-style: row i covers tokens [i*ratio,
+    // (i+1)*ratio), so the window [pos_lo, pos_limit) maps to rows
+    // [pos_lo/ratio, pos_limit/ratio) (the window is ubs-aligned and ubs is a
+    // multiple of every ratio, so the bounds are exact).
+    if (comp_only) {
+        const auto comp_rows = [](llama_pos pos, uint32_t ratio, uint32_t kv_size) {
+            return (uint32_t) std::min<uint64_t>(kv_size, (uint64_t) (pos < 0 ? 0 : pos) / ratio);
+        };
+        const uint32_t lo_csa = comp_rows(pos_lo,        DSV4_CSA_RATIO, kv_csa->get_size());
+        const uint32_t hi_csa = comp_rows(pos_limit,     DSV4_CSA_RATIO, kv_csa->get_size());
+        const uint32_t lo_hca = comp_rows(pos_lo,        DSV4_HCA_RATIO, kv_hca->get_size());
+        const uint32_t hi_hca = comp_rows(pos_limit,     DSV4_HCA_RATIO, kv_hca->get_size());
+        const uint32_t lo_lid = comp_rows(pos_lo,        DSV4_CSA_RATIO, kv_lid->get_size());
+        const uint32_t hi_lid = comp_rows(pos_limit,     DSV4_CSA_RATIO, kv_lid->get_size());
+
+        dsv4_state_write_k_cache_window(io, kv_csa.get(), seq_id, flags, lo_csa, hi_csa - lo_csa);
+        dsv4_state_write_k_cache_window(io, kv_hca.get(), seq_id, flags, lo_hca, hi_hca - lo_hca);
+        dsv4_state_write_k_cache_window(io, kv_lid.get(), seq_id, flags, lo_lid, hi_lid - lo_lid);
+
+        return;
+    }
 
     // kv_raw is skipped only for TAIL_ONLY (see above)
     if (!tail_only) {
@@ -1660,14 +1817,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
 
     // the compressed K caches are prefix-style (not windowable): fully present
-    // or absent. written in FULL and TAIL_ONLY modes. TAIL_ONLY MUST include them:
-    // the attention over a restored prefix attends over the prefix's completed
-    // comp rows (n_visible ~ pos/ratio), and the remainder prefill only rebuilds
-    // comp rows for tokens >= n_saved. a rings-only tail leaves the prefix comp
-    // rows empty -> the attention over the restored prefix sees zeros -> garbage.
-    // (the cost: the comp section grows with the context, so .rscache files are
-    // ~context-sized; that is a disk-bloat problem, not a correctness one.)
-    if (!partial_only && !attn_only) {
+    // or absent. written in FULL mode only (TAIL_ONLY is rings-only; the per-chunk
+    // comp rows live in the COMP_ONLY blobs).
+    if (!partial_only && !attn_only && !tail_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
@@ -1681,24 +1833,14 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
         dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
-
-        LLAMA_LOG_WARN("dsv4[state_write] mode=%u seq=%d pos_max=%d comp_rows csa=%u hca=%u lid=%u (kv_size csa=%u hca=%u lid=%u)\n",
-                mode, (int) seq_id, (int) pos_max,
-                n_rows_csa, n_rows_hca, n_rows_lid,
-                kv_csa->get_size(), kv_hca->get_size(), kv_lid->get_size());
-    } else {
-        LLAMA_LOG_WARN("dsv4[state_write] mode=%u seq=%d (no comp section: partial=%d attn=%d tail=%d)\n",
-                mode, (int) seq_id, (int) partial_only, (int) attn_only, (int) tail_only);
     }
 
-    // the ring states are written in all modes except ATTN_ONLY
+    // the ring states are written in all modes except ATTN_ONLY (and COMP_ONLY,
+    // which returned above)
     if (!attn_only) {
         csa_state->state_write(io, seq_id, flags, rs_idx);
         hca_state->state_write(io, seq_id, flags, rs_idx);
         lid_state->state_write(io, seq_id, flags, rs_idx);
-        LLAMA_LOG_WARN("dsv4[state_write] rings written: csa state_size=%u hca state_size=%u lid state_size=%u (rs_idx[seq]=%u)\n",
-                csa_state->get_state_size(), hca_state->get_state_size(), lid_state->get_state_size(),
-                (seq_id >= 0 && (uint32_t) seq_id < rs_idx.size()) ? rs_idx[seq_id] : 0);
     }
 }
 
@@ -1719,31 +1861,50 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     io.read(&mode, sizeof(mode));
-    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL && mode != DSV4_STATE_MODE_TAIL) {
+    if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL
+            && mode != DSV4_STATE_MODE_TAIL  && mode != DSV4_STATE_MODE_COMP) {
         throw std::runtime_error("DSV4 state mode mismatch");
     }
-    LLAMA_LOG_WARN("dsv4[state_read] magic=%08x version=%u mode=%u seq=%d flags=%u pos=[%d,%d)\n",
-            magic, version, mode, (int) seq_id, (unsigned) flags, (int) pos_lo, (int) pos_limit);
+
+    // COMP_ONLY: the window's comp rows only (row_lo from the v3 header), no
+    // kv_raw, no rings. APPEND = do not clear_compressed first, so the replay
+    // appends this chunk's rows on top of the earlier chunks' (chunk 0 does the
+    // clear). the ring state is untouched: it is reloaded later by the TAIL_ONLY
+    // restore (and rs_idx is reset there).
+    if (mode == DSV4_STATE_MODE_COMP) {
+        const bool append = (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) != 0;
+        if (!append) {
+            clear_compressed(seq_id, true);
+        }
+        dsv4_state_read_k_cache_window(io, kv_csa.get(), seq_id, flags);
+        dsv4_state_read_k_cache_window(io, kv_hca.get(), seq_id, flags);
+        dsv4_state_read_k_cache_window(io, kv_lid.get(), seq_id, flags);
+        return;
+    }
 
     // verify the caller's flags match what the blob actually contains, and
     // throw on disagreement: a mismatch would silently mis-parse (e.g. reading
-    // compressed rows as kv_raw rows) and garble the output. the comp K caches
-    // are in FULL and TAIL blobs (see state_write: the tail needs them for the
-    // attention over the restored prefix).
-    const bool blob_has_raw  = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_PARTIAL);
-    const bool blob_has_comp = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_TAIL);
+    // compressed rows as kv_raw rows) and garble the output.
+    //   FULL    : kv_raw + comp + rings   <- flags 0 / FULL_ONLY
+    //   PARTIAL : kv_raw only             <- PARTIAL_ONLY / ATTN_ONLY
+    //   TAIL    : rings only              <- TAIL_ONLY (no kv_raw, no comp)
+    // (COMP blobs are handled above; the comp rows are NOT in the TAIL - they
+    // live in the per-chunk COMP_ONLY blobs.)
+    const bool blob_has_raw   = (mode == DSV4_STATE_MODE_FULL || mode == DSV4_STATE_MODE_PARTIAL);
+    const bool blob_has_comp  = (mode == DSV4_STATE_MODE_FULL);
     const bool blob_has_rings = (mode != DSV4_STATE_MODE_PARTIAL);
-    const bool flags_want_raw  = (flags & (LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
-    const bool flags_want_comp = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) == 0;
+    const bool flags_want_raw   = (flags & (LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
     const bool flags_want_rings = (flags & LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY) == 0;
+    // comp is expected only from a FULL/FULL_ONLY read (flags 0); PARTIAL_ONLY /
+    // ATTN_ONLY / TAIL_ONLY all expect no comp (TAIL is rings-only).
+    const bool flags_want_comp  = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY |
+                                            LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) == 0;
     if (blob_has_raw != flags_want_raw || blob_has_comp != flags_want_comp || blob_has_rings != flags_want_rings) {
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
     if (blob_has_raw) {
         kv_raw->state_read(io, seq_id, flags, pos_lo, pos_limit);
-    } else {
-        LLAMA_LOG_WARN("dsv4[state_read] no kv_raw (mode=%u)\n", mode);
     }
 
     if (blob_has_comp) {
@@ -1752,9 +1913,6 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
-        LLAMA_LOG_WARN("dsv4[state_read] comp K caches loaded (csa/hca/lid), cleared first\n");
-    } else {
-        LLAMA_LOG_WARN("dsv4[state_read] NO comp K caches in blob (mode=%u) -> comp caches stay as-is (zeroed or from .kvcache replay)\n", mode);
     }
 
     if (blob_has_rings) {

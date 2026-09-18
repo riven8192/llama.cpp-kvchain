@@ -2056,15 +2056,17 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    // a plain kv cache has no recurrent part: PARTIAL_ONLY / TAIL_ONLY must
-    // serialize an EMPTY state (the real n_stream, then cell_count=0 per
-    // stream - NOT n_stream=0, which would trip the read-side n_stream check).
-    // without this, the restore would read the full attn state as recr.
-    const bool recr_only = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    // a plain kv cache has no recurrent part and no compressed K caches:
+    // PARTIAL_ONLY / TAIL_ONLY / COMP_ONLY must serialize an EMPTY state (the
+    // real n_stream, then cell_count=0 per stream - NOT n_stream=0, which would
+    // trip the read-side n_stream check). without this, the restore would read
+    // the full attn state as recr/comp.
+    const bool recr_or_comp_only =
+        (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY | LLAMA_STATE_SEQ_FLAGS_COMP_ONLY)) != 0;
 
     io.write(&n_stream, sizeof(n_stream));
 
-    if (recr_only) {
+    if (recr_or_comp_only) {
         const uint32_t cell_count_empty = 0;
         for (uint32_t s = 0; s < n_stream; ++s) {
             io.write(&cell_count_empty, sizeof(cell_count_empty));

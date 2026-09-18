@@ -925,12 +925,17 @@ extern "C" {
 #define LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY 16
 
 // inverse of ATTN_ONLY: everything except the per-token KV part. on
-// llama_kv_cache_dsv4 this is the compressed K caches + the ring (recurrent)
-// states (the comp caches are required: the attention over a restored prefix
-// attends over the prefix's completed comp rows, which the remainder prefill
-// does not rebuild); on the plain hybrid and pure-attn caches it behaves like
-// PARTIAL_ONLY.
+// llama_kv_cache_dsv4 this is the ring (recurrent) states only (the comp K
+// caches live in the COMP_ONLY blobs); on the plain hybrid and pure-attn
+// caches it behaves like PARTIAL_ONLY.
 #define LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY 32
+
+// the compressed K caches only (dsv4: kv_csa/kv_hca/kv_lid; every other cache:
+// an empty blob). the comp caches are prefix-style (row i covers tokens
+// [i*ratio, (i+1)*ratio)) and additive across chunks, so they are serialized
+// per-chunk for the window [pos_lo/ratio, pos_limit/ratio) (with the _window
+// state-seq variants) and replayed with APPEND on restore.
+#define LLAMA_STATE_SEQ_FLAGS_COMP_ONLY 64
 
 // on restore (state_read), do not clear the destination seq's cells first; append to them
 #define LLAMA_STATE_SEQ_FLAGS_APPEND 8

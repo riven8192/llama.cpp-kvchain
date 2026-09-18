@@ -16,6 +16,7 @@ namespace fs = std::filesystem;
 // so the whole chain is never in RAM at once.
 struct kv_chain_chunk {
     fs::path     attn_file; // this chunk's .kvcache (ATTN_ONLY rows for [k*bs,(k+1)*bs))
+    fs::path     cm_file;   // this chunk's .cmcache (COMP_ONLY comp rows); dsv4 only, empty otherwise
     fs::path     recr_file; // this chunk's .rscache; set for the TAIL chunk only
     llama_tokens tokens;    // the chunk's token IDs, verbatim from the file header
 };
@@ -99,6 +100,15 @@ public:
     bool   enabled() const { return !root_dir.empty(); }
     int32_t ubatch_size() const { return ubatch_size_; }
     uint64_t root_hash() const { return root_hash_; }
+    // true when the model has compressed K caches (arch deepseek4): then each
+    // chunk also gets a .cmcache file (the chunk's COMP_ONLY comp rows) and the
+    // .rscache is rings-only. non-dsv4 archs: false, two files, no cm loop.
+    bool has_comp() const { return has_comp_; }
+    // per-chunk "cm file present" map from the last load_prefix() call (chain
+    // order; 1 = present). only set when has_comp(); used by the replay loop to
+    // truncate at the deepest loaded chunk whose cm file is present, if a
+    // .kvcache read fails mid-replay (mirrors last_rs_present()).
+    const std::vector<uint8_t> & last_cm_present() const { return last_cm_present_; }
 
     static uint64_t fnv1a64(const uint8_t * data, size_t len);
     static uint64_t fnv1a64(uint64_t h, const uint8_t * data, size_t len);
@@ -111,7 +121,8 @@ private:
     void compute_root_hash(const common_params & params, const llama_model * model);
 
     bool write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
-                     const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr);
+                     const std::vector<uint8_t> & attn, const std::vector<uint8_t> & comp,
+                     const std::vector<uint8_t> & recr);
     bool write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
                           const llama_tokens & tokens, const std::vector<uint8_t> & blob);
     void evict_oldest(uint64_t need_bytes);
@@ -121,5 +132,7 @@ private:
     uint64_t    limit_bytes;
     int32_t     ubatch_size_; // chunk stride == n_ubatch
     uint64_t    total_bytes_cur = 0;
+    bool        has_comp_ = false; // model has compressed K caches (deepseek4)
     mutable std::vector<uint8_t> last_rs_present_; // set by load_prefix() (const: caches the last call's result)
+    mutable std::vector<uint8_t> last_cm_present_; // set by load_prefix() when has_comp_
 };

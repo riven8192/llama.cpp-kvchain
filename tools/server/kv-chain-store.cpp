@@ -20,11 +20,21 @@ static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
 // single version number for the kv-chain format: the chunk file layout AND the
 // root-hash metadata blob. bump on any change to either: a stale file is never
 // read (version check) and the root hash changes, so old chunks are a clean miss.
-static constexpr uint32_t KV_CHAIN_VERSION = 5;
+// v6: the DSV4 comp K caches moved out of the .rscache (now rings-only) into a
+// per-chunk .cmcache file; old (comp-carrying) dsv4 chunks are a clean miss.
+static constexpr uint32_t KV_CHAIN_VERSION = 6;
+
+// true when the model has compressed K caches (arch deepseek4): then each chunk
+// gets a third, .cmcache, file holding the chunk's comp rows (COMP_ONLY blob).
+// non-dsv4 archs stay at two files and their restore is byte-identical to v5.
+static bool kv_chain_has_comp(const llama_model * model) {
+    return model != nullptr && std::string(llama_model_arch_name(model)) == "deepseek4";
+}
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t ubatch_size,
                                const common_params & params, const llama_model * model) :
-    root_dir(std::move(root_dir)), limit_bytes(limit_bytes), ubatch_size_(ubatch_size > 0 ? ubatch_size : 512) {
+    root_dir(std::move(root_dir)), limit_bytes(limit_bytes), ubatch_size_(ubatch_size > 0 ? ubatch_size : 512),
+    has_comp_(kv_chain_has_comp(model)) {
     if (!enabled()) {
         return;
     }
@@ -241,13 +251,10 @@ static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id
 // TAIL_ONLY, not FULL (flags=0): on a DSV4 cache a FULL-mode blob starts with
 // kv_raw and its state_read clears kv_raw first, which would wipe the
 // per-token rows restored from the .kvcache files (loaded after this). on DSV4
-// TAIL_ONLY is the compressed K caches + the compressor RING states (no kv_raw).
-// the comp caches MUST be in the tail: the attention over a restored prefix
-// attends over the prefix's completed comp rows, and the remainder prefill only
-// rebuilds comp rows for tokens >= n_saved - a rings-only tail leaves them
-// empty -> garbage. cost: the comp section is prefix-style, so .rscache files
-// grow with the context (disk bloat, not a bug). see llama-kv-cache-dsv4.cpp
-// DSV4_STATE_MODE_TAIL.
+// TAIL_ONLY is now the compressor RING states ONLY (no kv_raw, no comp): the
+// comp K caches moved to the per-chunk .cmcache files (COMP_ONLY blobs,
+// additive across chunks) so the .rscache stays constant-size. see
+// llama-kv-cache-dsv4.cpp DSV4_STATE_MODE_TAIL / DSV4_STATE_MODE_COMP.
 static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) {
     const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
     if (size == 0) {
@@ -264,8 +271,10 @@ static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) 
 
 // save one chunk covering the window [pos_lo, pos_hi): the .kvcache file gets
 // the ATTN_ONLY rows for exactly this window (additive across chunks), the
-// .rscache file gets the tail snapshot (only the last chunk's copy is ever
-// read). chunk_tokens are stored verbatim in both headers.
+// .cmcache file (dsv4 only) gets the COMP_ONLY comp rows for this window
+// (additive across chunks), and the .rscache file gets the tail snapshot
+// (rings only on dsv4; only the last chunk's copy is ever read). chunk_tokens
+// are stored verbatim in every header.
 bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
                           uint64_t chunk_hash, const llama_tokens & chunk_tokens,
                           uint64_t parent_hash /* = 0, logging only */) {
@@ -281,29 +290,45 @@ bool kv_chain_store::save(llama_context * ctx, llama_seq_id seq_id, llama_pos po
         SRV_WRN("kv-chain[storage]: failed to dump chunk window [%d, %d)\n", (int) pos_lo, (int) pos_hi);
         return false;
     }
+    // the comp rows for this window (dsv4 only): COMP_ONLY + the window, so the
+    // .cmcache holds exactly this chunk's comp delta (rows [pos_lo/ratio,
+    // pos_hi/ratio)), additive across chunks like the attn rows.
+    std::vector<uint8_t> comp;
+    if (has_comp_) {
+        comp = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_COMP_ONLY);
+        if (comp.empty()) {
+            SRV_WRN("kv-chain[storage]: failed to dump comp window [%d, %d)\n", (int) pos_lo, (int) pos_hi);
+            return false;
+        }
+    }
 
     const fs::path dir = fs::path(root_dir);
 
-    SRV_INF("kv-chain[storage]: saving chunk hash=%s parent=%s tokens=[%d..%d) existing=(kv=%d rs=%d)\n",
+    SRV_INF("kv-chain[storage]: saving chunk hash=%s parent=%s tokens=[%d..%d) existing=(kv=%d cm=%d rs=%d)\n",
             hash_str(chunk_hash).c_str(), hash_str(parent_hash).c_str(),
             (int) pos_lo, (int) pos_hi,
             (int) fs::exists(dir / (hash_str(chunk_hash) + ".kvcache")),
+            has_comp_ ? (int) fs::exists(dir / (hash_str(chunk_hash) + ".cmcache")) : 0,
             (int) fs::exists(dir / (hash_str(chunk_hash) + ".rscache")));
 
-    return write_chunk(dir, chunk_hash, chunk_tokens, attn, recr);
+    return write_chunk(dir, chunk_hash, chunk_tokens, attn, comp, recr);
 }
 
-// writes both chunk files if not present; idempotent (a crash between the two
-// writes only re-writes the missing one). returns true if anything was written.
+// writes the chunk files if not present (2 files, or 3 when has_comp_);
+// idempotent (a crash between the writes only re-writes the missing ones).
+// returns true if anything was written.
 bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
-                                  const std::vector<uint8_t> & attn, const std::vector<uint8_t> & recr) {
+                                  const std::vector<uint8_t> & attn, const std::vector<uint8_t> & comp,
+                                  const std::vector<uint8_t> & recr) {
     const std::string stem = hash_str(chunk_hash);
     const fs::path kv_file = dir / (stem + ".kvcache");
+    const fs::path cm_file = dir / (stem + ".cmcache");
     const fs::path rs_file = dir / (stem + ".rscache");
 
     const bool kv_exists = fs::exists(kv_file);
+    const bool cm_exists = has_comp_ && fs::exists(cm_file);
     const bool rs_exists = fs::exists(rs_file);
-    if (kv_exists && rs_exists) {
+    if (kv_exists && rs_exists && (!has_comp_ || cm_exists)) {
         return false;
     }
 
@@ -311,8 +336,11 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
     const uint64_t hdr_bytes = 4 * sizeof(uint32_t) + sizeof(llama_token) * chunk_tokens.size()
                               + sizeof(uint32_t);
     const uint64_t kv_entry = attn.size() + hdr_bytes;
+    const uint64_t cm_entry = comp.size() + hdr_bytes;
     const uint64_t rs_entry = recr.size() + hdr_bytes;
-    const uint64_t need_bytes = (kv_exists ? 0 : kv_entry) + (rs_exists ? 0 : rs_entry);
+    const uint64_t need_bytes = (kv_exists ? 0 : kv_entry)
+                              + (has_comp_ && !cm_exists ? cm_entry : 0)
+                              + (rs_exists ? 0 : rs_entry);
 
     if (limit_bytes > 0 && total_bytes_cur + need_bytes > limit_bytes) {
         evict_oldest(need_bytes);
@@ -326,6 +354,13 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
             any_written = true;
         }
     }
+    if (has_comp_ && !cm_exists) {
+        const fs::path tmp = dir / (stem + ".cmcache.tmp");
+        if (write_chunk_file(tmp, cm_file, chunk_hash, chunk_tokens, comp)) {
+            total_bytes_cur += cm_entry;
+            any_written = true;
+        }
+    }
     if (!rs_exists) {
         const fs::path tmp = dir / (stem + ".rscache.tmp");
         if (write_chunk_file(tmp, rs_file, chunk_hash, chunk_tokens, recr)) {
@@ -334,9 +369,10 @@ bool kv_chain_store::write_chunk(const fs::path & dir, uint64_t chunk_hash, cons
         }
     }
     if (any_written) {
-        SRV_INF("kv-chain[storage]: saved chunk hash=%s (attn %.1f MiB, recr %.1f MiB)\n",
+        SRV_INF("kv-chain[storage]: saved chunk hash=%s (attn %.1f MiB, cm %.1f MiB, recr %.1f MiB)\n",
                 stem.c_str(),
-                (double) attn.size() / (1024.0*1024.0), (double) recr.size() / (1024.0*1024.0));
+                (double) attn.size() / (1024.0*1024.0), (double) comp.size() / (1024.0*1024.0),
+                (double) recr.size() / (1024.0*1024.0));
     }
     return any_written;
 }
@@ -462,7 +498,7 @@ void kv_chain_store::evict_oldest(uint64_t need_bytes) {
             continue;
         }
         const auto ext = e.path().extension();
-        if (ext == ".kvcache" || ext == ".rscache") {
+        if (ext == ".kvcache" || ext == ".cmcache" || ext == ".rscache") {
             all.push_back({ e.path(), (uint64_t) e.file_size(), e.last_write_time(ec) });
         }
     }
@@ -526,19 +562,25 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // phase 1: exists-only walk
     std::vector<std::string> stems;          // per found chunk: file name stem
     std::vector<bool> rs_present;            // per found chunk: rs file exists
+    std::vector<bool> cm_present;            // per found chunk: cm file exists (has_comp_ only)
     size_t n_kv_found = 0;
     size_t usable = 0; // 1-based: last chunk with an rs file
     for (size_t k = 0; k < n_chunks; ++k) {
         const std::string stem = hash_str(hashes[k]);
         const bool kv_exists = fs::exists(dir / (stem + ".kvcache"));
-        const bool rs_exists = kv_exists && fs::exists(dir / (stem + ".rscache"));
-        SRV_DBG("kv-chain[storage]: chunk %zu hash=%s kv=%d rs=%d\n", k, stem.c_str(),
-                (int) kv_exists, (int) rs_exists);
-        if (!kv_exists) {
+        // a missing .cmcache (dsv4) also breaks the chain: the comp prefix would
+        // be incomplete and the attention over the restored prefix would see
+        // zeros for the missing rows.
+        const bool cm_exists = !has_comp_ || fs::exists(dir / (stem + ".cmcache"));
+        const bool rs_exists = kv_exists && cm_exists && fs::exists(dir / (stem + ".rscache"));
+        SRV_DBG("kv-chain[storage]: chunk %zu hash=%s kv=%d cm=%d rs=%d\n", k, stem.c_str(),
+                (int) kv_exists, (int) cm_exists, (int) rs_exists);
+        if (!kv_exists || !cm_exists) {
             break;
         }
         stems.push_back(std::move(stem));
         rs_present.push_back(rs_exists);
+        cm_present.push_back(cm_exists);
         n_kv_found++;
         if (rs_exists) {
             usable = k + 1;
@@ -560,10 +602,18 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // state to resume from), i.e. 100% re-prefill.
     stems.resize(usable);
     rs_present.resize(usable);
+    cm_present.resize(usable);
     // (vector<uint8_t>, not vector<bool>: the latter's proxies are not const-assignable)
     last_rs_present_.resize(usable);
+    last_cm_present_.clear();
+    if (has_comp_) {
+        last_cm_present_.resize(usable);
+    }
     for (size_t k = 0; k < usable; ++k) {
         last_rs_present_[k] = rs_present[k] ? 1 : 0;
+        if (has_comp_) {
+            last_cm_present_[k] = cm_present[k] ? 1 : 0;
+        }
     }
 
     const fs::path rs_file_tail = dir / (stems[usable - 1] + ".rscache");
@@ -586,6 +636,9 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     for (size_t k = 0; k < usable; ++k) {
         kv_chain_chunk chunk;
         chunk.attn_file = dir / (stems[k] + ".kvcache");
+        if (has_comp_) {
+            chunk.cm_file = dir / (stems[k] + ".cmcache");
+        }
         chunk.tokens.assign(tokens.begin() + k * ubs, tokens.begin() + (k + 1) * ubs);
         if (k + 1 == usable) {
             chunk.recr_file = rs_file_tail; // TAIL chunk only (validated above)
@@ -594,16 +647,19 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     }
     *n_tokens = usable * ubs;
 
-    // touch the replayed .kvcache files + the tail rs + every 8th rs file below
-    // the tail: a future prompt may fork at one of those intermediate
-    // boundaries, and only its rs file is needed to restore the recurrent
-    // state there.
+    // touch the replayed .kvcache files + (dsv4) the .cmcache files + the tail
+    // rs + every 8th rs file below the tail: a future prompt may fork at one of
+    // those intermediate boundaries, and only its rs file is needed to restore
+    // the recurrent state there.
     {
         static constexpr size_t KV_CHAIN_RS_TOUCH_STRIDE = 8;
         std::vector<fs::path> to_touch;
-        to_touch.reserve(usable * 2);
+        to_touch.reserve(usable * 3);
         for (size_t k = 0; k < usable; ++k) {
             to_touch.push_back(chunks[k].attn_file);
+            if (has_comp_) {
+                to_touch.push_back(chunks[k].cm_file);
+            }
         }
         const size_t tail = usable - 1;
         for (size_t k = 0; k < tail; k += KV_CHAIN_RS_TOUCH_STRIDE) {
