@@ -960,6 +960,15 @@ private:
     server_slot * kv_chain_prefill_slot = nullptr;
     kv_chain_ubatch_state kv_chain_cb_state;
 
+    // decode tokens (sampled + speculative draft) of GENERATING slots that were
+    // DEFERRED from the previous pre_decode iteration because a chunk-save slot
+    // needed the batch to itself (a decode token in the batch would make the
+    // prefill's ubatches off-grid). replayed at the START of the next
+    // pre_decode, before the chunk pick. keyed by slot id; cleared on slot
+    // release (stale entries for a released id are harmless: the slot is not
+    // GENERATING, so they are never replayed).
+    std::map<int32_t, llama_tokens> kv_chain_deferred_decode;
+
     // set by kv_chain_pick_chunk_slot() when this iteration's batch is EXCLUSIVE
     // to one slot (a kv-chain chunk save is due, on an empty batch); cleared at
     // the end of the iteration. while set, the prompt loop lets only this slot
@@ -1017,7 +1026,7 @@ private:
         slot.kv_chain_last_saved_pos = pos;
     }
 
-    // kv-chain chunk exclusivity (a separate pre_decode phase, run BETWEEN the
+    // kv-chain chunk exclusivity (a separate pre_decode phase, run BEFORE the
     // decode-token fill and the prompt loop): with --parallel > 1 the KV cache
     // has n_stream = n_seq_max, so llama's split_equal MIXES other slots' tokens
     // (decode tails, other prompts' heads) into the prefill slot's ubatches.
@@ -1025,15 +1034,26 @@ private:
     // of ubs, the save hook skips it, and the chunk file is never written (a
     // missing chunk then caps the whole chain on the next restore).
     //
-    // fix: when the batch is still EMPTY, pick ONE slot that has a full ubs
-    // chunk left to prefill, and let it be the SOLE provider of this batch
-    // (the prompt loop skips every other slot, and the decode tokens were
-    // already deferred). it then fills exactly ubs tokens, so its absolute pos
-    // advances by a whole chunk and the boundary is on-grid. if the batch is
-    // NOT empty (decode tokens / a tail are already in it), pick nothing: that
-    // slot's chunk is deferred to a later, empty-batch iteration. awaiting an
-    // empty batch is deliberate - it is what keeps [prompt_a_tail,
-    // prompt_b_head] from ever sharing a ubatch.
+    // fix: pick ONE slot that has a full ubs chunk left to prefill, and let it
+    // be the SOLE provider of this batch (the prompt loop skips every other
+    // slot). the decode tokens of the GENERATING slots are DEFERRED to the next
+    // iteration (kv_chain_deferred_decode): a decode token in the batch would
+    // make the prefill's ubatches off-grid, and the pick only runs on an EMPTY
+    // batch. the deferred tokens are replayed at the start of the next
+    // pre_decode (before the pick), so the decode is delayed by exactly one
+    // iteration - one prefill ubs-chunk - which is the price of an on-grid
+    // chunk save. a slot with only a PARTIAL chunk left (remaining < ubs) does
+    // NOT win the pick, so the decode is not deferred for it: the partial tail
+    // prefills mixed with the decode (the tail is never saved anyway, and a
+    // decode token at pos 0 keeps every prefill token at pos >= 1, so the
+    // trailing partial ubatch is harmless).
+    //
+    // NOTE: the pick runs BEFORE the decode-token fill precisely so the batch
+    // is empty when it decides. an earlier version ran it after the fill, so
+    // the batch was never empty when a decode was in flight, the pick never
+    // fired, and the fill loop appended the prefill to the decode batch (s0
+    // decode + s1 prefill in one ubatch) -> every further prefill chunk
+    // off-grid, no more chunk saves.
     //
     // remaining_after_restore() = (task.n_tokens - prompt.n_tokens) -
     //   (hash_chain.size() * ubs). at pick time a STARTED slot has NOT yet run
@@ -3351,24 +3371,72 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
-        // kv-chain chunk exclusivity, decided in its OWN phase (see
-        // kv_chain_pick_chunk_slot): if the batch is empty, one slot with a full
-        // ubs chunk left to prefill becomes the SOLE provider of this batch, so
-        // its ubatches stay on the ubs-grid. this must run AFTER the decode
-        // tokens are (or are not) added, because it only fires on an empty
-        // batch. while a slot is chosen, the prompt loop skips every other
-        // slot; the decode tokens were deferred so the batch is clean.
-        kv_chain_chunk_slot = nullptr;
+        // kv-chain: replay the decode tokens that the PREVIOUS iteration deferred
+        // (a chunk-save slot needed the batch to itself then). the batch is
+        // empty here, so the tokens land at pos 0 - the same positions the
+        // slot's prompt.tokens were advanced to when they were captured.
+        if (kv_chain) {
+            for (auto & kv : kv_chain_deferred_decode) {
+                auto it = std::find_if(slots.begin(), slots.end(), [&](const server_slot & s) {
+                    return s.id == kv.first;
+                });
+                if (it == slots.end() || it->state != SLOT_STATE_GENERATING) {
+                    continue; // slot released/aborted meanwhile
+                }
+                server_slot & slot = *it;
+                // the token stream is [sampled, draft...]: the sampled token is
+                // at prompt.tokens[n-1-draft.size()], the draft follows (see
+                // handle_last_sampled_token).
+                const size_t n_draft = slot.spec_draft.size();
+                const size_t base    = slot.prompt.n_tokens() - 1 - n_draft;
+                for (size_t i = 0; i < 1 + n_draft; ++i) {
+                    const llama_token tok   = slot.prompt.tokens[base + i];
+                    const llama_pos   pos   = slot.prompt.tokens.pos_next(base + i);
+                    const bool        last  = (i == n_draft);
+                    if (last) {
+                        // output on the SAMPLED token only (never the draft): the
+                        // draft was rejected, its logits are discarded (post_decode
+                        // handles spec_i_batch). this mirrors handle_last_sampled_token.
+                        slot.i_batch = batch.size();
+                    }
+                    batch.add(slot.id, tok, pos, last, false);
+                }
+                // spec_i_batch is RELATIVE to slot.i_batch (see
+                // handle_last_sampled_token): [sampled, draft...] offsets.
+                for (size_t i = 0; i <= n_draft; ++i) {
+                    slot.spec_i_batch.push_back((int32_t) (slot.i_batch + (int32_t) i));
+                }
+                kv_chain_deferred_decode.erase(kv.first);
+                SRV_INF("kv-chain[deferred]: slot %d replayed %zu decode tokens (1 sampled + %zu draft)\n",
+                        slot.id, 1 + n_draft, n_draft);
+            }
+        }
 
-        // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
-
-        // kv-chain: pick the chunk-exclusive slot now that the decode tokens
-        // have been added (the batch is either empty or it is not - a chunk save
-        // is only possible on the empty case).
+        // kv-chain: pick the chunk-exclusive slot. it must run on an EMPTY batch
+        // (the batch is empty here unless the deferred tokens above filled it):
+        // a decode token in the batch would make the prefill's ubatches
+        // off-grid. the decode fill below is skipped while a slot is chosen.
         kv_chain_chunk_slot = kv_chain_pick_chunk_slot();
+
+        // update the batch with the sampled/drafted tokens. the chunk-exclusive
+        // slot is the SOLE provider of this batch: the GENERATING slots' decode
+        // tokens are DEFERRED to the next iteration (kv_chain_deferred_decode)
+        // instead of being added now, so the prefill's ubatches stay on the
+        // ubs-grid (a decode token at batch pos 0 would desync the grid).
+        if (kv_chain_chunk_slot) {
+            for (auto & slot : generating) {
+                const size_t n_draft = slot->spec_draft.size();
+                const size_t base    = slot->prompt.n_tokens() - 1 - n_draft;
+                const llama_tokens & toks = slot->prompt.tokens.get_tokens();
+                kv_chain_deferred_decode[slot->id].assign(toks.begin() + base, toks.begin() + base + 1 + n_draft);
+                SRV_INF("kv-chain[deferred]: slot %d decode (%zu tokens) deferred - chunk_slot %d owns the batch\n",
+                        slot->id, 1 + n_draft, kv_chain_chunk_slot->id);
+            }
+        } else {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -4362,6 +4430,11 @@ private:
                     kv_chain_prefill_slot = nullptr;
                     kv_chain_cb_state.slot = nullptr;
                 }
+
+                // drop any decode tokens deferred for this slot (a chunk-save
+                // slot owned the batch last iteration); without this, a released
+                // slot's tokens would linger in the map (harmless but untidy).
+                kv_chain_deferred_decode.erase(slot.id);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
