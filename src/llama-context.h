@@ -156,9 +156,6 @@ struct llama_context {
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
-    size_t state_seq_get_data_prefix(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos pos_limit);
-    size_t state_seq_set_data_prefix(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_pos pos_limit);
-
     size_t state_seq_get_data_window(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
     size_t state_seq_set_data_window(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit);
 

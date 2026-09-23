@@ -85,17 +85,6 @@ public:
     bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob,
                          const llama_tokens & expected_tokens) const;
 
-    // per-chunk "rs file present" map from the last load_prefix() call (chain
-    // order; 1 = present). used by the replay loop to truncate at the deepest
-    // loaded chunk whose rs file is present, if a .kvcache read fails mid-replay.
-    const std::vector<uint8_t> & last_rs_present() const { return last_rs_present_; }
-
-    // utimensat the files of the given chunk hashes to "now". the default
-    // relatime mount does not update mtime on read, so without this LRU would
-    // evict the hottest chains first. load_prefix() already touches on hit;
-    // this is for other restore paths.
-    void touch_chunks(const std::vector<uint64_t> & chunk_hashes) const;
-
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
     int32_t ubatch_size() const { return ubatch_size_; }
@@ -104,11 +93,6 @@ public:
     // chunk also gets a .cmcache file (the chunk's COMP_ONLY comp rows) and the
     // .rscache is rings-only. non-dsv4 archs: false, two files, no cm loop.
     bool has_comp() const { return has_comp_; }
-    // per-chunk "cm file present" map from the last load_prefix() call (chain
-    // order; 1 = present). only set when has_comp(); used by the replay loop to
-    // truncate at the deepest loaded chunk whose cm file is present, if a
-    // .kvcache read fails mid-replay (mirrors last_rs_present()).
-    const std::vector<uint8_t> & last_cm_present() const { return last_cm_present_; }
 
     static uint64_t fnv1a64(const uint8_t * data, size_t len);
     static uint64_t fnv1a64(uint64_t h, const uint8_t * data, size_t len);
@@ -133,6 +117,4 @@ private:
     int32_t     ubatch_size_; // chunk stride == n_ubatch
     uint64_t    total_bytes_cur = 0;
     bool        has_comp_ = false; // model has compressed K caches (deepseek4)
-    mutable std::vector<uint8_t> last_rs_present_; // set by load_prefix() (const: caches the last call's result)
-    mutable std::vector<uint8_t> last_cm_present_; // set by load_prefix() when has_comp_
 };

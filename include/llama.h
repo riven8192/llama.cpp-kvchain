@@ -989,25 +989,8 @@ extern "C" {
                            size_t   size,
                      llama_seq_id   dest_seq_id,
             llama_state_seq_flags   flags,
-                          llama_pos pos_lo,
-                          llama_pos pos_limit);
-
-    // like the _ext above, but only (de)serialize cells with pos < pos_limit
-    LLAMA_API size_t llama_state_seq_get_data_prefix_ext(
-            struct llama_context * ctx,
-                          uint8_t * dst,
-                           size_t   size,
-                     llama_seq_id   seq_id,
-            llama_state_seq_flags   flags,
-                          llama_pos pos_limit);
-
-    LLAMA_API size_t llama_state_seq_set_data_prefix_ext(
-            struct llama_context * ctx,
-                    const uint8_t * src,
-                           size_t   size,
-                     llama_seq_id   dest_seq_id,
-            llama_state_seq_flags   flags,
-                          llama_pos pos_limit);
+                           llama_pos pos_lo,
+                           llama_pos pos_limit);
 
     //
     // Decoding

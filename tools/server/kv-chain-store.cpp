@@ -562,7 +562,6 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // phase 1: exists-only walk
     std::vector<std::string> stems;          // per found chunk: file name stem
     std::vector<bool> rs_present;            // per found chunk: rs file exists
-    std::vector<bool> cm_present;            // per found chunk: cm file exists (has_comp_ only)
     size_t n_kv_found = 0;
     size_t usable = 0; // 1-based: last chunk with an rs file
     for (size_t k = 0; k < n_chunks; ++k) {
@@ -570,7 +569,7 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         const bool kv_exists = fs::exists(dir / (stem + ".kvcache"));
         // a missing .cmcache (dsv4) also breaks the chain: the comp prefix would
         // be incomplete and the attention over the restored prefix would see
-        // zeros for the missing rows.
+        // zeros for the missing rows. (always true for non-dsv4, which has no cm)
         const bool cm_exists = !has_comp_ || fs::exists(dir / (stem + ".cmcache"));
         const bool rs_exists = kv_exists && cm_exists && fs::exists(dir / (stem + ".rscache"));
         SRV_DBG("kv-chain[storage]: chunk %zu hash=%s kv=%d cm=%d rs=%d\n", k, stem.c_str(),
@@ -580,7 +579,6 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
         }
         stems.push_back(std::move(stem));
         rs_present.push_back(rs_exists);
-        cm_present.push_back(cm_exists);
         n_kv_found++;
         if (rs_exists) {
             usable = k + 1;
@@ -602,19 +600,6 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     // state to resume from), i.e. 100% re-prefill.
     stems.resize(usable);
     rs_present.resize(usable);
-    cm_present.resize(usable);
-    // (vector<uint8_t>, not vector<bool>: the latter's proxies are not const-assignable)
-    last_rs_present_.resize(usable);
-    last_cm_present_.clear();
-    if (has_comp_) {
-        last_cm_present_.resize(usable);
-    }
-    for (size_t k = 0; k < usable; ++k) {
-        last_rs_present_[k] = rs_present[k] ? 1 : 0;
-        if (has_comp_) {
-            last_cm_present_[k] = cm_present[k] ? 1 : 0;
-        }
-    }
 
     const fs::path rs_file_tail = dir / (stems[usable - 1] + ".rscache");
     const llama_tokens tail_block(tokens.begin() + (usable - 1) * ubs, tokens.begin() + usable * ubs);
@@ -674,18 +659,4 @@ std::vector<kv_chain_chunk> kv_chain_store::load_prefix(const llama_tokens & tok
     SRV_INF("kv-chain[storage]: %zu prompt chunks, first %zu kv-files found on disk, last rs-file found for chunk %zu, replay plan: %zu chunks\n",
             n_chunks, n_kv_found, usable, chunks.size());
     return chunks;
-}
-
-void kv_chain_store::touch_chunks(const std::vector<uint64_t> & chunk_hashes) const {
-    if (!enabled() || chunk_hashes.empty()) {
-        return;
-    }
-    const fs::path dir = fs::path(root_dir);
-    std::vector<fs::path> files;
-    files.reserve(chunk_hashes.size() * 2);
-    for (uint64_t h : chunk_hashes) {
-        files.push_back(dir / (hash_str(h) + ".kvcache"));
-        files.push_back(dir / (hash_str(h) + ".rscache"));
-    }
-    touch_chain_files(files);
 }
