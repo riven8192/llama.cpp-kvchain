@@ -15,7 +15,7 @@ excludes=()
 
 usage() {
   cat <<'EOF'
-usage: git-diff-chunks.sh [options] [-- extra git-diff args]
+usage: git_diff_chunks.sh [options] [-- extra git-diff args]
 
   -b, --base REF       parent branch to diff against      (default: master)
   -m, --max N          max lines per chunk                (default: 500)
@@ -26,7 +26,7 @@ usage: git-diff-chunks.sh [options] [-- extra git-diff args]
   -h, --help           this message
 
 example:
-  git-diff-chunks.sh -b main -U 2 -x NOTES.md -x '*.lock' -x dist/
+  git_diff_chunks.sh -b main -U 2 -x NOTES.md -x '*.lock' -x dist/
 EOF
 }
 

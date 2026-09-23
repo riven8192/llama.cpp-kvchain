@@ -19,8 +19,12 @@ echo "Flushing build cache..."
 rm -rf "${LLAMA_BUILD_DIR}"
 mkdir -p "${LLAMA_BUILD_DIR}"
 
+# -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON (use if not linked statically)
+
+
 echo "Configuring (build dir: ${LLAMA_BUILD_DIR})"
 cmake -S . -B "${LLAMA_BUILD_DIR}" -G Ninja \
+  -DBUILD_SHARED_LIBS=OFF \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_VULKAN=ON \
   -DLLAMA_CURL=ON \
