@@ -673,7 +673,7 @@ struct server_slot {
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
+        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.3f, t = %6.2f s / %.2f tokens per second\n",
                 (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
     }
 
@@ -3656,7 +3656,7 @@ private:
                                     // the disk hash-chain cache is the only prefix cache;
                                     // bypass the native in-memory common-prefix reuse so
                                     // the restore path is the single source of truth.
-                                    SLT_WRN(slot, "%s", "kv-chain[storage]: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
+                                    SLT_INF(slot, "%s", "kv-chain[storage]: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
                                     n_past = 0;
                                 } else {
                                     // reuse any previously computed tokens that are common with the new prompt
@@ -3870,6 +3870,14 @@ private:
                             SLT_INF(slot, "kv-chain[restore]: load_prefix -> %zu chunks, n_saved=%zu (input_n=%zu)\n",
                                     chunks.size(), n_saved, input_tokens.size());
                             if (!chunks.empty() && n_saved > 0) {
+                                // wall time + bytes for the WHOLE restore below
+                                // (the streaming read-from-disk + upload-to-vram
+                                // of every chunk, not per-op): seq_rm, the attn
+                                // replay, the (dsv4) comp replay, the tail rs.
+                                // n_bytes_read = the BLOB bytes (the file header
+                                // with the token ids is not counted).
+                                const int64_t t_restore_start = ggml_time_us();
+                                uint64_t      n_bytes_read = 0;
                                 // wipe the slot's KV cells first: in the no-restart
                                 // case this resets the previous prompt+response
                                 // (per-token KV cells and recurrent state) to a
@@ -3895,6 +3903,7 @@ private:
                                         ok = false;
                                         break;
                                     }
+                                    n_bytes_read += attn_blob.size();
                                     // ATTN_ONLY: the .kvcache blob was written with
                                     // ATTN_ONLY, so the read must use the same flag.
                                     const llama_state_seq_flags attn_flags =
@@ -3903,7 +3912,7 @@ private:
                                     const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
                                             attn_blob.data(), attn_blob.size(), slot.id,
                                             attn_flags, pos_lo, pos_hi);
-                                    SLT_INF(slot, "kv-chain[restore]: chunk %zu set_data(ATTN_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                    SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(ATTN_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
                                             k, (k == 0) ? "" : "|APPEND", (int) pos_lo, (int) pos_hi,
                                             attn_blob.size(), n_attn);
                                     attn_blob.clear();
@@ -3931,13 +3940,14 @@ private:
                                             ok = false;
                                             break;
                                         }
+                                        n_bytes_read += cm_blob.size();
                                         const llama_state_seq_flags cm_flags =
                                                 (k == 0) ? LLAMA_STATE_SEQ_FLAGS_COMP_ONLY
                                                          : (LLAMA_STATE_SEQ_FLAGS_COMP_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
                                         const size_t n_cm = llama_state_seq_set_data_window_ext(ctx_tgt,
                                                 cm_blob.data(), cm_blob.size(), slot.id,
                                                 cm_flags, pos_lo, pos_hi);
-                                        SLT_INF(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                        SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
                                                 k, (k == 0) ? "" : "|APPEND", (int) pos_lo, (int) pos_hi,
                                                 cm_blob.size(), n_cm);
                                         cm_blob.clear();
@@ -3968,10 +3978,11 @@ private:
                                             SLT_WRN(slot, "%s", "kv-chain[storage]: tail rs re-read failed at tail chunk, discarding restore");
                                             ok = false;
                                         } else {
+                                            n_bytes_read += tail_recr.size();
                                             const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
                                                     tail_recr.data(), tail_recr.size(), slot.id,
                                                     LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
-                                            SLT_INF(slot, "kv-chain[restore]: tail set_data(TAIL_ONLY) blob=%zu -> %zu bytes (this is the dsv4 rings-only / qwen recr blob)\n",
+                                            SLT_DBG(slot, "kv-chain[restore]: tail set_data(TAIL_ONLY) blob=%zu -> %zu bytes (this is the dsv4 rings-only / qwen recr blob)\n",
                                                     tail_recr.size(), n_recr);
                                             tail_recr.clear();
                                             tail_recr.shrink_to_fit();
@@ -3992,8 +4003,13 @@ private:
                                     // searches tokens[0, n-1)) -> something is left to prefill.
                                     const size_t n_left = input_tokens.size() - (size_t) n_past;
                                     GGML_ASSERT(n_left > 0);
-                                    SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill\n",
-                                            n_past, n_replayed, n_left);
+                                    const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
+                                    SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill "
+                                            "(read %.2f GiB in %.2f s = %.2f GiB/s)\n",
+                                            n_past, n_replayed, n_left,
+                                            (double) n_bytes_read / (1024.0*1024.0*1024.0),
+                                            t_restore_s,
+                                            t_restore_s > 0.0 ? (double) n_bytes_read / (1024.0*1024.0*1024.0) / t_restore_s : 0.0);
                                 } else {
                                     SLT_WRN(slot, "%s", "kv-chain[storage]: failed to restore chain, falling back to prefill");
                                 }
