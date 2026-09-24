@@ -28,11 +28,12 @@ fi
 # the seed pins the RNG.
 curl -s -N -X POST "${LLAMA_URL}/v1/completions" \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 512, temperature: 0, seed: 42}')" \
+  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 2048, temperature: 0, seed: 42}')" \
 | python3 -c '
 import json, sys
 
 usage = None
+count = 0
 for line in sys.stdin:
     line = line.strip()
     if not line.startswith("data:"):
@@ -47,6 +48,7 @@ for line in sys.stdin:
     choice = (chunk.get("choices") or [{}])[0]
     text = choice.get("text")
     if text:
+        count += 1
         sys.stdout.write(text)
         sys.stdout.flush()
     if chunk.get("usage"):
@@ -56,6 +58,6 @@ sys.stdout.write("\n")
 sys.stdout.flush()
 if usage:
     d = usage.get("prompt_tokens_details", {})
-    sys.stderr.write("cached_tokens: %s  prompt_tokens: %s\n"
-                     % (d.get("cached_tokens", 0), usage.get("prompt_tokens", 0)))
+    sys.stderr.write("cached_tokens: %s\nprompt_tokens: %s\nresponse_tokens: %s\n"
+                     % (d.get("cached_tokens", 0), usage.get("prompt_tokens", 0), count))
 '

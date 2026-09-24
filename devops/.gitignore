@@ -5,6 +5,14 @@
 .kv-cache/
 parallel-slot-*.json
 
+# generated prompt fixtures (built by llama_unittests.sh's make_exact_prompt_len)
+.fixed-size-prompt-*.txt
+
+# unittest run artifacts
+.unittest-output/
+stderr.txt
+stdout.txt
+
 # large prompt fixtures (pasted in for the ubatch-grid probe; not source)
 prompt_30k.txt
 prompt_7sentences.txt
