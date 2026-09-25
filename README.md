@@ -18,17 +18,21 @@ files are already on disk, load them into VRAM and prefill the remaining tokens.
 
 ### Serialization and usage of kv-cache files
 
-Depending on the model architecture, one or multiple files are written per chunk.
-- Older models simply have 1 kv-cache file per chunk.
-- Qwen-3.8 27B has an additional recurrent-state block, of which only the last will be loaded.
-- DeepSeek V4 Flash has both rings (of which only the last file is loaded) and components (the whole chain is loaded).
+The kv-cache files form a hash-chain, meaning, the root-hash contains metadata (like model info),
+every next file has a filename generated like so: `hash_curr=hash(hash_prev | current_chunk_tokens)`.
+This mean that when switching models, hash-files of the other models are never read due to their
+different root. This also ensures that a chunk A containing the same tokens as chunk B, at different
+positions in the prompt, are never treated as equal, given that they will have distinct hashes.
+
+Depending on the model architecture, one or multiple files are written per chunk. The goal is to
+have zero redundancy in the stored files, so every type of kv-cache file should have the same size.
 
 ### Eviction logic
 
 Every time kv-cache files are loaded, their last-modified-time is updated. This is the signal
-that they are still valuable. When the kv-cache directory size exceeds its quota, the file(s)
-with the oldest last-modified-time is deleted. This means that the LRU state lives outside of
-llama.cpp memory, and survives a process restart or reboot.
+that they are still valuable. When the kv-cache directory size exceeds its quota, the files
+with the oldest last-modified-time are deleted, until we are below the quota. This means that
+the LRU state lives outside of llama.cpp memory, and survives a process restart or reboot.
 
 
 ## How to use
