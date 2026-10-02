@@ -317,7 +317,7 @@ server_alive() {
 
 check_hello() {
 	echo "=== hello: trivial prompt gets a real answer ==="
-	do_prompt "hello-a" "hello world"
+	do_prompt "hello-a" "hi buddy!"
 	require_response_contains "hello-a" "help"
 	require_response_contains "hello-a" "today"
 	echo

@@ -4,9 +4,10 @@ Base: llama.cpp **v0.4.0** (tag `v0.4.0`, 5266f24da), branch `hash-chain-kv`
 (fork: github.com/riven8192/llama.cpp-kvchain). Local hack, not upstream-grade
 (see `../docs/project-plan.md` for the design). The code is the source of truth
 for HOW things work; this file only holds what/where + test status + quirks.
-Model under test: Qwen3.8-27B (16 full-attn + 48 Gated DeltaNet recurrent
-layers), selected via `LLAMA_HF_REF` in `devops/env.sh`, passed to llama-server
-as `-hf`. DSV4F (arch `deepseek4`) is also supported (section 4b).
+Model under test: selected via `LLAMA_HF_REF` in `devops/env.sh`, passed to
+llama-server as `-hf`. three archs supported: Qwen3.8-27B (16 full-attn + 48
+Gated DeltaNet recurrent layers), DSV4F (arch `deepseek4`, section 4b) and
+Qwen3.8-Flash-Next (arch `qwen4exp` QSA indexer, section 4c).
 
 CURRENT STATE: KV_CHAIN_VERSION 6. Per chunk, files in a FLAT cache dir:
   - `<hash>.kvcache` = ATTN_ONLY blob (per-token KV rows for exactly the chunk
@@ -97,48 +98,34 @@ different model/config/parallel is a clean miss, never garbage.
 - LRU touch on restore: `load_prefix` touches every matched .kvcache/.cmcache,
   the TAIL .rscache, PLUS the .rscache of every chunk index that is a multiple
   of `KV_CHAIN_RS_TOUCH_STRIDE` (8) below the tail — so intermediate fork-point
-  rs files survive LRU (a future prompt forking off the chain halfway still
-  finds its recurrent state). tested by the mtime gap-pattern check in
-  `llama_unittest_forked_chains.sh`.
+   rs files survive LRU (a future prompt forking off the chain halfway still
+   finds its recurrent state). tested by the mtime gap-pattern check in
+   `check_fork` (llama_unittests.sh).
+- `KVCHAIN_VERBOSE=1` (env, OFF by default): enables the kv-chain diagnostics
+   — the `/tmp/rt-save` + `/tmp/rt-restore` round-trip dumps, the qwen4exp
+   idx-K tensor dumps, and the per-layer `KVCHAINDBG` trace logs. OFF means
+   the normal prefill/restore path pays no diagnostic I/O (the dumps do a GPU
+   sync + tensor_get each) and no per-layer logging. turn it on when bringing
+   up a new architecture (the dumps let you byte-compare a no-restore prefill
+   against a restore). the qsa assert / OOR error-path logs are NOT gated.
 
 ## 4. Test status
 
-All PASS on Qwen3.8-27B. Run them with `devops/llama_run_unittests.sh`
-(builds first, runs all, prints a summary, exits non-zero on failure); each
-writes `devops/out-<name>.log` — grep THAT instead of re-running, a full pass
-takes many minutes.
+All PASS on all three supported archs: Qwen3.8-27B, Qwen3.8-Flash-Next
+(qwen4exp), and DSV4F (deepseek4). Run them with `devops/
+llama_unittests_models.sh` — it runs the same `devops/llama_unittests.sh`
+suite per model (27B `-ub 32`, DSV4F `-ub 128`, Flash-Next `-ub 32`), teeing
+each run to `.unittest-output-<model>.log` (gitignored; grep those instead of
+re-running). The suite is one server session; the active `check_*` blocks are
+commented in at the bottom of `llama_unittests.sh`.
 
-Each script's header explains what it does; only the expected numbers are
-recorded here, because those are what a regression changes:
-
-- `smoke_test`       : 4-way byte-identical check (no-kv prime/repeat vs
-                       kv-chain prime/restore) — the strongest oracle, runs first
-- `restore_restart`  : cached_tokens 0/352, 6/6 phrases
-- `no_kvchain`       : native in-memory reuse, cached_tokens >= 256
-- `restore_session`  : cached_tokens 0/352, 6/6 phrases, >=10 files of each type
-- `evict_rscache`    : still a full restore (tail rs intact)
-- `evict_kvcache`    : chain breaks at chunk 2 -> cached_tokens 64
-- `forked_chains`    : exactly 0/352/96/352 + rs-touch gap pattern
-- `ubatch_edge`      : 0/192, 0/256, 0/192 at -ub 64 (the 192s come from
-                       searching tokens[0, n-1) — the 256-token prompt's last
-                       token is never restored)
-- `dsv4f`            : NOT part of the runner (different model, same port/cache
-                       dir — never run concurrently with the Qwen tests)
-- `parallel_slot`    : `-np 2`, forced id_slot, prompt A killed mid-prefill,
-                       prompt B restores a full chunk prefix; asserts ON-GRID
-                       ubatch count == complete chunks prefilled. NOT part of
-                       the runner (kills a connection mid-flight)
-- `parallel_slot2`   : scratch -np 2 repro (decode-heavy A killed mid-gen while
-                       prefill-heavy B runs); NOT part of the runner
-- grid-safety guard  : `-b 96 -ub 32` -> FATAL + exit(1)
-
-Helper: `devops/llama_make_exact_prompt_len.sh <N>` converges a prompt to
-exactly N tokens (needs a running server; prints the prompt between `[` and `]`).
-
-Tests run with `--reasoning off --reasoning-budget 0` (llama_run.sh) and
-`temperature: 0` (llama_prompt.sh): reasoning models otherwise burn the whole
-n_ctx on thinking tokens; temperature=0 + a fixed seed keeps the fidelity
-checks deterministic.
+Each check's header explains what it does. the oracle: restore must be
+byte-identical to the no-restore prime, and cached_tokens must hit the
+expected multiple-of-ubs count. `check_verbatim` is the strongest (prime 0 ->
+restore, verbatim passage reply, model-agnostic expected cached count derived
+from the prime's actual prompt_tokens). the `hello`/`verbatim`/`coherence`
+checks exercise chat-model prompts via the chat endpoint (see the
+llama_prompt.sh quirk in section 5).
 
 **Qwen3-4B (pure full-attn, arch `qwen3`)**: the mechanics work, but the 4B is
 NON-DETERMINISTIC on a LONG generation when ANY prefix is restored (the
@@ -194,6 +181,32 @@ breaks the chain (like a missing .kvcache). NON-dsv4 archs: COMP_ONLY is an
 empty blob, so no .cmcache is written/read (gated on arch) — 2 files,
 byte-identical to the Qwen path. Versions were bumped once at the end
 (KV_CHAIN_VERSION 5->6, DSV4_STATE_VERSION 1->2, DSV4_K_CACHE_STATE_VER 2->3).
+
+## 4c. Qwen3.8-Flash-Next (qwen4exp) support
+
+Qwen3.8-Flash-Next (arch `qwen4exp`, `llama_memory_hybrid_idx`) is the third
+architecture. unlike Qwen3.8-27B (a clean full-attn + recurrent split) it adds
+a QSA (sparse-attention) INDEXER: a SEPARATE plain `llama_kv_cache` (mem_idx)
+that must track the main attention cache CELL FOR CELL (an assert in
+qwen4exp.cpp enforces `idx.n_kv == attn.n_kv`). the indexer's rows are the
+COMP_ONLY part; on every other arch COMP_ONLY is an empty blob.
+
+On-disk layout (same three-file scheme as dsv4, different contents):
+  - .kvcache = ATTN_ONLY = the main attn window [k*ubs,(k+1)*ubs), additive.
+  - .cmcache = COMP_ONLY = this chunk's QSA INDEXER rows, additive.
+  - .rscache = TAIL_ONLY = the recurrent tail.
+Restore of the idx (`.cmcache`) goes through `llama_kvchain_set_idx_window`
+(llama-context.cpp), NOT the generic set_data path: the idx is a separate cache
+that must land on the SAME cell indices the attn restore just wrote, so it
+adopts the attn's slot layout (sinfos_in) instead of running its own find_slot
+(which drifts under APPEND). the attn layout passed in is restricted to THIS
+chunk's window [pos_lo,pos_limit) — `kvchain_attn_sinfos` filters the attn
+cells by position — because the per-chunk idx restore holds exactly ubs cells,
+and feeding it the whole restored prefix made the mirrored-layout size check
+reject the restore ("mirrored slot layout holds 352 cells, this cache restores
+32") and discard the whole restore. the idx restore also needs the compute
+graph invalidated after each chunk (qwen4exp QSA sizes its windows from n_kv at
+graph-build time) — `llama_kvchain_invalidate_graph`.
 
 ## 5. Quirks / gotchas
 
@@ -276,5 +289,11 @@ byte-identical to the Qwen path. Versions were bumped once at the end
   newest timestamped log.
 - devops/llama_test.sh supports `[cmd:PATH]` directives (runs a bash script
   with $KV_CACHE_DIR in env) for filesystem mutations between prompts.
-- devops/llama_prompt.sh uses stream mode with `max_tokens: 512` cap to
-  prevent infinite generation loops in tests.
+- devops/llama_prompt.sh uses STREAM mode against `/v1/chat/completions`
+  (NOT `/v1/completions`) with a `max_tokens: 2048` cap. the chat endpoint is
+  REQUIRED: the tested models are chat models, and a bare prompt through the
+  raw-text completions endpoint degenerates into repetition (verified on
+  dsv4f: "'foo, 'foo, 'foo..." vs a clean answer via chat). deltas are read
+  from `choices[0].delta.content`; `stream_options.include_usage: true` is set
+  so the cached/prompt/response-token stats still reach stderr (the tests
+  parse them).

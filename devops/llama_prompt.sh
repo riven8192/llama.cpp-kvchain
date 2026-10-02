@@ -14,21 +14,30 @@ if [[ "${PROMPT}" == "-" || -z "${PROMPT}" ]]; then
   PROMPT="$(cat)"
 fi
 
+# the prompt goes through /v1/chat/completions (NOT /v1/completions): the
+# tested models are chat models, and a bare prompt through the raw-text
+# completions endpoint (no chat scaffolding) degenerates into repetition on
+# dsv4f ("', 'foo, 'foo, 'foo..."). the chat template fixes that.
+#
 # the SSE stream is parsed by python3 (native json lib), NOT by bash:
 # a streamed text delta like "red\n" must reach stdout byte-for-byte - any
 # bash string handling ($( ...), read, printf) risks mangling or stripping
-# the newlines. the python side:
+# the newlines. in the chat stream each delta lives in choices[0].delta.content
+# (not choices[0].text as in /v1/completions). the python side:
 #   - writes each text delta to stdout IMMEDIATELY (flush per chunk), so the
 #     stream stays live for long generations
 #   - writes the final usage line to STDERR, so it never interleaves with
 #     the (newline-free-at-the-end) streamed text on stdout
+#   - usage only arrives on the final chunk, so ask for it explicitly via
+#     stream_options.include_usage (llama.cpp omits usage in stream mode
+#     otherwise, and the cached_tokens stat depends on it)
 # temperature=0 + a fixed seed in the body: deterministic output so the
 # restore-fidelity tests (byte-identical-vs-prefill) are not flaked by
 # sampling. temp=0 alone is NOT deterministic on some backends/samplers -
 # the seed pins the RNG.
-curl -s -N -X POST "${LLAMA_URL}/v1/completions" \
+curl -s -N -X POST "${LLAMA_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
-  -d "$(jq -n --arg p "${PROMPT}" '{prompt: $p, cache_prompt: true, stream: true, max_tokens: 2048, temperature: 0, seed: 42}')" \
+  -d "$(jq -n --arg p "${PROMPT}" '{messages: [{role: "user", content: $p}], cache_prompt: true, stream: true, stream_options: {include_usage: true}, max_tokens: 2048, temperature: 0, seed: 42}')" \
 | python3 -c '
 import json, sys
 
@@ -46,7 +55,8 @@ for line in sys.stdin:
     except json.JSONDecodeError:
         continue
     choice = (chunk.get("choices") or [{}])[0]
-    text = choice.get("text")
+    delta = choice.get("delta") or {}
+    text = delta.get("content")
     if text:
         count += 1
         sys.stdout.write(text)
