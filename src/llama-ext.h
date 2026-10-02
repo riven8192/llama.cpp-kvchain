@@ -7,7 +7,23 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <map>
+
+// kv-chain: return true when the verbose diagnostics are enabled (KVCHAIN_VERBOSE=1).
+// OFF by default, so the normal prefill/restore path pays no diagnostic I/O and no
+// per-layer KVCHAINDBG logging. the /tmp/rt-* and idx-K tensor dumps are the
+// expensive part (a GPU sync + tensor_get per call); gating them and the log noise
+// behind this one env var keeps production clean while leaving the tooling available
+// when a new architecture needs to be debugged. read once (cached) because the
+// state-write/read paths call it in per-layer loops.
+inline bool llama_kvchain_diag_verbose() {
+    static const bool on = [] {
+        const char * e = std::getenv("KVCHAIN_VERBOSE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -89,6 +105,31 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// kv-chain diagnostics: log the attn vs QSA-indexer cache head/used/size for a
+// seq, so a cell-for-cell drift after a restore is visible (qwen4exp). no-op if
+// the model has no hybrid_idx memory.
+LLAMA_API void llama_kvchain_dbg_log(const struct llama_context * ctx, int32_t seq_id);
+
+// kv-chain: restore the QSA-indexer (COMP_ONLY) blob for seq_id, placing its cells
+// in the SAME indices the attention cache currently holds (instead of running its
+// own find_slot, which drifts under APPEND). the blob is a COMP_ONLY seq-state
+// window blob, same shape as the one fed to llama_state_seq_set_data_window_ext.
+// append: when true, do not clear the seq's idx cells first (chunks 1..N). returns
+// the number of bytes read, 0 on failure (or if the model has no indexer).
+LLAMA_API size_t llama_kvchain_set_idx_window(const struct llama_context * ctx,
+        const uint8_t * src, size_t size, int32_t seq_id,
+        llama_state_seq_flags flags, int32_t pos_lo, int32_t pos_limit, bool append);
+
+// kv-chain: invalidate the cached compute graph after an out-of-band state
+// restore that bypasses the state_seq_set_data path (the QSA idx restore). the
+// next decode must rebuild the graph, or it sizes its windows (qwen4exp QSA)
+// from a stale n_kv.
+LLAMA_API void llama_kvchain_invalidate_graph(const struct llama_context * ctx);
+
+// kv-chain: synchronize the backend so device tensors are readable on host.
+// needed by the idx-key fingerprint diagnostic (log_kvchain_dbg).
+LLAMA_API void llama_kvchain_sync(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0

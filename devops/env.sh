@@ -19,7 +19,8 @@ fi
 # when picking a model, only change the comment '#' to enable/disable -- leave all models in place, for future switching
 # : "${LLAMA_HF_REF:=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_XXS}"
 # : "${LLAMA_HF_REF:=unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ1_S}"
-: "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
+: "${LLAMA_HF_REF:=unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL}"
+# : "${LLAMA_HF_REF:=unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL}"
 # : "${LLAMA_HF_REF:=unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q8_K_XL}"
 # : "${LLAMA_HF_REF:=unsloth/Qwen3-4B-Instruct-2507-GGUF}"
 
@@ -30,6 +31,8 @@ fi
 : "${LLAMA_NGL:=999}"
 : "${LLAMA_THREADS:=16}"
 : "${LLAMA_PARALLEL:=1}"
+: "${LLAMA_BATCH:=256}"
+: "${LLAMA_UBATCH:=256}"
 
 : "${KV_CACHE_DIR:=${LLAMA_ROOT}/devops/.kv-cache}"
 : "${KV_CHAIN_LIMIT_GB:=100}"

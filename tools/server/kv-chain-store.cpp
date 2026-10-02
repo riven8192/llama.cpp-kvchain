@@ -22,13 +22,27 @@ static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
 // read (version check) and the root hash changes, so old chunks are a clean miss.
 // v6: the DSV4 comp K caches moved out of the .rscache (now rings-only) into a
 // per-chunk .cmcache file; old (comp-carrying) dsv4 chunks are a clean miss.
-static constexpr uint32_t KV_CHAIN_VERSION = 6;
+// v7: qwen4exp (Qwen3.8-Flash-Next) joins the three-file layout: its QSA indexer
+// (a per-token cache, llama_memory_hybrid_idx::mem_idx) moves out of the ATTN_ONLY
+// blob into the per-chunk .cmcache (per-token rows, identity window). old qwen4exp
+// chunks (idx carried in .kvcache) are a clean miss.
+static constexpr uint32_t KV_CHAIN_VERSION = 7;
 
-// true when the model has compressed K caches (arch deepseek4): then each chunk
-// gets a third, .cmcache, file holding the chunk's comp rows (COMP_ONLY blob).
-// non-dsv4 archs stay at two files and their restore is byte-identical to v5.
+// true when the model has a per-token "comp" cache that is neither the main
+// attention KV nor the recurrent tail, so it needs its own additive per-chunk
+// .cmcache file:
+//   - deepseek4 (DSV4F): the three compressed K caches (kv_csa/kv_hca/kv_lid),
+//     prefix-style (row i covers tokens [i*ratio, (i+1)*ratio)).
+//   - qwen4exp (Qwen3.8-Flash-Next): the QSA sparse-attention indexer (a plain
+//     per-token llama_kv_cache, row i = token i; the "blocks" are a runtime
+//     pooling, not a storage ratio).
+// every other arch has no such cache: two files, byte-identical to v6.
 static bool kv_chain_has_comp(const llama_model * model) {
-    return model != nullptr && std::string(llama_model_arch_name(model)) == "deepseek4";
+    if (model == nullptr) {
+        return false;
+    }
+    const std::string arch = llama_model_arch_name(model);
+    return arch == "deepseek4" || arch == "qwen4exp";
 }
 
 kv_chain_store::kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t ubatch_size,
@@ -234,6 +248,7 @@ void kv_chain_store::compute_root_hash(const common_params & params, const llama
 static std::vector<uint8_t> dump_window(llama_context * ctx, llama_seq_id seq_id,
                                         llama_pos pos_lo, llama_pos pos_hi, llama_state_seq_flags flags) {
     const size_t size = llama_state_seq_get_size_window_ext(ctx, seq_id, flags, pos_lo, pos_hi);
+    SRV_INF("kv-chain[storage]: dump_window flags=0x%x pos=[%d,%d) size=%zu\n", (unsigned) flags, (int) pos_lo, (int) pos_hi, size);
     if (size == 0) {
         return {};
     }
@@ -267,6 +282,78 @@ static std::vector<uint8_t> dump_tail(llama_context * ctx, llama_seq_id seq_id) 
         return {};
     }
     return blob;
+}
+
+// removes any /tmp file whose name starts with "<prefix>.": the per-chunk dumps
+// write one file per chunk (e.g. /tmp/rt-save.kvcache.0 .. .rscache.10) and a
+// stale file from a previous run (different chunk count, or an old .cmcache when
+// the model no longer has a comp part) would otherwise be mistaken for the
+// current one. /tmp is shared, but the prefixes (/tmp/rt-save, /tmp/rt-restore)
+// are unique to this feature, so prefix-matching is safe.
+void kv_chain_store::clear_diagnostic_dump(const char * prefix) {
+    std::error_code ec;
+    const std::string dot(std::string(prefix) + ".");
+    for (const auto & e : fs::directory_iterator("/tmp", ec)) {
+        if (!e.is_regular_file()) {
+            continue;
+        }
+        if (e.path().filename().string().rfind(dot, 0) == 0) {
+            fs::remove(e.path(), ec);
+        }
+    }
+}
+
+// writes a raw blob to path (truncating), logging the result.
+static void write_diagnostic_blob(const char * path, const std::vector<uint8_t> & blob, const char * tag) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (f) {
+        f.write(reinterpret_cast<const char *>(blob.data()), (std::streamsize) blob.size());
+        SRV_INF("kv-chain[diag]: %s %zu bytes -> %s\n", tag, blob.size(), path);
+    } else {
+        SRV_ERR("kv-chain[diag]: failed to open %s for writing\n", path);
+    }
+}
+
+// round-trip diagnostic: dump chunk k's POSITION-ANCHORED per-token blobs from
+// the LIVE VRAM state:
+//   <prefix>.kvcache.<k>  ATTN_ONLY window [k*ubs,(k+1)*ubs)
+//   <prefix>.cmcache.<k>  COMP_ONLY window (only when has_comp)
+// these depend only on the window [k*ubs,(k+1)*ubs), so the save side's window k
+// (a no-restore run, at chunk k's boundary) is byte-comparable against the
+// restore side's window k (re-dumped after the disk load). N chunks -> N kvcache
+// files, all verifiable. call clear_diagnostic_dump(out_prefix) once first.
+void kv_chain_store::dump_live_chunk_window(llama_context * ctx, llama_seq_id seq_id, size_t k,
+                                            const char * out_prefix) {
+    const size_t ubs = (size_t) ubatch_size_;
+    const llama_pos pos_lo    = (llama_pos) (k * ubs);
+    const llama_pos pos_hi    = (llama_pos) ((k + 1) * ubs);
+    const std::string p(out_prefix);
+
+    const std::vector<uint8_t> attn = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY);
+    write_diagnostic_blob((p + ".kvcache." + std::to_string(k)).c_str(), attn,
+                          string_format("dump_live_chunk_window %zu attn", k).c_str());
+    if (has_comp_) {
+        const std::vector<uint8_t> comp = dump_window(ctx, seq_id, pos_lo, pos_hi, LLAMA_STATE_SEQ_FLAGS_COMP_ONLY);
+        write_diagnostic_blob((p + ".cmcache." + std::to_string(k)).c_str(), comp,
+                              string_format("dump_live_chunk_window %zu comp", k).c_str());
+    }
+}
+
+// round-trip diagnostic: dump the live TAIL_ONLY recurrent state (the ROLLING
+// object, as of the CURRENT prefill boundary) to <prefix>.rscache.<k>. the
+// recurrent tail's bytes depend on the BOUNDARY it is captured at, so a file is
+// only comparable against another captured at the SAME boundary: on the save
+// (no-restore) side, chunk k's dump is the state as of chunk k's boundary
+// (== the on-disk .rscache written for chunk k); on the restore side the live
+// state is the tail, so only the LAST chunk's rscache is verifiable. N chunks ->
+// N rscache files, only the last verifiable. call clear_diagnostic_dump(out_prefix)
+// once first.
+void kv_chain_store::dump_live_recurrent(llama_context * ctx, llama_seq_id seq_id, size_t k,
+                                         const char * out_prefix) {
+    const std::string p(out_prefix);
+    const std::vector<uint8_t> recr = dump_tail(ctx, seq_id);
+    write_diagnostic_blob((p + ".rscache." + std::to_string(k)).c_str(), recr,
+                          string_format("dump_live_recurrent %zu recr", k).c_str());
 }
 
 // save one chunk covering the window [pos_lo, pos_hi): the .kvcache file gets

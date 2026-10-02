@@ -85,6 +85,36 @@ public:
     bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob,
                          const llama_tokens & expected_tokens) const;
 
+    // round-trip diagnostic: remove all /tmp files named "<prefix>.*". call ONCE
+    // at the start of a dump session (the save side at its first boundary, the
+    // restore side before its per-chunk loop) so stale files from a previous run
+    // (different chunk count, or an old .cmcache when the model has no comp part)
+    // are gone before the fresh per-chunk files are written.
+    void clear_diagnostic_dump(const char * prefix);
+
+    // round-trip diagnostic: dump chunk k's POSITION-ANCHORED per-token blobs
+    // from the LIVE VRAM state to:
+    //   <prefix>.kvcache.<k>  ATTN_ONLY window [k*ubs,(k+1)*ubs)
+    //   <prefix>.cmcache.<k>  COMP_ONLY window (only when has_comp)
+    // these depend only on the window [k*ubs,(k+1)*ubs): the save side's window k
+    // (a no-restore run, at chunk k's boundary) is byte-comparable against the
+    // restore side's window k (re-dumped after the disk load). call
+    // clear_diagnostic_dump(prefix) once first. N chunks -> N kvcache files, all
+    // verifiable.
+    void dump_live_chunk_window(llama_context * ctx, llama_seq_id seq_id, size_t k,
+                                const char * out_prefix);
+
+    // round-trip diagnostic: dump the live TAIL_ONLY recurrent state (the ROLLING
+    // object, as of the CURRENT prefill boundary) to <prefix>.rscache.<k>. the
+    // recurrent tail's bytes depend on the BOUNDARY captured, so a file is only
+    // comparable against another captured at the SAME boundary: on the save
+    // (no-restore) side chunk k's dump is the state as of chunk k's boundary; on
+    // the restore side the live state is the tail, so ONLY the LAST chunk's
+    // rscache is verifiable. call clear_diagnostic_dump(prefix) once first. N
+    // chunks -> N rscache files, only the last verifiable.
+    void dump_live_recurrent(llama_context * ctx, llama_seq_id seq_id, size_t k,
+                             const char * out_prefix);
+
     size_t total_bytes() const { return total_bytes_cur; }
     bool   enabled() const { return !root_dir.empty(); }
     int32_t ubatch_size() const { return ubatch_size_; }

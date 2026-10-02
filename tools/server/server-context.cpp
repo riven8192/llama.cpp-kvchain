@@ -13,6 +13,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "../../src/llama-ext.h" // llama_model_arch_name (kv-chain dsv4 ubatch guard)
+#include "../../src/llama-memory-hybrid-idx.h" // kv-chain idx K dump (qwen4exp)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -1045,6 +1046,44 @@ private:
         kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
                        chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // parent: logging only
         slot.kv_chain_last_saved_pos = pos;
+
+        // round-trip reference (no-restore run): at EVERY on-grid boundary the live
+        // state is exactly "as of chunk_n's boundary", so dump chunk_n's
+        // position-anchored window (.kvcache.N / .cmcache.N) AND the live recurrent
+        // tail as of this boundary (.rscache.N). N chunks -> N kvcache files (all
+        // verifiable) + N rscache files (only the last one is comparable to the
+        // restore side, which sits at the tail). a later restore run re-dumps the
+        // same set and they are byte-compared (identical = lossless disk load).
+        // the stale-file wipe happens once, at the first boundary (chunk 0).
+        // gated on KVCHAIN_VERBOSE: each dump does a GPU sync + tensor_get, so it
+        // must not run on the normal save path.
+        if (llama_kvchain_diag_verbose() && !slot.kv_chain_restored) {
+            if (chunk_n == 0) {
+                kv_chain->clear_diagnostic_dump("/tmp/rt-save");
+            }
+            kv_chain->dump_live_chunk_window(slot.ctx_tgt, slot.id, chunk_n, "/tmp/rt-save");
+            kv_chain->dump_live_recurrent(slot.ctx_tgt, slot.id, chunk_n, "/tmp/rt-save");
+        }
+
+        // diagnose the qwen4exp idx K data: log the idx K fingerprint (cell 0 + the
+        // last non-empty cell) after every on-grid prefill boundary, so a NO-RESTORE
+        // run (coherence-a) emits the fingerprint at pos = n_saved (2624) to compare
+        // byte-for-byte against the RESTORED run's post-restore fingerprint (the
+        // idx-k-fp line in log_kvchain_dbg). same prompt -> same idx K values.
+        // dump the idx K raw bytes (cells 0..pos) at a no-restore run so it can be
+        // cmp'd offline against the RESTORED run's dump (/tmp/idx-restore.bin).
+        // only a no-restore run reaches here (a restored slot has kv_chain_restored
+        // set and its prefill pos is far past ubs, so it never hits a save boundary).
+        // gated on KVCHAIN_VERBOSE (the dump does a backend sync + tensor_get).
+        if (llama_kvchain_diag_verbose() &&
+            model_tgt != nullptr &&
+            std::string(llama_model_arch_name(model_tgt)) == "qwen4exp" &&
+            !slot.kv_chain_restored) {
+            auto * mem = llama_get_memory(ctx_tgt);
+            if (auto * hyb = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+                hyb->dump_idx_k(ctx_tgt, slot.id, "/tmp/idx-save.bin", (uint32_t) pos);
+            }
+        }
     }
 
     server_metrics metrics;
@@ -3866,7 +3905,20 @@ private:
                             // get_text_tokens() (not get_tokens()): the latter
                             // asserts !has_mtmd
                             const llama_tokens text_tokens = input_tokens.get_text_tokens();
-                            const std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
+                            std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
+                            // diagnostic: cap the restore to the first N chunks (env
+                            // KVCHAIN_RESTORE_MAX_CHUNKS) to binary-search which chunk
+                            // range corrupts the re-prefill. the tail rs of the CAPPED
+                            // chain is used (its recurrent state is valid at that
+                            // shorter boundary), so the restore stays self-consistent.
+                            if (const char * cap_env = getenv("KVCHAIN_RESTORE_MAX_CHUNKS")) {
+                                const size_t cap = (size_t) std::atol(cap_env);
+                                if (cap > 0 && chunks.size() > cap) {
+                                    chunks.resize(cap);
+                                    n_saved = cap * (size_t) kv_chain->ubatch_size();
+                                    SLT_INF(slot, "kv-chain[restore]: CAPPED restore to %zu chunks (n_saved=%zu) via env\n", chunks.size(), n_saved);
+                                }
+                            }
                             SLT_INF(slot, "kv-chain[restore]: load_prefix -> %zu chunks, n_saved=%zu (input_n=%zu)\n",
                                     chunks.size(), n_saved, input_tokens.size());
                             if (!chunks.empty() && n_saved > 0) {
@@ -3931,6 +3983,14 @@ private:
                                 // rest APPEND). this rebuilds the prefix's completed comp
                                 // rows that the attention over the restored prefix needs.
                                 if (ok && kv_chain->has_comp()) {
+                                    // the qwen4exp QSA indexer is a SEPARATE cache that must track
+                                    // the attention cache cell-for-cell, so its restore must adopt the
+                                    // attn's slot layout (llama_kvchain_set_idx_window). dsv4's comp K
+                                    // caches live inside the dsv4 cache itself, so the plain
+                                    // set_data_window_ext is correct there.
+                                    const bool idx_mirrors_attn =
+                                            model_tgt != nullptr &&
+                                            std::string(llama_model_arch_name(model_tgt)) == "qwen4exp";
                                     for (size_t k = 0; k < chunks.size() && ok; ++k) {
                                         const llama_pos pos_lo = (llama_pos) (k * ubs);
                                         const llama_pos pos_hi = (llama_pos) ((k + 1) * ubs);
@@ -3941,15 +4001,27 @@ private:
                                             break;
                                         }
                                         n_bytes_read += cm_blob.size();
+                                        const bool append = (k != 0);
                                         const llama_state_seq_flags cm_flags =
-                                                (k == 0) ? LLAMA_STATE_SEQ_FLAGS_COMP_ONLY
-                                                         : (LLAMA_STATE_SEQ_FLAGS_COMP_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
-                                        const size_t n_cm = llama_state_seq_set_data_window_ext(ctx_tgt,
-                                                cm_blob.data(), cm_blob.size(), slot.id,
-                                                cm_flags, pos_lo, pos_hi);
-                                        SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
-                                                k, (k == 0) ? "" : "|APPEND", (int) pos_lo, (int) pos_hi,
-                                                cm_blob.size(), n_cm);
+                                                append ? (LLAMA_STATE_SEQ_FLAGS_COMP_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND)
+                                                       : LLAMA_STATE_SEQ_FLAGS_COMP_ONLY;
+                                         // the idx restore only touches the idx cache (the generic
+                                         // windowed path would re-read the whole hybrid blob), so it
+                                         // does not invalidate the graph result itself - do it here,
+                                         // once per chunk: the next decode must rebuild the graph,
+                                         // or it sizes its windows (qwen4exp QSA) from a stale n_kv.
+                                         const size_t n_cm = idx_mirrors_attn
+                                                 ? llama_kvchain_set_idx_window(ctx_tgt, cm_blob.data(), cm_blob.size(),
+                                                         slot.id, cm_flags, pos_lo, pos_hi, append)
+                                                 : llama_state_seq_set_data_window_ext(ctx_tgt,
+                                                         cm_blob.data(), cm_blob.size(), slot.id,
+                                                         cm_flags, pos_lo, pos_hi);
+                                         if (idx_mirrors_attn) {
+                                             llama_kvchain_invalidate_graph(ctx_tgt);
+                                         }
+                                        SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                                k, (k == 0) ? "" : "|APPEND", idx_mirrors_attn ? "|idx-attn" : "",
+                                                (int) pos_lo, (int) pos_hi, cm_blob.size(), n_cm);
                                         cm_blob.clear();
                                         cm_blob.shrink_to_fit();
                                         if (n_cm == 0) {
@@ -3970,29 +4042,29 @@ private:
                                 // load the recurrent tail from the TAIL chunk's .rscache
                                 // (validated up front by load_prefix). TAIL_ONLY, the same
                                 // flag the blob was dumped with.
-                                if (ok && !chunks.empty()) {
-                                    std::vector<uint8_t> tail_recr;
-                                    const kv_chain_chunk & tail_chunk = chunks.back();
-                                    if (!tail_chunk.recr_file.empty()) {
-                                        if (!kv_chain->read_chunk_file(tail_chunk.recr_file, tail_recr, tail_chunk.tokens)) {
-                                            SLT_WRN(slot, "%s", "kv-chain[storage]: tail rs re-read failed at tail chunk, discarding restore");
-                                            ok = false;
-                                        } else {
-                                            n_bytes_read += tail_recr.size();
-                                            const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
-                                                    tail_recr.data(), tail_recr.size(), slot.id,
-                                                    LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
-                                            SLT_DBG(slot, "kv-chain[restore]: tail set_data(TAIL_ONLY) blob=%zu -> %zu bytes (this is the dsv4 rings-only / qwen recr blob)\n",
-                                                    tail_recr.size(), n_recr);
-                                            tail_recr.clear();
-                                            tail_recr.shrink_to_fit();
-                                            if (n_recr == 0) {
-                                                SLT_WRN(slot, "%s", "kv-chain[storage]: recr restore failed at tail chunk");
-                                                ok = false;
-                                            }
-                                        }
-                                    }
-                                }
+                                 if (ok && !chunks.empty()) {
+                                     std::vector<uint8_t> tail_recr;
+                                     const kv_chain_chunk & tail_chunk = chunks.back();
+                                     if (!tail_chunk.recr_file.empty()) {
+                                         if (!kv_chain->read_chunk_file(tail_chunk.recr_file, tail_recr, tail_chunk.tokens)) {
+                                             SLT_WRN(slot, "%s", "kv-chain[storage]: tail rs re-read failed at tail chunk, discarding restore");
+                                             ok = false;
+                                          } else {
+                                              n_bytes_read += tail_recr.size();
+                                              const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
+                                                      tail_recr.data(), tail_recr.size(), slot.id,
+                                                      LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
+                                              SLT_DBG(slot, "kv-chain[restore]: tail set_data(TAIL_ONLY) blob=%zu -> %zu bytes (this is the dsv4 rings-only / qwen recr blob)\n",
+                                                      tail_recr.size(), n_recr);
+                                              if (n_recr == 0) {
+                                                  SLT_WRN(slot, "%s", "kv-chain[storage]: recr restore failed at tail chunk");
+                                                  ok = false;
+                                              }
+                                              tail_recr.clear();
+                                              tail_recr.shrink_to_fit();
+                                          }
+                                     }
+                                 }
                                 if (ok) {
                                     for (size_t i = 0; i < n_saved && i < input_tokens.size(); ++i) {
                                         slot.prompt.tokens.push_back(input_tokens[i]);
@@ -4003,7 +4075,38 @@ private:
                                     // searches tokens[0, n-1)) -> something is left to prefill.
                                     const size_t n_left = input_tokens.size() - (size_t) n_past;
                                     GGML_ASSERT(n_left > 0);
-                                    const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
+                                     const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
+                                     // diagnose the idx/attn cell-for-cell drift + re-dump the live
+                                     // state for an offline cmp against the no-restore run's /tmp/rt-save.
+                                     // gated on KVCHAIN_VERBOSE: each dump does a GPU sync + tensor_get.
+                                     if (llama_kvchain_diag_verbose()) {
+                                        // the per-cache seq_pos_max + the memory type show whether the QSA
+                                        // indexer (mem_idx) ended up at a different position than the main
+                                        // attn cache after a restore.
+                                        const int attn_pmax = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                        SRV_INF("kv-chain[restore]: post-restore attn seq_pos_max=%d (slot %d)\n", attn_pmax, slot.id);
+                                        llama_kvchain_dbg_log(ctx_tgt, slot.id);
+                                        // round-trip reference: after the disk load + tail rs load the
+                                        // live state is the full prefix "as of the tail", so re-dump
+                                        // EVERY chunk's position-anchored window (.kvcache.k /
+                                        // .cmcache.k) and the live recurrent state (.rscache.k).
+                                        // cmp against /tmp/rt-save (the no-restore prefill+save of the
+                                        // same chunks): each .kvcache.k / .cmcache.k is verifiable,
+                                        // and .rscache.<last> (the tail) is verifiable against rt-save's
+                                        // .rscache.<last> (same boundary). NOTE: on this side the live
+                                        // recurrent state is ONE rolling object (the tail), so every
+                                        // .rscache.k holds the tail content - only .rscache.<last> is a
+                                        // meaningful compare (the earlier ones are not the as-of-k state,
+                                        // which the restore never computed). this mirrors the N-file
+                                        // on-disk layout so both sides produce N kvcache + N rscache.
+                                        if (!chunks.empty()) {
+                                            kv_chain->clear_diagnostic_dump("/tmp/rt-restore");
+                                            for (size_t k = 0; k < chunks.size(); ++k) {
+                                                kv_chain->dump_live_chunk_window(ctx_tgt, slot.id, k, "/tmp/rt-restore");
+                                                kv_chain->dump_live_recurrent(ctx_tgt, slot.id, k, "/tmp/rt-restore");
+                                            }
+                                        }
+                                     }
                                     SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill "
                                             "(read %.2f GiB in %.2f s = %.2f GiB/s)\n",
                                             n_past, n_replayed, n_left,

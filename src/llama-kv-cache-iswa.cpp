@@ -265,13 +265,13 @@ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id
     kv_swa->state_write(io, seq_id, flags, pos_lo, pos_limit);
 }
 
-void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     const bool read_base = (flags & LLAMA_STATE_SEQ_FLAGS_FULL_ONLY) || (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
     if (read_base) {
-        kv_base->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        kv_base->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
 
-    kv_swa->state_read(io, seq_id, flags, pos_lo, pos_limit);
+    kv_swa->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
 }
 
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {

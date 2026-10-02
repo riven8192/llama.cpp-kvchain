@@ -854,10 +854,11 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     state_write_data(io, cell_ranges_data);
 }
 
-void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     GGML_UNUSED(flags);
     GGML_UNUSED(pos_lo);
     GGML_UNUSED(pos_limit); // the blob already contains only cells in [pos_lo, pos_limit)
+    GGML_UNUSED(sinfos_in); // the recurrent state has no per-token cells to mirror
 
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));

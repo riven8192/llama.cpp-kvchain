@@ -205,16 +205,16 @@ void llama_memory_hybrid_iswa::state_write(llama_io_write_i & io, llama_seq_id s
     }
 }
 
-void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_memory_hybrid_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     // mirror of state_write: on this hybrid ATTN_ONLY == FULL_ONLY and
     // TAIL_ONLY == PARTIAL_ONLY (the recurrent part is a separate mem_recr).
     const bool read_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
     const bool read_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (read_attn) {
-        mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
     if (read_recr) {
-        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
 }
 

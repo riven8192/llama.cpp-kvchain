@@ -1844,8 +1844,9 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
 }
 
-void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     GGML_UNUSED(pos_lo);
+    GGML_UNUSED(sinfos_in); // dsv4 has no mirrored per-token cache to adopt a layout from
     uint32_t magic;
     uint32_t version;
     uint32_t mode = DSV4_STATE_MODE_FULL;

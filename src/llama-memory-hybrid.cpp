@@ -1,5 +1,6 @@
 #include "llama-memory-hybrid.h"
 
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-context.h"
@@ -192,6 +193,10 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
     // select mem_attn alone and PARTIAL_ONLY/TAIL_ONLY select mem_recr alone.
     const bool write_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
     const bool write_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid::state_write flags=0x%x pos=[%d,%d) write_attn=%d write_recr=%d\n",
+                (unsigned) flags, (int) pos_lo, (int) pos_limit, (int) write_attn, (int) write_recr);
+    }
     if (write_attn) {
         mem_attn->state_write(io, seq_id, flags, pos_lo, pos_limit);
     }
@@ -200,16 +205,20 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
     }
 }
 
-void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     // mirror of state_write: on this hybrid ATTN_ONLY == FULL_ONLY and
     // TAIL_ONLY == PARTIAL_ONLY (the recurrent part is a separate mem_recr).
     const bool read_attn = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
     const bool read_recr = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid::state_read flags=0x%x pos=[%d,%d) read_attn=%d read_recr=%d\n",
+                (unsigned) flags, (int) pos_lo, (int) pos_limit, (int) read_attn, (int) read_recr);
+    }
     if (read_attn) {
-        mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
     if (read_recr) {
-        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
 }
 

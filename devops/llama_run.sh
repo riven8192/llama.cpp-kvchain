@@ -56,6 +56,8 @@ ARGS=(
   -ngl "${LLAMA_NGL}"
   -t "${LLAMA_THREADS}"
   --parallel "${LLAMA_PARALLEL}"
+  -b "${LLAMA_BATCH}"
+  -ub "${LLAMA_UBATCH}"
   # kill reasoning/thinking mode + zero its budget: reasoning models (e.g.
   # Qwen3-4B) otherwise spend the whole n_ctx on thinking tokens, get capped
   # mid-reasoning, and never emit the answer - tests then fail on a ctx issue,
@@ -84,10 +86,11 @@ else
 fi
 
 echo "starting llama-server on ${LLAMA_URL}"
-echo "  model : ${LLAMA_HF_REF}"
-echo "  cache : ${CACHE_DESC}"
-echo "  log   : ${LLAMA_LOG}"
-echo "  exec  : [${LLAMA_SERVER_BIN} ${ARGS[@]}]"
+echo "  model  : ${LLAMA_HF_REF}"
+echo "  cache  : ${CACHE_DESC}"
+echo "  ubatch : ${LLAMA_UBATCH}"
+echo "  log    : ${LLAMA_LOG}"
+echo "  exec   : [${LLAMA_SERVER_BIN} ${ARGS[@]}]"
 
 # fully detach so the launcher shell does not wait on the server.
 # IMPORTANT: the server's stdout/stderr must go to LOG FILES ONLY. if it inherited
@@ -103,6 +106,8 @@ log_ts="$(date +%Y%m%d-%H%M%S)"
 : >"${LLAMA_PIDFILE}"
 : >"${LLAMA_LOG}.${log_ts}.log"
 ln -sf "${LLAMA_LOG}.${log_ts}.log" "${LLAMA_LOG}"
+
+echo "llama-server exec timestamp: $(ls -1l "${LLAMA_SERVER_BIN}")" | tee "${LLAMA_LOG}"
 
 setsid bash -c '
   pidfile=$1; tslog=$2; shift 2

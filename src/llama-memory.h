@@ -124,8 +124,14 @@ struct llama_memory_i {
 
     // pos_lo/pos_limit: only (de)serialize cells with pos_lo <= pos < pos_limit (0 / INT32_MAX = all)
     // LLAMA_STATE_SEQ_FLAGS_APPEND: on read, do not clear the dest seq's cells first (append mode)
+    // sinfos_in (kv-chain, default nullptr): a slot layout a mirrored cache must adopt
+    // instead of finding cells of its own, so it lands on the same cell indices as the
+    // cache it mirrors (the qwen4exp QSA indexer must track the attention cache cell
+    // for cell). it is a const llama_kv_cache::slot_info_vec_t *; the base declares it
+    // as void * to avoid including llama-kv-cache.h here.
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX) const = 0;
-    virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX) = 0;
+    virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX,
+                             const void * sinfos_in = nullptr) = 0;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

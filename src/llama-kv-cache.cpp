@@ -1206,6 +1206,20 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::get_head(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+    return v_heads[seq_to_stream[seq_id]];
+}
+
+uint32_t llama_kv_cache::get_used(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+    return v_cells[seq_to_stream[seq_id]].get_used();
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1257,7 +1271,26 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        // a kv-chain restore places the seq's cells at the positions the prefix had,
+        // which can run far past the cell COUNT (the QSA indexer keeps only some of the
+        // tokens' cells). the window must cover the max position, not just the extent,
+        // or the graph (qwen4exp QSA) asserts on the restored cells. during a normal
+        // prefill pos_max ~= used_max_p1, so this only grows the window after a restore.
+        // the stream's seq: with the kv_unified layout it is the stream index itself
+        const uint32_t seq_of_strm = (size_t) sinfo.strm[s] < seq_to_stream.size()
+            ? seq_to_stream[sinfo.strm[s]]
+            : sinfo.strm[s];
+        const uint32_t pos_max = (uint32_t) std::max<int64_t>(0, cells.seq_pos_max(seq_of_strm) + 1);
+        const uint32_t extent  = std::max(cells.used_max_p1(), pos_max);
+
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(extent, n_pad_cur))), result);
+
+        // kv-chain diagnostics: why does the graph see a stale window? dump the
+        // per-stream occupancy this result is computed from
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG get_n_kv: strm=%u used_max_p1=%u pos_max=%u get_used=%u size=%u -> result=%u\n",
+                    sinfo.strm[s], cells.used_max_p1(), pos_max, cells.get_used(), (uint32_t) cells.size(), result);
+        }
     }
 
     return result;
@@ -2066,10 +2099,18 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     io.write(&n_stream, sizeof(n_stream));
 
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG state_write(kv) flags=0x%x pos=[%d,%d) n_stream=%u n_layer(layers)=%zu recr_or_comp_only=%d other=%d\n",
+                (unsigned) flags, (int) pos_lo, (int) pos_limit, n_stream, layers.size(), (int) recr_or_comp_only, (int) (other != nullptr));
+    }
+
     if (recr_or_comp_only) {
         const uint32_t cell_count_empty = 0;
         for (uint32_t s = 0; s < n_stream; ++s) {
             io.write(&cell_count_empty, sizeof(cell_count_empty));
+        }
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG state_write(kv) EMPTY (recr/comp only) n_stream=%u\n", n_stream);
         }
         return;
     }
@@ -2125,6 +2166,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         GGML_ASSERT(cell_count == cell_count_check);
 
         io.write(&cell_count, sizeof(cell_count));
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG state_write(kv) stream=%u cell_count=%u\n", s, cell_count);
+        }
 
         // skip empty streams
         if (cell_count == 0) {
@@ -2136,9 +2180,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 }
 
-void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     // the kv-chain restore passes APPEND for chunks after the first (so earlier
     // chunks' cells are not wiped). it is carried in the flags, not a separate arg.
+    // sinfos_in (a const slot_info_vec_t *) is the layout a mirrored cache adopts;
+    // a plain llama_kv_cache restore always finds its own cells, so it is unused here.
+    GGML_UNUSED(sinfos_in);
     const bool append = (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) != 0;
     state_read_sinfo(io, seq_id, flags, pos_lo, pos_limit, nullptr, nullptr, append);
 }
@@ -2172,8 +2219,16 @@ const slot_info_vec_t *   sinfos_in,
         throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
     }
 
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG state_read_sinfo(kv) flags=0x%x pos=[%d,%d) n_stream=%u n_layer(layers)=%zu sinfos_in=%d sinfos_out=%d append=%d other=%d\n",
+                (unsigned) flags, (int) pos_lo, (int) pos_limit, n_stream, layers.size(), (int) (sinfos_in != nullptr), (int) (sinfos_out != nullptr), (int) append, (int) (other != nullptr));
+    }
+
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG state_read_sinfo(kv) read n_stream_cur=%u (expect %u)\n", n_stream_cur, n_stream);
+    }
     if (n_stream_cur != n_stream) {
         throw std::runtime_error("n_stream mismatch");
     }
@@ -2289,6 +2344,10 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             const size_t buf_size = range_size * k_size_row;
             io.write_tensor(k, range.first * k_size_row, buf_size);
         }
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG state_write_data(kv) K layer=%u k_type=%d k_row=%zu n_ranges=%zu\n",
+                    il, k_type_i, k_size_row, cr.data.size());
+        }
     }
 
     if (!v_trans) {
@@ -2316,6 +2375,13 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
                 const size_t buf_size = range_size * v_size_row;
                 io.write_tensor(v, range.first * v_size_row, buf_size);
             }
+            if (llama_kvchain_diag_verbose()) {
+                LLAMA_LOG_ERROR("KVCHAINDBG state_write_data(kv) V layer=%u v_type=%d v_row=%zu\n",
+                        il, v_type_i, v_size_row);
+            }
+        }
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG state_write_data(kv) V done (v_trans=%d)\n", (int) this->v_trans);
         }
     } else {
         // When v is transposed, we also need the element size and get the element ranges from each row
@@ -2364,6 +2430,26 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // single sequence
         if (!append) {
             seq_rm(dest_seq_id, -1, -1);
+        } else if (sinfo_in) {
+            // kv-chain APPEND into a MIRROR layout: the adopted cells already
+            // hold THIS seq's rows from the earlier chunks (same positions),
+            // which this chunk's rows replace. free exactly the window
+            // [pos_lo, pos_limit) first, or the "not free" check below (and the
+            // cell-for-cell invariant) breaks from chunk 1 on.
+            // without sinfo_in the APPEND find_slot path leaves earlier chunks'
+            // cells in place (the plain kv-chain restore).
+            uint32_t max_adopted = 0;
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                const uint32_t idx = sinfo_in->idxs[0][i];
+                if (idx < cells.size()) {
+                    cells.rm(idx);
+                    max_adopted = std::max(max_adopted, idx);
+                }
+            }
+            // head must point just past the layout's last cell, or the NEXT
+            // find_slot (the re-prefill) wraps to 0 and overwrites the restored
+            // cells instead of extending past them.
+            head = max_adopted + 1;
         }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
@@ -2557,6 +2643,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
     io.read(&v_trans, sizeof(v_trans));
     io.read(&n_layer, sizeof(n_layer));
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG state_read_data(kv) strm=%u cell_count=%u read v_trans=%u n_layer=%u (expect v_trans=%d n_layer=%zu)\n",
+                strm, cell_count, v_trans, n_layer, (int) this->v_trans, layers.size());
+    }
 
     if (n_layer != layers.size()) {
         LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
@@ -2602,6 +2692,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         for (const auto & r : runs) {
             io.read_tensor(k, (size_t) r.from * k_size_row, (size_t) (r.to - r.from) * k_size_row);
         }
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG state_read_data(kv) K layer=%u k_type=%d k_row=%zu n_runs=%zu cell_count=%u\n",
+                    il, k_type_i, k_size_row, (size_t) runs.size(), cell_count);
+        }
     }
 
     if (!this->v_trans) {
@@ -2636,6 +2730,13 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
             for (const auto & r : runs) {
                 io.read_tensor(v, (size_t) r.from * v_size_row, (size_t) (r.to - r.from) * v_size_row);
             }
+            if (llama_kvchain_diag_verbose()) {
+                LLAMA_LOG_ERROR("KVCHAINDBG state_read_data(kv) V layer=%u v_type=%d v_row=%zu\n",
+                        il, v_type_i, v_size_row);
+            }
+        }
+        if (llama_kvchain_diag_verbose()) {
+            LLAMA_LOG_ERROR("KVCHAINDBG state_read_data(kv) V done (v_trans=%d)\n", (int) this->v_trans);
         }
     } else {
         // For each layer, read the values for each cell (transposed)
@@ -2744,6 +2845,20 @@ bool llama_kv_cache_context::apply() {
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
         kv->update(lctx, do_shift, sc_info);
+
+        // an out-of-band state restore (kv-chain) leaves n_kv stale: it is only
+        // refreshed on ubatch applies above, but the graph (qwen4exp QSA in
+        // particular) sizes its windows from get_n_kv(). recompute it from the
+        // dummy all-streams slot info (the same shape as the update ctor above:
+        // get_n_kv only walks sinfo.strm, the idxs are irrelevant).
+        llama_kv_cache::slot_info sinfo_all;
+        sinfo_all.s0 = 0;
+        sinfo_all.s1 = kv->get_n_stream() - 1;
+        for (uint32_t s = 0; s < kv->get_n_stream(); ++s) {
+            sinfo_all.strm.push_back(s);
+            sinfo_all.idxs.push_back({ 0 });
+        }
+        n_kv = kv->get_n_kv(sinfo_all);
 
         return true;
     }

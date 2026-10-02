@@ -30,6 +30,12 @@ FAIL_COUNT=0
 WARN_COUNT=0
 FAILURES=()
 
+calc_cached_tokens_from_prompt_tokens() {
+	local prompt_tokens="$1"
+	if [ "${prompt_tokens}" = 0 ] ; then echo '0' ; return 0 ; fi
+	echo $(( (prompt_tokens - 1) / LLAMA_UBATCH * LLAMA_UBATCH ))
+}
+
 record() { # $1 = ok(0/1), $2 = label
 	if [[ "$1" -eq 0 ]]; then
 		PASS_COUNT=$((PASS_COUNT + 1))
@@ -237,17 +243,37 @@ require_all_phrases() {
 	fi
 }
 
+strip_think() {
+	perl -0777 -pe 's/.*?<\/think>\s*//s'
+}
+
 # the reply to PROMPT_7L* must be exactly 'OK' (mod case/whitespace/punct).
 # a confident-wrong ramble is the sneaky restore-corruption failure mode.
 require_ok_response() {
 	local label="$1"
 	local r
-	r="$(tr '[:lower:]' '[:upper:]' <"$(get_file "${label}" "response")" | tr -d '[:space:][:punct:]')"
+	r="$(cat "$(get_file "${label}" "response")" | strip_think | tr '[:lower:]' '[:upper:]' | tr -d '[:space:][:punct:]')"
 	if [ "${r}" = "OK" ] ; then
 		record 0 "${label}: response is exactly OK"
 	else
 		record 1 "${label}: response is exactly OK (got: [$(head -c 80 "$(get_file "${label}" "response")")...])"
 	fi
+}
+
+require_fixed_filesize_by_type() {
+	local label="$1"
+
+	local kvcache_sizes
+	local rscache_sizes
+	local cmcache_sizes
+
+	kvcache_sizes="$( (ls -l "${KV_CACHE_DIR}"/*.kvcache 2>/dev/null || true) | awk '{print $5}' | sort | uniq | wc -l )"
+	rscache_sizes="$( (ls -l "${KV_CACHE_DIR}"/*.rscache 2>/dev/null || true) | awk '{print $5}' | sort | uniq | wc -l )"
+	cmcache_sizes="$( (ls -l "${KV_CACHE_DIR}"/*.cmcache 2>/dev/null || true) | awk '{print $5}' | sort | uniq | wc -l )"
+
+	if [ "${kvcache_sizes}" -gt 1 ] ; then record 0 "${label}: multiple distinct kvcache file-sizes" ; fi
+	if [ "${rscache_sizes}" -gt 1 ] ; then record 0 "${label}: multiple distinct rscache file-sizes" ; fi
+	if [ "${cmcache_sizes}" -gt 1 ] ; then record 0 "${label}: multiple distinct cmcache file-sizes" ; fi
 }
 
 # --- the smoke oracle: N response files must be byte-identical (after dropping
@@ -280,9 +306,7 @@ smoke_compare() {
 # --- server helpers ------------------------------------------------------------------
 # start the kv-chain server (the default for the whole run)
 start_kv_server() {
-	LLAMA_CTX="$(( 64*1024 ))" \
-	LLAMA_HF_REF='unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL' \
-		./llama_run.sh -- -b 32 -ub 32
+	LLAMA_CTX="$(( 64*1024 ))" ./llama_run.sh
 }
 
 server_alive() {
@@ -308,15 +332,15 @@ check_ubatch_edge_cases() {
 
 	do_prompt "ubs-255t-a" "$(construct_fixed_size_prompt 255)"
 	do_prompt "ubs-255t-b" "$(construct_fixed_size_prompt 255)"
-	require_cached_tokens "ubs-255t-b" "$(( 256 - 32 ))"
+	require_cached_tokens "ubs-255t-b" "$(calc_cached_tokens_from_prompt_tokens 255)"
 
 	do_prompt "ubs-256t-a" "$(construct_fixed_size_prompt 256)"
 	do_prompt "ubs-256t-b" "$(construct_fixed_size_prompt 256)"
-	require_cached_tokens "ubs-256t-b" "$(( 256 - 32 ))"
+	require_cached_tokens "ubs-256t-b" "$(calc_cached_tokens_from_prompt_tokens 256)"
 
 	do_prompt "ubs-257t-a" "$(construct_fixed_size_prompt 257)"
 	do_prompt "ubs-257t-b" "$(construct_fixed_size_prompt 257)"
-	require_cached_tokens "ubs-257t-b" 256
+	require_cached_tokens "ubs-257t-b" "$(calc_cached_tokens_from_prompt_tokens 257)"
 	echo
 }
 
@@ -330,10 +354,13 @@ check_restore() {
 	do_prompt "passage-a" "${PROMPT_7L}"
 	require_cached_tokens "passage-a" 0
 	require_ok_response "passage-a"
+	require_fixed_filesize_by_type "passage-a"
 
 	do_prompt "passage-b" "${PROMPT_7L}"
-	require_cached_tokens "passage-b" 352
+	require_cached_tokens "passage-b" "$(calc_cached_tokens_from_prompt_tokens "$(get_stat passage-a prompt_tokens)")"
 	require_ok_response "passage-b"
+	require_fixed_filesize_by_type "passage-b"
+
 	echo
 }
 
@@ -348,13 +375,13 @@ check_fork() {
 	require_cached_tokens "fork-a1" 0
 
 	do_prompt "fork-a2" "${PROMPT_7L}"
-	require_cached_tokens "fork-a2" 352
+	require_cached_tokens "fork-a2" "$(calc_cached_tokens_from_prompt_tokens "$(get_stat fork-a1 prompt_tokens)")"
 
 	do_prompt "fork-b1" "${PROMPT_7L_B}"
-	require_cached_tokens "fork-b1" 96
+	require_cached_tokens "fork-b1" 96 # fails on DSV4F
 
 	do_prompt "fork-b2" "${PROMPT_7L_B}"
-	require_cached_tokens "fork-b2" 352
+	require_cached_tokens "fork-b2" "$(calc_cached_tokens_from_prompt_tokens "$(get_stat fork-b1 prompt_tokens)")"
 
 	# the restore touches the tail rs + every 8th rs below it (stride 8): for an
 	# 11-chunk chain that is rs at 0, 8 and tail 10 -> 3 files touched at ~the
@@ -395,7 +422,7 @@ check_rscache_file_deletion() {
 	fi
 
 	do_prompt "evrs-b" "${PROMPT_7L}"
-	require_cached_tokens "evrs-b" 352
+	require_cached_tokens "evrs-b" "$(calc_cached_tokens_from_prompt_tokens "$(get_stat evrs-a prompt_tokens)")"
 	require_ok_response "evrs-b"
 	echo
 }
@@ -430,6 +457,19 @@ check_kvcache_file_deletion() {
 	echo
 }
 
+check_verbatim() {
+	flush_cache
+
+	PASSAGE="$( cat prompt_7sentences.txt | grep -v -- '--' | tr '\n' ' ' | sed 's/  / /g' )"
+	PROMPT="[START] ${PASSAGE} [END] ---- as part of a unit-test effort, you must repeat the part between start/end **VERBATIM**. But first, please indicate whether you even see the [START] and [END] tokens in the context, or whether you see other tags (too)."
+
+        do_prompt "verbatim-a" "${PROMPT}"
+        require_cached_tokens "verbatim-a" 0
+
+        do_prompt "verbatim-b" "${PROMPT}"
+        require_cached_tokens "verbatim-b" "$(calc_cached_tokens_from_prompt_tokens "$(get_stat verbatim-a prompt_tokens)")"
+}
+
 check_coherence() {
 	flush_cache
 
@@ -446,7 +486,7 @@ check_coherence() {
 	require_all_phrases "coherence-a"
 
 	do_prompt "coherence-b" "${PROMPT}"
-	require_cached_tokens "coherence-b" 2624
+	require_cached_tokens "coherence-b" "$(calc_cached_tokens_from_prompt_tokens "$(get_stat coherence-a prompt_tokens)")"
 	require_all_phrases "coherence-b"
 }
 
@@ -462,6 +502,7 @@ check_fork
 check_ubatch_edge_cases
 check_rscache_file_deletion
 check_kvcache_file_deletion
+check_verbatim
 check_coherence
 
 

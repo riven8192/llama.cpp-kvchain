@@ -2,6 +2,8 @@
 
 #include "llama-memory-hybrid.h"
 
+#include "llama.h" // struct llama_context (forward decl, log_kvchain_dbg)
+
 #include <memory>
 #include <vector>
 
@@ -67,13 +69,37 @@ public:
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX) const override;
-    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX)       override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX, const void * sinfos_in = nullptr)       override;
 
     //
     // llama_memory_hybrid_idx specific API
     //
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+
+    // kv-chain diagnostics: log the attn vs idx cache head/used/size for a seq,
+    // so a cell-for-cell drift after a restore is visible.
+    void log_kvchain_dbg(llama_seq_id seq_id) const;
+
+    // like log_kvchain_dbg, but also fingerprints the idx K tensor (cell 0 + the
+    // last cell) so a restored run can be compared byte-for-byte against the
+    // no-restore run. ctx is needed to sync the backend before the read.
+    void log_kvchain_dbg(const struct llama_context * ctx, llama_seq_id seq_id) const;
+
+    // kv-chain diagnostic: dump the idx K tensor raw bytes (cells 0..n_cells-1, the
+    // first layer) to path so a restored run can be cmp'd offline against the
+    // no-restore run. ctx is needed to sync the backend before the read.
+    void dump_idx_k(const struct llama_context * ctx, llama_seq_id seq_id, const char * path, uint32_t n_cells) const;
+
+    // kv-chain: capture the attention cache's current slot layout for seq_id, so
+    // the QSA indexer (a separate cache that must track the attention cell for
+    // cell) can be restored into those SAME indices instead of running its own
+    // find_slot (which drifts under APPEND). returns an empty vector on failure.
+    // when pos_limit > pos_lo only the cells with pos in [pos_lo, pos_limit) are
+    // returned: a per-chunk idx restore (cell_count = ubs) must adopt the attn
+    // cells of THAT chunk's window, not the whole restored prefix, or the
+    // mirrored-layout size check in state_read_meta rejects the restore.
+    llama_kv_cache::slot_info_vec_t kvchain_attn_sinfos(llama_seq_id seq_id, llama_pos pos_lo = -1, llama_pos pos_limit = -1) const;
 
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:

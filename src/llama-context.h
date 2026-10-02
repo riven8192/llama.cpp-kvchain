@@ -39,6 +39,14 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// kv-chain: drops the cached compute graph after an out-of-band state restore
+// (the QSA idx path). needs the private gf_res_prev, hence the friend below.
+void llama_kvchain_invalidate_graph(const struct llama_context * ctx);
+
+// kv-chain: synchronize the backend (device tensors readable on host). needed by
+// the idx-key fingerprint diagnostic, which reads the K buffer out of band.
+void llama_kvchain_sync(const struct llama_context * ctx);
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -399,4 +407,7 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    friend void llama_kvchain_invalidate_graph(const struct llama_context * ctx);
+    friend void llama_kvchain_sync(const struct llama_context * ctx);
 };

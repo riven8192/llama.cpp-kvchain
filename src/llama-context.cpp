@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3115,6 +3116,12 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // kv-chain restores cells out of band (no ubatch), which the normal
+    // apply() path would only notice at the next decode. invalidate the graph
+    // result NOW: the next decode must rebuild it, or it sizes its windows
+    // (qwen4exp QSA) from a stale n_kv and asserts.
+    gf_res_prev->reset();
+
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic
@@ -3164,6 +3171,9 @@ size_t llama_context::state_seq_get_data_window(llama_seq_id seq_id, uint8_t * d
 }
 
 size_t llama_context::state_seq_set_data_window(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    // see state_seq_set_data: invalidate the graph result after an out-of-band restore
+    gf_res_prev->reset();
+
     std::unique_ptr<llama_io_read_i> io = std::make_unique<llama_io_read_host>(src, size);
 
     try {
@@ -4410,6 +4420,67 @@ void llama_opt_epoch(
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_kvchain_dbg_log(const struct llama_context * ctx, int32_t seq_id) {
+    // downcast to the hybrid_idx memory (qwen4exp); no-op otherwise
+    auto * mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        return;
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        hyb->log_kvchain_dbg(ctx, seq_id);
+    }
+}
+
+void llama_kvchain_invalidate_graph(const struct llama_context * ctx) {
+    // the cached compute graph must be dropped after an out-of-band state restore:
+    // the graph sizes its windows (qwen4exp QSA) from the cache n_kv at build time,
+    // and a stale graph would assert or read out of bounds.
+    // const_cast: the API takes a const ctx * like the rest of the kv-chain helpers.
+    const_cast<struct llama_context *>(ctx)->gf_res_prev->reset();
+}
+
+void llama_kvchain_sync(const struct llama_context * ctx) {
+    const_cast<struct llama_context *>(ctx)->synchronize();
+}
+
+size_t llama_kvchain_set_idx_window(const struct llama_context * ctx,
+        const uint8_t * src, size_t size, int32_t seq_id,
+        llama_state_seq_flags flags, int32_t pos_lo, int32_t pos_limit, bool append) {
+    // the graph invalidation for this out-of-band restore is done by the caller
+    // via the state_seq_set_data path; it only touches the idx cache here
+    auto * mem = llama_get_memory(ctx);
+    auto * hyb = mem ? dynamic_cast<llama_memory_hybrid_idx *>(mem) : nullptr;
+    if (hyb == nullptr) {
+        return 0;
+    }
+    // the idx must land on the same cell indices the attention cache holds, so the
+    // two stay cell-for-cell (qwen4exp assert). capture that layout now (after the
+    // attn restore has run) and feed it to the idx restore as sinfos_in.
+    // restrict to this chunk's window [pos_lo, pos_limit): the idx restore for
+    // chunk k restores exactly ubs cells, so it must adopt only the attn cells of
+    // chunk k, not the whole restored prefix (the full layout would make
+    // state_read_meta reject the restore with a mirrored-size mismatch).
+    const auto sinfos_attn = hyb->kvchain_attn_sinfos(seq_id, pos_lo, pos_limit);
+
+    std::unique_ptr<llama_io_read_i> io = std::make_unique<llama_io_read_host>(src, size);
+    try {
+        uint32_t magic_read;
+        io->read(&magic_read, sizeof(magic_read));
+        if (io_magic_seq != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        // mem_idx is a plain llama_kv_cache; clear COMP_ONLY (it would otherwise
+        // read an EMPTY state) and pass the attn layout so the cells adopt it.
+        const auto f = (llama_state_seq_flags) (flags & ~LLAMA_STATE_SEQ_FLAGS_COMP_ONLY);
+        hyb->get_mem_idx()->state_read_sinfo(*io, seq_id, f, pos_lo, pos_limit,
+                nullptr, sinfos_attn.empty() ? nullptr : &sinfos_attn, append);
+        return io->n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading idx state: %s\n", __func__, err.what());
+        return 0;
+    }
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

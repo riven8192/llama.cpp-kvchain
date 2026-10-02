@@ -246,16 +246,16 @@ void llama_kv_cache_dsa_iswa::state_write(llama_io_write_i & io, llama_seq_id se
     }
 }
 
-void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+void llama_kv_cache_dsa_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     // mirror of state_write: on this cache ATTN_ONLY == FULL_ONLY and
     // TAIL_ONLY == PARTIAL_ONLY (the dsa part is a separate kv_dsa).
     const bool read_dsa = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
     const bool read_swa = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
     if (read_dsa) {
-        kv_dsa->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        kv_dsa->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
     if (read_swa) {
-        kv_swa->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        kv_swa->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
 }
 
