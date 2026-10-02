@@ -85,6 +85,7 @@ cmake --build ./build-directory
 ## Tested models
 
 - unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL
+- unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
 - unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_S (DSV4-Flash requires the --ubatch value to be a multiple of 128)
 - unsloth/MiniMax-M2.7-GGUF:UD-Q3_K_XL
 - unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q8_K_XL
