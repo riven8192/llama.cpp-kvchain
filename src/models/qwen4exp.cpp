@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "llama-ext.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
@@ -418,6 +419,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
     if (mctx_idx) {
+        const uint32_t nkv_idx = mctx_idx->get_n_kv();
+        const uint32_t nkv_attn = inp->mctx->get_attn()->get_n_kv();
+        if (nkv_idx != nkv_attn) {
+            LLAMA_LOG_ERROR("KVCHAINDBG qsa assert: n_kv idx=%u attn=%u n_tokens=%d\n", nkv_idx, nkv_attn, (int) n_tokens);
+        }
         GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
     }
@@ -755,6 +761,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     const int64_t n_new   = inp_kpool->n_new;
 
     GGML_ASSERT(hparams.dsv4_compress_ratios[il] == kpool);
+    GGML_ASSERT(kpool > 0);
+
+    // kv-chain diagnostics: the graph's window size at build time. after a restore
+    // the rebuilt graph must see the restored extent, not the pre-restore n_kv.
+    // (v0.6.0: build_qsa_top_k was reworked into build_qsa_sel; the ratio is now kpool
+    // and the window extent is inp_kpool->n_kv.)
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG qsa build: il=%d r=%lld n_kv=%lld n_blocks=%lld n_tokens=%d\n",
+                il, (long long) kpool, (long long) inp_kpool->n_kv, (long long) ((inp_kpool->n_kv + kpool - 1)/kpool), (int) n_tokens);
+    }
 
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);

@@ -8,11 +8,13 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
+#include "llama-ext.h" // llama_kvchain_sync (the idx-key fingerprint diagnostic)
 
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <iterator>
 #include <stdexcept>
 
@@ -256,39 +258,141 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
-void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    llama_memory_hybrid::state_write(io, seq_id, flags);
-
-    // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
-    // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) const {
+    // the QSA indexer (mem_idx) is a per-token llama_kv_cache (row i = token i, the
+    // "blocks" are a runtime pooling, not a storage ratio). it is serialized:
+    //   - for COMP_ONLY: as the WHOLE blob (the .cmcache file, per-chunk additive,
+    //     identity window - mem_idx is a plain kv cache so state_write's pos filter
+    //     does the cut);
+    //   - for FULL (flags 0): as a pure suffix after attn+recr (the upstream layout,
+    //     so a whole-context round-trip stays complete);
+    //   - NOT for ATTN_ONLY/FULL_ONLY (the .kvcache holds only the main attn KV) nor
+    //     TAIL_ONLY/PARTIAL_ONLY (the recurrent tail).
+    // this mirrors llama_kv_cache_dsv4, whose COMP_ONLY flag selects the comp K
+    // caches and excludes them from ATTN_ONLY. (an earlier version emitted the idx
+    // under the attn gate, which put the whole growing indexer into every .kvcache
+    // and desynced the read side.)
+    const bool comp_only = (flags & LLAMA_STATE_SEQ_FLAGS_COMP_ONLY) != 0;
+    if (comp_only) {
         if (mem_idx) {
-            mem_idx->state_write(io, seq_id, flags);
+            // mem_idx is a plain llama_kv_cache: COMP_ONLY there means "write an
+            // EMPTY state" (it has no comp part of its own), so clear the flag -
+            // the indexer IS the per-token cache, serialized in full for the
+            // window [pos_lo, pos_limit) (state_write's pos filter does the cut).
+            mem_idx->state_write(io, seq_id, (llama_state_seq_flags) (flags & ~LLAMA_STATE_SEQ_FLAGS_COMP_ONLY), pos_lo, pos_limit);
         }
+        return;
     }
 
+    llama_memory_hybrid::state_write(io, seq_id, flags, pos_lo, pos_limit);
+
+    // the idx section is a pure suffix, present for a FULL blob (flags 0) only.
+    // FULL_ONLY/ATTN_ONLY/TAIL_ONLY/PARTIAL_ONLY all exclude it.
+    const bool full = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY |
+                                LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY | LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) == 0;
+    if (full && mem_idx) {
+        mem_idx->state_write(io, seq_id, flags, pos_lo, pos_limit);
+    }
 }
 
-void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit, const void * sinfos_in) {
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 
     // [TAG_HYBRID_IDX_SINFO]
     // the indexer restore adopts the attention cache's layout instead of searching for cells of its own
     // two find_slot calls agree only while both caches see the same occupancy, which a restore cannot promise
+    // sinfos_in (kv-chain) is the attention cache's slot layout, captured while the
+    // .kvcache (ATTN_ONLY) restore ran; the idx must land on those SAME cell indices
+    // or the cell-for-cell invariant (qwen4exp.cpp: "the indexer cache must track
+    // the attention cache cell for cell") breaks. it is a const slot_info_vec_t *;
+    // the base declares it void * to avoid including llama-kv-cache.h.
+    const llama_kv_cache::slot_info_vec_t * sinfos_attn_in =
+            static_cast<const llama_kv_cache::slot_info_vec_t *>(sinfos_in);
     llama_kv_cache::slot_info_vec_t sinfos_attn;
 
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx::state_read flags=0x%x pos=[%d,%d) mem_idx=%d sinfos_in=%d\n",
+                (unsigned) flags, (int) pos_lo, (int) pos_limit, (int) (mem_idx != nullptr), (int) (sinfos_in != nullptr));
+    }
+
+    // COMP_ONLY: the .cmcache blob is ONLY the indexer rows (written by the
+    // comp_only branch of state_write). mem_idx is a plain llama_kv_cache, so clear
+    // COMP_ONLY (it would otherwise read an EMPTY state). it must restore into the
+    // attention cache's layout (sinfos_attn_in) - a plain state_read would find_slot
+    // in the idx's OWN cells, and under APPEND its head counter drifts from the
+    // attn's, landing cells at different indices (the cell-for-cell assert).
+    // APPEND = do not seq_rm the dest seq first, so the replay appends this chunk's
+    // rows on top of the earlier chunks' (chunk 0 does the wipe).
+    const bool comp_only = (flags & LLAMA_STATE_SEQ_FLAGS_COMP_ONLY) != 0;
+    if (comp_only) {
+        if (mem_idx) {
+            const bool append = (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) != 0;
+            if (llama_kvchain_diag_verbose()) {
+                LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx::state_read COMP_ONLY -> mem_idx::state_read_sinfo append=%d sinfos_in=%d\n",
+                        (int) append, (int) (sinfos_attn_in != nullptr));
+            }
+            mem_idx->state_read_sinfo(io, seq_id,
+                    (llama_state_seq_flags) (flags & ~LLAMA_STATE_SEQ_FLAGS_COMP_ONLY),
+                    pos_lo, pos_limit, nullptr, sinfos_attn_in, append);
+        }
+        return;
+    }
+
+    // section gates must mirror state_write exactly:
+    //   attn part : written by llama_memory_hybrid::state_write under the
+    //               FULL_ONLY/ATTN_ONLY gate, read under the !PARTIAL_ONLY gate
+    //               (the base hybrid's own convention - the two agree for every
+    //               flag combination this arch sees).
+    //   recr part : written under the PARTIAL_ONLY/TAIL_ONLY gate. this function
+    //               "repeats" llama_memory_hybrid::state_read (which gates the
+    //               recr read the same way), but the repeat here called it
+    //               unconditionally - a latent bug that only bites now that
+    //               kv-chain restores a hybrid_idx arch (qwen4exp) with an
+    //               ATTN_ONLY blob: with no recr section in the blob, the recr
+    //               reader mis-parses the following bytes and runs past the end
+    //               of buffer. gate it on the same flag the write side uses.
+    //   idx part  : a pure suffix, written for FULL (flags 0) only (COMP_ONLY is
+    //               handled above). it adopts the attention sinfos, so it is read
+    //               only when the attn part was read too.
+    const bool has_recr_section = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY)) != 0;
+    const bool full             = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY |
+                                            LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY | LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) == 0;
+    const bool has_idx_section  = full && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+    if (llama_kvchain_diag_verbose()) {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx::state_read has_recr_section=%d full=%d has_idx_section=%d\n",
+                (int) has_recr_section, (int) full, (int) has_idx_section);
+    }
+
+    // the attn gate must mirror llama_memory_hybrid::state_write, which emits the
+    // attn part under the FULL_ONLY/ATTN_ONLY gate. the original upstream repeat
+    // here used a bare !PARTIAL_ONLY gate, which is WRONG for TAIL_ONLY (0x20):
+    // PARTIAL_ONLY (0x1) is clear, so !PARTIAL_ONLY is true and the attn section
+    // would be read out of a TAIL_ONLY blob that holds only the recr tail -
+    // mis-parsing it ("invalid seq_id-agnostic kv cell"). this is the second
+    // latent bug in this "repeat" that the kv-chain flags exposed.
+    const bool has_attn_section = (flags & (LLAMA_STATE_SEQ_FLAGS_FULL_ONLY | LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY)) != 0;
+
+    // the attn (per-token KV) part is what the kv-chain restores chunk-by-chunk:
+    // chunk 0 wipes (APPEND clear), chunks 1..N APPEND. the append mode must come
+    // from the flags, NOT be hardcoded false - a hardcoded false made every chunk
+    // after the first seq_rm the whole seq, so only the LAST chunk's cells survived
+    // (the restore looked empty: a windowed read of [0,ubs) saw cell_count=0).
+    const bool attn_append = (flags & LLAMA_STATE_SEQ_FLAGS_APPEND) != 0;
+
     try {
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
-            get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
+        if (has_attn_section) {
+            get_mem_attn()->state_read_sinfo(io, seq_id, flags, pos_lo, pos_limit, has_idx_section ? &sinfos_attn : nullptr, nullptr, attn_append);
         }
 
-        get_mem_recr()->state_read(io, seq_id, flags);
+        if (has_recr_section) {
+            get_mem_recr()->state_read(io, seq_id, flags, pos_lo, pos_limit);
+        }
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (has_idx_section) {
             if (mem_idx) {
-                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                mem_idx->state_read_sinfo(io, seq_id, flags, pos_lo, pos_limit, nullptr, &sinfos_attn, false);
                 // the restore rewrites the cells behind the pool layout's back
                 mem_idx_stale_set(seq_id, 0);
                 // it can also change which cells are shared; re-derive sharing for every sequence, as seq_rm does
@@ -331,6 +435,161 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
+
+void llama_memory_hybrid_idx::log_kvchain_dbg(llama_seq_id seq_id) const {
+    if (!llama_kvchain_diag_verbose()) {
+        return;
+    }
+    const auto * attn = get_mem_attn();
+    const auto * idx  = mem_idx.get();
+    if (!attn) {
+        return;
+    }
+    if (idx) {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx seq=%d attn(head=%u used=%u size=%u) idx(head=%u used=%u size=%u)\n",
+                (int) seq_id,
+                attn->get_head(seq_id), attn->get_used(seq_id), attn->get_size(),
+                idx->get_head (seq_id), idx->get_used (seq_id), idx->get_size ());
+    } else {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx seq=%d attn(head=%u used=%u size=%u) idx=<none>\n",
+                (int) seq_id, attn->get_head(seq_id), attn->get_used(seq_id), attn->get_size());
+    }
+}
+
+void llama_memory_hybrid_idx::log_kvchain_dbg(const struct llama_context * ctx, llama_seq_id seq_id) const {
+    if (!llama_kvchain_diag_verbose()) {
+        return;
+    }
+    const auto * attn = get_mem_attn();
+    const auto * idx  = mem_idx.get();
+    if (!attn) {
+        return;
+    }
+    if (idx) {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx seq=%d attn(head=%u used=%u size=%u) idx(head=%u used=%u size=%u)\n",
+                (int) seq_id,
+                attn->get_head(seq_id), attn->get_used(seq_id), attn->get_size(),
+                idx->get_head (seq_id), idx->get_used (seq_id), idx->get_size ());
+    } else {
+        LLAMA_LOG_ERROR("KVCHAINDBG hybrid_idx seq=%d attn(head=%u used=%u size=%u) idx=<none>\n",
+                (int) seq_id, attn->get_head(seq_id), attn->get_used(seq_id), attn->get_size());
+    }
+
+    if (ctx == nullptr || idx == nullptr) {
+        return;
+    }
+
+    // content fingerprint of the idx K tensor, so a RESTORED run can be compared
+    // byte-for-byte against the NO-RESTORE run (same prompt -> same values):
+    //   - cell 0 = the first restored cell (the restore's data)
+    //   - the LAST non-empty cell = the most recent prefill/decode cell (fresh data)
+    const auto & icells = idx->get_cells(seq_id);
+    const int32_t il = idx->get_layer_ids().front();
+    auto * kt = idx->get_k_storage(il);
+    if (!kt) {
+        return;
+    }
+
+    // the K buffer is a device tensor (unified memory, offloaded): sync, then fetch
+    // the rows through the backend - never read the buffer raw.
+    llama_kvchain_sync(ctx);
+
+    const int64_t row_bytes = ggml_row_size(kt->type, kt->ne[0]);
+    const size_t n_el = (size_t) (kt->ne[0] < 64 ? kt->ne[0] : 64);
+
+    auto fp = [&](uint32_t cell) -> std::string {
+        std::vector<uint8_t> buf((size_t) row_bytes);
+        ggml_backend_tensor_get(kt, buf.data(), (size_t) cell*row_bytes, buf.size());
+        uint64_t h = 1469598103934665603ULL;
+        for (size_t i = 0; i < n_el; ++i) {
+            const uint32_t bits = *(const uint32_t *) (buf.data() + i*4);
+            h ^= bits; h *= 1099511628211ULL;
+        }
+        char out[64];
+        const float f0 = *(const float *) buf.data();
+        std::snprintf(out, sizeof(out), " %016llx (f0=%f)", (unsigned long long) h, f0);
+        return out;
+    };
+
+    uint32_t last = 0;
+    for (uint32_t j = 1; j < icells.size(); ++j) {
+        if (!icells.is_empty(j)) {
+            last = j;
+        }
+    }
+    LLAMA_LOG_ERROR("KVCHAINDBG idx-k-fp seq=%d il=%d cell0[%s] last@%u pos=%d[%s]\n",
+            (int) seq_id, il, fp(0).c_str(), last, (int) icells.pos_get(last), fp(last).c_str());
+}
+
+void llama_memory_hybrid_idx::dump_idx_k(const struct llama_context * ctx, llama_seq_id seq_id, const char * path, uint32_t n_cells) const {
+    const auto * idx = mem_idx.get();
+    if (!idx || ctx == nullptr || n_cells == 0) {
+        return;
+    }
+    const int32_t il = idx->get_layer_ids().front();
+    auto * kt = idx->get_k_storage(il);
+    if (!kt) {
+        return;
+    }
+    LLAMA_LOG_ERROR("KVCHAINDBG dump_idx_k: begin %u cells il=%d (ne0=%ld row_bytes=%ld)\n",
+            n_cells, il, (long) kt->ne[0], (long) ggml_row_size(kt->type, kt->ne[0]));
+    llama_kvchain_sync(ctx);
+    LLAMA_LOG_ERROR("KVCHAINDBG dump_idx_k: synced\n");
+    const int64_t row_bytes = ggml_row_size(kt->type, kt->ne[0]);
+    std::vector<uint8_t> buf((size_t) n_cells*row_bytes);
+    ggml_backend_tensor_get(kt, buf.data(), 0, buf.size());
+    LLAMA_LOG_ERROR("KVCHAINDBG dump_idx_k: tensor_get done (%zu bytes)\n", buf.size());
+    FILE * f = std::fopen(path, "wb");
+    if (f) {
+        std::fwrite(buf.data(), 1, buf.size(), f);
+        std::fclose(f);
+        LLAMA_LOG_ERROR("KVCHAINDBG dump_idx_k: wrote %u cells (%zu bytes) il=%d to %s\n", n_cells, buf.size(), il, path);
+    } else {
+        LLAMA_LOG_ERROR("KVCHAINDBG dump_idx_k: failed to open %s\n", path);
+    }
+}
+
+llama_kv_cache::slot_info_vec_t llama_memory_hybrid_idx::kvchain_attn_sinfos(llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_limit) const {
+    const auto * attn = get_mem_attn();
+    const auto * idx  = get_mem_idx();
+    if (attn == nullptr || idx == nullptr || seq_id < 0) {
+        return {};
+    }
+    // the attn's current cells for seq_id, in cell-index order: this is the layout
+    // the idx must adopt so the two caches stay cell-for-cell after a restore.
+    // the vector must have one entry per stream (sinfos_in->size() == n_stream
+    // check in state_read_sinfo); only the current seq's stream holds cells,
+    // the rest are empty.
+    // a per-chunk idx restore restores exactly one chunk's window, so restrict the
+    // layout to [pos_lo, pos_limit) when given: feeding the whole restored prefix
+    // here makes the mirrored-layout size check reject the chunk-sized restore.
+    const bool windowed = pos_limit > pos_lo;
+    const uint32_t n_stream = idx->get_n_stream();
+    const auto & cells = attn->get_cells(seq_id);
+    const uint32_t strm = (seq_id < (llama_seq_id) n_stream) ? (uint32_t) seq_id : 0;
+
+    llama_kv_cache::slot_info sinfo;
+    sinfo.s0 = strm;
+    sinfo.s1 = strm;
+    sinfo.strm = { strm };
+    sinfo.idxs = { {} };
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_has(i, seq_id)) {
+            if (windowed) {
+                const llama_pos p = cells.pos_get(i);
+                if (p < pos_lo || p >= pos_limit) {
+                    continue;
+                }
+            }
+            sinfo.idxs[0].push_back(i);
+        }
+    }
+
+    llama_kv_cache::slot_info_vec_t res(n_stream);
+    res[strm] = std::move(sinfo);
+    return res;
+}
+
 
 //
 // llama_memory_hybrid_idx_context

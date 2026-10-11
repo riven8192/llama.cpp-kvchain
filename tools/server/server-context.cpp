@@ -7,11 +7,14 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "kv-chain-store.h"
 
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_model_arch_name (kv-chain dsv4 ubatch guard)
+#include "../../src/llama-memory-hybrid-idx.h" // kv-chain idx K dump (qwen4exp)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -132,7 +135,31 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+// verbose kv-chain debugging: human-readable slot state name (for the [slots]
+// trace lines). a switch (not an array) so a missed state is a compile error.
+static const char * kv_chain_state_name(slot_state s) {
+    switch (s) {
+        case SLOT_STATE_IDLE:              return "IDLE";
+        case SLOT_STATE_WAIT_OTHER:        return "WAIT_OTHER";
+        case SLOT_STATE_STARTED:           return "STARTED";
+        case SLOT_STATE_PROCESSING_PROMPT: return "PROC_PROMPT";
+        case SLOT_STATE_DONE_PROMPT:       return "DONE_PROMPT";
+        case SLOT_STATE_GENERATING:        return "GENERATING";
+    }
+    return "?";
+}
+
 struct server_slot; // forward declaration
+struct server_context_impl;
+
+// per-ubatch hook state: the prefilling slot the snapshots belong to
+struct kv_chain_ubatch_state {
+    server_context_impl * ctx = nullptr;
+    server_slot *         slot = nullptr;
+};
+
+// defined after server_context_impl (needs the full type)
+static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos);
 
 struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
@@ -303,6 +330,18 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // prompt state restored from the disk hash-chain cache
+    bool kv_chain_restored = false;
+
+    // the full hash chain of this prompt, computed once at prompt arrival.
+    // both the restore walk and the per-ubatch save hook index this vector, so
+    // they can never disagree about a chunk's name.
+    std::vector<uint64_t> kv_chain_hashes;
+
+    // pos of the last chunk boundary saved; dedupes the MTP draft path, which
+    // re-decodes the same tokens and re-fires the ubatch hook at the same pos
+    size_t kv_chain_last_saved_pos = 0;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -379,6 +418,16 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        kv_chain_restored = false;
+        kv_chain_last_saved_pos = 0;
+        // the hash chain belongs to the CURRENT task; it is rebuilt at the next
+        // prompt start (see the STARTED block). if it is not cleared here, the
+        // PREVIOUS task's chain leaks into the next task's classification: the
+        // classifier subtracts kv_chain_hashes.size()*ubs as the "expected
+        // restore", and a stale (larger) chain makes remaining go negative ->
+        // the new task is misfiled as "nothing to do" and the slot stalls
+        // (the stuck-slot bug).
+        kv_chain_hashes.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -663,7 +712,7 @@ struct server_slot {
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
+        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.3f, t = %6.2f s / %.2f tokens per second\n",
                 (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
     }
 
@@ -931,6 +980,7 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 
 struct server_context_impl {
     friend struct server_context;
+    friend void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos);
 
 public:
     // only use these pointers outside of this class:
@@ -1014,6 +1064,128 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<kv_chain_store> kv_chain;
+
+    // the slot whose prompt is currently being prefilled (at most one)
+    server_slot * kv_chain_prefill_slot = nullptr;
+    kv_chain_ubatch_state kv_chain_cb_state;
+
+    // the slots that may add tokens to THIS iteration's batch (the
+    // slotsToIncorporate of pre_decode). rebuilt at the start of every
+    // pre_decode: exactly ONE slot (a random full-chunk prefill) when a
+    // kv-chain chunk save is due, otherwise the partial-prefill + generating
+    // slots (the normal mixed path). every per-slot loop in pre_decode early-
+    // outs with !kv_chain_slots_to_incorporate.contains(slot). the save hook
+    // (cb_ubatch) fires mid-decode, after pre_decode, so the list is still
+    // valid there.
+    std::vector<server_slot *> kv_chain_slots_to_incorporate;
+
+    // called after each ubatch is committed; persists only at bs-aligned
+    // boundaries, so chunk k holds the state of the prefix [0, (k+1)*bs)
+    void kv_chain_save_prefill_ubatch(server_slot & slot, uint32_t n_pos_last) {
+        if (!kv_chain || kv_chain_prefill_slot != &slot) {
+            return;
+        }
+        const int pos_max = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max < 0) {
+            return;
+        }
+        const size_t pos = (size_t) pos_max + 1; // number of tokens prefilled so far
+        const size_t ubs = (size_t) kv_chain->ubatch_size();
+
+        // the MTP draft path re-decodes the same tokens and re-fires the hook
+        // at the same pos (on- or off-grid); a repeat is a no-op, so dedup
+        // first and let the ON/OFF-GRID log below fire exactly once per pos.
+        if (pos == slot.kv_chain_last_saved_pos) {
+            return;
+        }
+
+        // the hash chain is a fixed ubs-grid; only dump when pos is exactly a
+        // ubs-multiple (state-as-of k*ubs). off-grid boundaries are skipped.
+        // OFF-GRID diagnosis: for a PREFILL slot the KV pos must equal the
+        // number of tokens in slot.prompt (the chain is indexed by prompt
+        // offset). a mismatch means the KV pos was desynced (e.g. a restore
+        // set n_past but the prompt index did not advance, or a mixed
+        // decode+prefill ubatch) -> log it, it is the thing that kills the
+        // chunk saves.
+        if (pos % ubs != 0) {
+            const size_t pnt = slot.prompt.n_tokens();
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                const bool in_batch = std::find(kv_chain_slots_to_incorporate.begin(),
+                                                kv_chain_slots_to_incorporate.end(), &slot)
+                                      != kv_chain_slots_to_incorporate.end();
+                SLT_WRN(slot, "kv-chain[ubatch]: OFF-GRID pos=%d (pos%%ubs=%d) prompt.n_tokens=%zu mismatch=%d task.n_tokens=%d state=%s in_batch=%s\n",
+                        (int) pos, (int) (pos % ubs), pnt, (int) ((int64_t) pos - (int64_t) pnt),
+                        (int) slot.task->n_tokens(), kv_chain_state_name(slot.state),
+                        in_batch ? "yes" : "no");
+            } else {
+                SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d pos%%ubs=%d OFF-GRID (state=%s, not a prefill)\n",
+                        (int) pos, (int) n_pos_last, (int) (pos % ubs), kv_chain_state_name(slot.state));
+            }
+            return;
+        }
+        SLT_INF(slot, "kv-chain[ubatch]: pos=%d cb_n_pos_last=%d ON-GRID (prompt.n_tokens=%zu)\n",
+                (int) pos, (int) n_pos_last, slot.prompt.n_tokens());
+        // the boundary at pos = k*ubs completes chunk (k-1), covering [(k-1)*ubs, k*ubs)
+        const size_t chunk_n = pos / ubs - 1;
+
+        const size_t n = slot.prompt.n_tokens();
+        if (pos > n) {
+            return;
+        }
+        const size_t chunk_lo = (size_t) chunk_n * ubs;
+        llama_tokens chunk_tokens;
+        chunk_tokens.reserve(ubs);
+        for (size_t i = chunk_lo; i < pos; ++i) {
+            chunk_tokens.push_back(slot.prompt.tokens[i]);
+        }
+        if (chunk_n >= slot.kv_chain_hashes.size()) {
+            return;
+        }
+        const uint64_t chunk_hash = slot.kv_chain_hashes[chunk_n];
+
+        kv_chain->save(slot.ctx_tgt, slot.id, (llama_pos) chunk_lo, (llama_pos) pos, chunk_hash, chunk_tokens,
+                       chunk_n > 0 ? slot.kv_chain_hashes[chunk_n - 1] : kv_chain->root_hash()); // parent: logging only
+        slot.kv_chain_last_saved_pos = pos;
+
+        // round-trip reference (no-restore run): at EVERY on-grid boundary the live
+        // state is exactly "as of chunk_n's boundary", so dump chunk_n's
+        // position-anchored window (.kvcache.N / .cmcache.N) AND the live recurrent
+        // tail as of this boundary (.rscache.N). N chunks -> N kvcache files (all
+        // verifiable) + N rscache files (only the last one is comparable to the
+        // restore side, which sits at the tail). a later restore run re-dumps the
+        // same set and they are byte-compared (identical = lossless disk load).
+        // the stale-file wipe happens once, at the first boundary (chunk 0).
+        // gated on KVCHAIN_VERBOSE: each dump does a GPU sync + tensor_get, so it
+        // must not run on the normal save path.
+        if (llama_kvchain_diag_verbose() && !slot.kv_chain_restored) {
+            if (chunk_n == 0) {
+                kv_chain->clear_diagnostic_dump("/tmp/rt-save");
+            }
+            kv_chain->dump_live_chunk_window(slot.ctx_tgt, slot.id, chunk_n, "/tmp/rt-save");
+            kv_chain->dump_live_recurrent(slot.ctx_tgt, slot.id, chunk_n, "/tmp/rt-save");
+        }
+
+        // diagnose the qwen4exp idx K data: log the idx K fingerprint (cell 0 + the
+        // last non-empty cell) after every on-grid prefill boundary, so a NO-RESTORE
+        // run (coherence-a) emits the fingerprint at pos = n_saved (2624) to compare
+        // byte-for-byte against the RESTORED run's post-restore fingerprint (the
+        // idx-k-fp line in log_kvchain_dbg). same prompt -> same idx K values.
+        // dump the idx K raw bytes (cells 0..pos) at a no-restore run so it can be
+        // cmp'd offline against the RESTORED run's dump (/tmp/idx-restore.bin).
+        // only a no-restore run reaches here (a restored slot has kv_chain_restored
+        // set and its prefill pos is far past ubs, so it never hits a save boundary).
+        // gated on KVCHAIN_VERBOSE (the dump does a backend sync + tensor_get).
+        if (llama_kvchain_diag_verbose() &&
+            model_tgt != nullptr &&
+            std::string(llama_model_arch_name(model_tgt)) == "qwen4exp" &&
+            !slot.kv_chain_restored) {
+            auto * mem = llama_get_memory(ctx_tgt);
+            if (auto * hyb = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+                hyb->dump_idx_k(ctx_tgt, slot.id, "/tmp/idx-save.bin", (uint32_t) pos);
+            }
+        }
+    }
 
     server_metrics metrics;
 
@@ -1203,6 +1375,14 @@ private:
         {
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        // attach the per-ubatch kv-chain callback (snapshots state mid-prefill)
+        if (!params_base.kv_chain_dir.empty()) {
+            kv_chain_cb_state.ctx = this;
+            kv_chain_cb_state.slot = nullptr;
+            params_base.cb_ubatch      = kv_chain_cb_ubatch;
+            params_base.cb_ubatch_data = &kv_chain_cb_state;
         }
 
         llama_init = common_init_from_params(params_base);
@@ -1494,6 +1674,53 @@ private:
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        SRV_INF("kv-chain: params kv_chain_dir='%s', kv_chain_limit_gb=%d\n",
+                params_base.kv_chain_dir.c_str(), params_base.kv_chain_limit_gb);
+        if (!params_base.kv_chain_dir.empty()) {
+            // grid-safety guard: every ubatch boundary must land on the n_ubatch
+            // chunk grid or the hash chain desyncs. n_batch must be a multiple
+            // of n_ubatch, and the KV-full retry halves n_batch, so the ratio
+            // must survive arbitrary halvings: it must be a power of 2.
+            const int32_t n_b  = (int32_t) llama_n_batch (ctx_tgt);
+            const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_tgt);
+            const int32_t ratio = (n_ub > 0) ? n_b / n_ub : 0;
+            const bool grid_safe = (n_ub > 0) && (n_b % n_ub == 0) && (ratio & (ratio - 1)) == 0;
+            if (!grid_safe) {
+                common_log_flush(common_log_main());
+                std::fprintf(stderr, "kv-chain: FATAL: -b %d / -ub %d is not grid-safe "
+                        "(n_batch must be a power-of-2 multiple of n_ubatch, so that every "
+                        "ubatch boundary - including KV-full retry halvings - lands on the "
+                        "chunk grid). use e.g. -b == -ub, or -b 2048 -ub 512. exiting.\n",
+                        n_b, n_ub);
+                std::fflush(stderr);
+                std::exit(1);
+            }
+            SRV_INF("kv-chain: grid-safe: -b %d / -ub %d = %d (power of 2)\n", n_b, n_ub, ratio);
+            // dsv4 (deepseek4) extra guard: its largest compressor ring is
+            // state_size 128 (hca), and the per-chunk comp window maps to
+            // [pos_lo/128, pos_limit/128) rows - a non-multiple-of-128 ubatch
+            // would make the comp window bounds non-integral / misaligned. the
+            // arch is known here (model_tgt is loaded), so hard-fail on a
+            // mis-config rather than save/restore a broken chain.
+            if (model_tgt != nullptr &&
+                std::string(llama_model_arch_name(model_tgt)) == "deepseek4" &&
+                (n_ub % 128) != 0) {
+                common_log_flush(common_log_main());
+                std::fprintf(stderr, "kv-chain: FATAL: dsv4 (deepseek4) requires -ub to be a "
+                        "multiple of 128 (the largest compressor ring state_size), got -ub %d. "
+                        "use e.g. -ub 128 / -b 128. exiting.\n", n_ub);
+                std::fflush(stderr);
+                std::exit(1);
+            }
+            const uint64_t limit_bytes = params_base.kv_chain_limit_gb > 0
+                ? static_cast<uint64_t>(params_base.kv_chain_limit_gb) * 1024ull*1024ull*1024ull
+                : 0;
+            // chunk stride = n_ubatch (not n_batch): the snapshots fire at ubatch
+            // boundaries, which land on the n_ubatch grid.
+            kv_chain = std::make_unique<kv_chain_store>(params_base.kv_chain_dir, limit_bytes,
+                                                        n_ub, params_base, model_tgt);
+        }
 
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
@@ -1951,6 +2178,30 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // kv-chain: the slot may still hold the PREVIOUS task's prompt buffer.
+        // it survives release in two ways: reset() (in release()) keeps
+        // prompt.tokens on purpose (native in-memory reuse + LCP slot
+        // selection rely on it), and get_available_slot() - which runs JUST
+        // BEFORE this launch - may move a cached prompt back in via
+        // prompt_load() (prompt = std::move(it->prompt)). with kv-chain the
+        // native prefix reuse is bypassed (n_past = 0 in the STARTED block)
+        // and the disk chain is authoritative, so the stale buffer is dead
+        // weight: the classifier (top of the NEXT pre_decode, which runs
+        // BEFORE the fill loop's STARTED block) computes
+        // raw_left = task->n_tokens() - prompt.n_tokens(), which goes
+        // negative when the previous task's prompt+response was longer, and
+        // asserts. the buffer is either a different prompt (head mismatch) or
+        // the same prompt plus generated tokens (head match, buffer_n >
+        // task_n) - in BOTH cases the disk restore rebuilds everything that
+        // matters, so dropping it loses nothing. it must be done HERE, not in
+        // reset() (prompt_load re-populates after reset) and not in the
+        // STARTED block (the classifier runs first).
+        if (kv_chain && slot.prompt.n_tokens() > 0) {
+            SLT_INF(slot, "kv-chain[storage]: dropping stale prompt buffer at launch (%zu tokens from previous task, new task has %d)\n",
+                    slot.prompt.n_tokens(), slot.task->n_tokens());
+            slot.prompt.clear();
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -3076,6 +3327,13 @@ private:
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
+                // log each whole-batch prompt decode (skips the per-token decode
+                // steps of generation)
+                if (n_tokens > 1 && batch.size() == n_batch) {
+                    SRV_INF("kv-chain[decode]: batch.size=%d off=%d n_tokens=%d n_batch=%d\n",
+                            (int) batch.size(), off, n_tokens, n_batch);
+                }
+
                 batch.render(off, n_tokens);
                 bool ok = decode(n_batch, off);
 #ifdef DEBUG_TIMINGS
@@ -3176,6 +3434,11 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        // the batch must be empty for the kv-chain pick: it still holds the
+        // PREVIOUS iteration's tokens until the clear() above, so the pick may
+        // only run now (a size check before the clear would always bail on the
+        // stale data). after the clear, any non-empty batch is a bug.
+        GGML_ASSERT(batch.size() == 0);
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -3183,8 +3446,190 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // kv-chain: classify the slots and build kv_chain_slots_to_incorporate
+        // (the slotsToIncorporate), BEFORE any decode/draft handling, so every
+        // slot is in its pre-decode state (the sampled token is NOT yet in
+        // prompt.tokens).
+        //
+        // the classification is EXHAUSTIVE: every slot lands in exactly one of
+        // the five lists, and an unexpected one (a processing slot with nothing
+        // to do - the "stuck slot" bug) is a hard assert. without this, a
+        // misfiled slot is silently held out forever (the fill loop never lets
+        // it through) and the server stalls with "nothing to do".
+        //
+        // policy:
+        //   prefillChunkSlots = slots that can still fill a FULL ubs chunk
+        //   prefillPartial    = slots with a prompt tail < ubs left
+        //   generateAndDraft  = GENERATING slots
+        //   idleStateSlots    = IDLE / WAIT_OTHER
+        //   if both a chunk slot AND an interleave slot (partial/decode) exist:
+        //       a 50/50 coin decides - the chunk slot gets batch exclusivity
+        //       (the interleave slots are gated, left completely untouched, and
+        //       retry next iteration) or the interleave slots mix freely.
+        //       without the coin the chunk saves would starve every concurrent
+        //       generation behind the longest prefill.
+        //   only chunk slots: ONE of them (random) is the SOLE slot of this
+        //       batch.
+        //   only interleave slots: slotsToIncorporate = prefillPartial +
+        //       generateAndDraft (the normal mixed path; a decode token at
+        //       batch pos 0 keeps every prefill token at pos >= 1, so the mixed
+        //       ubatches are harmless - the partial tail is never saved anyway).
+        // every per-slot loop below early-outs with
+        // !kv_chain_slots_to_incorporate.contains(slot).
+        {
+            kv_chain_slots_to_incorporate.clear();
+            if (kv_chain) {
+                std::vector<server_slot *> prefill_chunk, prefill_partial, gen_and_draft, idle_state, unexpected;
+                const size_t ubs = (size_t) kv_chain->ubatch_size();
+                for (auto & slot : slots) {
+                    switch (slot.state) {
+                        case SLOT_STATE_IDLE:
+                        case SLOT_STATE_WAIT_OTHER:
+                            idle_state.push_back(&slot);
+                            break;
+                        case SLOT_STATE_GENERATING:
+                            gen_and_draft.push_back(&slot);
+                            break;
+                        case SLOT_STATE_STARTED:
+                        case SLOT_STATE_PROCESSING_PROMPT: {
+                            // remaining prompt tokens to prefill. NOTE: a
+                            // STARTED slot has NOT yet run its inline restore,
+                            // so its raw count includes the tokens the restore
+                            // will load (they are NOT re-prefilled); subtract
+                            // the expected restore (hash_chain.size()*ubs, an
+                            // upper bound). a PROCESSING_PROMPT slot is
+                            // post-restore (subtract nothing).
+                            //
+                            // fail-fast on the arithmetic: a processing slot
+                            // ALWAYS has a task, and the expected restore can
+                            // never exceed the raw prompt length (the restore
+                            // is capped at tokens[0, n-1)). a negative
+                            // remaining here means the hash chain is STALE -
+                            // it was not cleared when the previous task was
+                            // released (see the kv_chain_hashes.clear() in
+                            // reset()). that is exactly the stuck-slot bug.
+                            GGML_ASSERT(slot.task && "kv-chain: processing slot has no task");
+                            const int64_t raw_left  = (int64_t) slot.task->n_tokens() - (int64_t) slot.prompt.n_tokens();
+                            const int64_t restored  = (slot.state == SLOT_STATE_STARTED)
+                                ? (int64_t) (slot.kv_chain_hashes.size() * ubs) : 0;
+                            const int64_t remaining = raw_left - restored;
+                            // log the full arithmetic BEFORE the assert: a bare
+                            // assert message gives no clue which of the three
+                            // inputs is stale (task too small? prompt buffer from
+                            // a previous task? hash chain not cleared?). a
+                            // negative raw_left means the prompt buffer holds MORE
+                            // tokens than the task has - i.e. the buffer belongs
+                            // to a (longer) previous task: it survives release
+                            // (reset() keeps prompt) and prompt_load() may even
+                            // move a cached prompt back in AFTER reset, at launch.
+                            // the STARTED block is supposed to drop it (see the
+                            // 'dropping stale prompt buffer' log); if this still
+                            // fires, that drop was skipped (state path?) - the
+                            // logs above show which.
+                            if (raw_left < 0 || remaining < 0) {
+                                SLT_WRN(slot, "kv-chain[slots]: BAD ARITHMETIC state=%s task_n=%d prompt_n=%zu raw_left=%lld restored=%lld remaining=%lld chain_chunks=%zu ubs=%zu\n",
+                                        kv_chain_state_name(slot.state), (int) slot.task->n_tokens(),
+                                        slot.prompt.n_tokens(), (long long) raw_left, (long long) restored,
+                                        (long long) remaining, slot.kv_chain_hashes.size(), ubs);
+                                // dump the first tokens of buffer vs task: if the
+                                // buffer's head differs from the task's head, the
+                                // buffer is from a different prompt (stale).
+                                {
+                                    const auto & b = slot.prompt.tokens.get_text_tokens();
+                                    const auto & t = slot.task->tokens.get_text_tokens();
+                                    auto dump = [](const auto & v, size_t n) {
+                                        std::string s;
+                                        for (size_t i = 0; i < n && i < v.size(); ++i) {
+                                            s += std::to_string(v[i]);
+                                            s += ",";
+                                        }
+                                        return s;
+                                    };
+                                    SLT_WRN(slot, "kv-chain[slots]: buffer head=[%s...] task head=[%s...] (buffer_n=%zu task_n=%zu)\n",
+                                            dump(b, 12).c_str(), dump(t, 12).c_str(), b.size(), t.size());
+                                }
+                                common_log_flush(common_log_main());
+                            }
+                            GGML_ASSERT(raw_left  >= 0 && "kv-chain: prompt index past the task length");
+                            GGML_ASSERT(remaining >= 0 && "kv-chain: stale hash chain (not cleared on release)");
+                            if (remaining >= (int64_t) ubs) {
+                                prefill_chunk.push_back(&slot);
+                            } else if (remaining > 0) {
+                                prefill_partial.push_back(&slot);
+                            } else {
+                                // a STARTED/PROCESSING_PROMPT slot with nothing
+                                // left to prefill: it should have transitioned
+                                // to DONE_PROMPT (and then GENERATING) already.
+                                // if it is still here, it is stuck (the fill
+                                // loop never lets it through) -> assert.
+                                // (a 100% disk cache hit is impossible - the
+                                // restore searches tokens[0, n-1), so the last
+                                // token is always re-prefilled; empty prompts
+                                // are rejected up front.)
+                                unexpected.push_back(&slot);
+                            }
+                            break;
+                        }
+                        case SLOT_STATE_DONE_PROMPT:
+                            // the prompt was fully processed in the previous
+                            // iteration; post_decode transitions it to
+                            // GENERATING (or releases it) after the decode.
+                            // it adds no tokens this iteration.
+                            idle_state.push_back(&slot);
+                            break;
+                    }
+                }
+                for (auto * s : prefill_chunk)   SRV_INF("kv-chain[slots]: slot %d is prefill-chunk\n",   s->id);
+                for (auto * s : prefill_partial) SRV_INF("kv-chain[slots]: slot %d is prefill-partial\n", s->id);
+                for (auto * s : gen_and_draft)   SRV_INF("kv-chain[slots]: slot %d is gen-n-draft\n",     s->id);
+                for (auto * s : idle_state)      SRV_INF("kv-chain[slots]: slot %d is idle (%s)\n",       s->id, kv_chain_state_name(s->state));
+                for (auto * s : unexpected) {
+                    const int64_t uraw  = s->task ? (int64_t) s->task->n_tokens() - (int64_t) s->prompt.n_tokens() : -1;
+                    const int64_t urest = (s->state == SLOT_STATE_STARTED) ? (int64_t) (s->kv_chain_hashes.size() * ubs) : 0;
+                    SRV_WRN("kv-chain[slots]: slot %d UNEXPECTED %s (nothing to do, task_n=%d prompt_n=%zu raw_left=%lld restored=%lld remaining=%lld)\n",
+                            s->id, kv_chain_state_name(s->state),
+                            s->task ? (int) s->task->n_tokens() : -1, s->prompt.n_tokens(),
+                            (long long) uraw, (long long) urest, (long long) (uraw - urest));
+                }
+                GGML_ASSERT(unexpected.empty() && "kv-chain: a STARTED/PROCESSING_PROMPT slot has nothing to prefill - stuck slot");
+
+                // give chunk-job-type and other-job-type a 50/50 share
+                bool hasExclusiveJobs = !prefill_chunk.empty();
+                bool hasInterleaveJobs = !prefill_partial.empty() || !gen_and_draft.empty();
+                bool hasBothJobTypes = hasExclusiveJobs && hasInterleaveJobs;
+
+                static std::mt19937 rng(std::random_device{}());
+                bool prioritizeExclJob = hasBothJobTypes
+                                             ? std::uniform_int_distribution<size_t>(0, 1)(rng)
+                                             : !prefill_chunk.empty();
+
+
+                if (prioritizeExclJob) {
+                    const size_t idx = std::uniform_int_distribution<size_t>(0, prefill_chunk.size() - 1)(rng);
+                    kv_chain_slots_to_incorporate.push_back(prefill_chunk[idx]);
+                    SRV_INF("kv-chain[pick]: slot %d has exclusivity (%zu chunk slots eligible)\n",
+                            prefill_chunk[idx]->id, prefill_chunk.size());
+                } else {
+                    kv_chain_slots_to_incorporate.insert(kv_chain_slots_to_incorporate.end(),
+                            prefill_partial.begin(), prefill_partial.end());
+                    kv_chain_slots_to_incorporate.insert(kv_chain_slots_to_incorporate.end(),
+                            gen_and_draft.begin(), gen_and_draft.end());
+                    SRV_INF("kv-chain[pick]: %zu partial prefill + %zu decode slot(s) mix freely\n",
+                            prefill_partial.size(), gen_and_draft.size());
+                }
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
+            if (kv_chain &&
+                std::find(kv_chain_slots_to_incorporate.begin(), kv_chain_slots_to_incorporate.end(), &slot)
+                == kv_chain_slots_to_incorporate.end()) {
+                return; // gated out: no draft, no checkpoint, no batch entry
+                         // this iteration - and do NOT claim slot_batched, or
+                         // the chunk slot (the real first slot of the batch)
+                         // would be skipped by the can_batch_with check below
+            }
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -3260,6 +3705,13 @@ private:
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
+            if (kv_chain &&
+                std::find(kv_chain_slots_to_incorporate.begin(), kv_chain_slots_to_incorporate.end(), &slot)
+                == kv_chain_slots_to_incorporate.end()) {
+                return; // gated out: no draft checkpoint this iteration (the
+                         // draft itself was not generated for this slot either
+                         // - see the gate above)
+            }
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
@@ -3306,14 +3758,31 @@ private:
             }
         });
 
-        // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
-
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // update the batch with the sampled/drafted tokens. slots NOT in
+        // slotsToIncorporate (the gated-out GENERATING slots while a chunk
+        // slot owns the batch) are skipped: a decode token at batch pos 0
+        // would make the prefill's ubatches off-grid. skipping is safe because
+        // NOTHING has been committed yet - the pick ran before the
+        // draft/checkpoint handling (which is gated too), so the gated slots'
+        // sampled token is not in prompt.tokens, their spec_draft is empty,
+        // and their KV pos is unchanged. next iteration (no full chunk left to
+        // save) the normal path runs and the token enters exactly as upstream
+        // does.
+        iterate(generating, [&](server_slot & slot) {
+            if (kv_chain &&
+                std::find(kv_chain_slots_to_incorporate.begin(), kv_chain_slots_to_incorporate.end(), &slot)
+                == kv_chain_slots_to_incorporate.end()) {
+                const server_slot * excl = kv_chain_slots_to_incorporate.empty() ? nullptr : kv_chain_slots_to_incorporate[0];
+                SRV_INF("kv-chain[deferred]: slot %d decode skipped this iteration - chunk_slot %d owns the batch\n",
+                        slot.id, excl ? excl->id : -1);
+                return;
+            }
+            slot.handle_last_sampled_token(batch);
+        });
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3323,6 +3792,21 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
+                // slotsToIncorporate gate: while a chunk slot owns the batch,
+                // ONLY that slot may add tokens - a decode or partial-prefill
+                // token would make the chunk's ubatches off-grid. the held-out
+                // slots are left completely untouched (no state change) and
+                // retry next iteration.
+                if (kv_chain &&
+                    std::find(kv_chain_slots_to_incorporate.begin(), kv_chain_slots_to_incorporate.end(), &slot)
+                    == kv_chain_slots_to_incorporate.end()) {
+                    if (slot.is_processing()) {
+                        const server_slot * excl = kv_chain_slots_to_incorporate.empty() ? nullptr : kv_chain_slots_to_incorporate[0];
+                        SRV_INF("kv-chain[fill]: slot %d [%s] HELD OUT (chunk_slot=%d owns batch)\n",
+                                slot.id, kv_chain_state_name(slot.state), excl ? excl->id : -1);
+                    }
+                    return;
+                }
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -3354,6 +3838,14 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        // arm the per-ubatch kv-chain snapshot: the hash chain is
+                        // computed once here, at prompt arrival, from the tokens.
+                        if (kv_chain && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+                            kv_chain_prefill_slot      = &slot;
+                            kv_chain_cb_state.slot   = &slot;
+                            slot.kv_chain_hashes = kv_chain->hash_chain(input_tokens.get_text_tokens());
+                        }
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3440,78 +3932,86 @@ private:
                             const bool is_stateless_task = slot.task->type == SERVER_TASK_TYPE_EMBEDDING || slot.task->type == SERVER_TASK_TYPE_RERANK;
 
                             if (slot.task->params.cache_prompt && !is_stateless_task) {
-                                // reuse any previously computed tokens that are common with the new prompt
-                                n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                if (kv_chain) {
+                                    // the disk hash-chain cache is the only prefix cache;
+                                    // bypass the native in-memory common-prefix reuse so
+                                    // the restore path is the single source of truth.
+                                    SLT_INF(slot, "%s", "kv-chain[storage]: in-memory prefix caching bypassed (disk hash-chain is authoritative)\n");
+                                    n_past = 0;
+                                } else {
+                                    // reuse any previously computed tokens that are common with the new prompt
+                                    n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
-                                // the children start from the shared prefix, do not go past it
-                                if (slot.task->n_tokens_shared > 0) {
-                                    n_past = std::min(n_past, slot.task->n_tokens_shared);
-                                }
-
-                                // if there is an alora invoked, don't cache after the invocation start
-                                if (slot.alora_invocation_start > 0) {
-                                    SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
-                                    n_past = std::min(n_past, slot.alora_invocation_start - 1);
-                                }
-
-                                const auto n_cache_reuse = slot.task->params.n_cache_reuse;
-
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
-
-                                if (!can_cache_reuse && n_cache_reuse > 0) {
-                                    SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
-                                }
-
-                                // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
-                                    size_t head_c = n_past; // cache
-                                    size_t head_p = n_past; // current prompt
-
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
+                                    // the children start from the shared prefix, do not go past it
+                                    if (slot.task->n_tokens_shared > 0) {
+                                        n_past = std::min(n_past, slot.task->n_tokens_shared);
                                     }
 
-                                    SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
+                                    // if there is an alora invoked, don't cache after the invocation start
+                                    if (slot.alora_invocation_start > 0) {
+                                        SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
+                                        n_past = std::min(n_past, slot.alora_invocation_start - 1);
+                                    }
 
-                                    while (head_c < slot.prompt.tokens.size() &&
-                                           head_p < input_tokens.size()) {
+                                    const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                        size_t n_match = 0;
-                                        while (head_c + n_match < slot.prompt.tokens.size() &&
-                                               head_p + n_match < input_tokens.size()       &&
-                                               slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
-                                            n_match++;
+                                    const bool can_cache_reuse =
+                                        llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                        !slot.prompt.tokens.has_mtmd;
+
+                                    if (!can_cache_reuse && n_cache_reuse > 0) {
+                                        SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    }
+
+                                    // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                    if (can_cache_reuse && n_cache_reuse > 0) {
+                                        GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+
+                                        size_t head_c = n_past; // cache
+                                        size_t head_p = n_past; // current prompt
+
+                                        if (mctx) {
+                                            // we should never reach this
+                                            GGML_ABORT("not supported by multimodal");
                                         }
 
-                                        if (n_match >= (size_t) n_cache_reuse) {
-                                            SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
-                                            //for (size_t i = head_p; i < head_p + n_match; i++) {
-                                            //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
-                                            //}
+                                        SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
-                                            const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+                                        while (head_c < slot.prompt.tokens.size() &&
+                                               head_p < input_tokens.size()) {
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
-
-                                            for (size_t i = 0; i < n_match; i++) {
-                                                slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
-                                                n_past++;
+                                            size_t n_match = 0;
+                                            while (head_c + n_match < slot.prompt.tokens.size() &&
+                                                   head_p + n_match < input_tokens.size()       &&
+                                                   slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
+                                                n_match++;
                                             }
 
-                                            head_c += n_match;
-                                            head_p += n_match;
-                                        } else {
-                                            head_c += 1;
-                                        }
-                                    }
+                                            if (n_match >= (size_t) n_cache_reuse) {
+                                                SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
+                                                //for (size_t i = head_p; i < head_p + n_match; i++) {
+                                                //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
+                                                //}
 
-                                    SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                                const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+
+                                                slot.mem.seq_rm (slot.id, head_p, head_c);
+                                                slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+
+                                                for (size_t i = 0; i < n_match; i++) {
+                                                    slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
+                                                    n_past++;
+                                                }
+
+                                                head_c += n_match;
+                                                head_p += n_match;
+                                            } else {
+                                                head_c += 1;
+                                            }
+                                        }
+
+                                        SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
@@ -3629,8 +4129,246 @@ private:
                             }
                         }
 
+                        if (kv_chain) {
+                            // slot.prompt.n_tokens() == 0 here: any stale
+                            // previous-task buffer was dropped at launch
+                            // (launch_slot_with_task, 'dropping stale prompt
+                            // buffer at launch'), which runs before the
+                            // classifier and before this block.
+                            SLT_INF(slot, "kv-chain[storage]: restore check: n_past=%d prompt.n_tokens=%d cache_prompt=%d has_mtmd=%d input_n=%zu\n",
+                                    n_past, slot.prompt.n_tokens(), (int) slot.task->params.cache_prompt,
+                                    (int) input_tokens.has_mtmd, input_tokens.size());
+                        }
+                        // slot.prompt.n_tokens() == 0 here: the stale previous-task
+                        // buffer was dropped above (kv-chain block), so the restore
+                        // appends into an empty buffer. the pre-restore seq_rm still
+                        // wipes the slot's KV cells (no-restart case).
+                        if (kv_chain && n_past == 0 && slot.task->params.cache_prompt) {
+                            // restore a saved prefix from the disk hash-chain cache.
+                            // has_mtmd reflects the model's capability, not whether
+                            // this prompt has media, so no guard on it here.
+                            size_t n_saved = 0;
+                            // get_text_tokens() (not get_tokens()): the latter
+                            // asserts !has_mtmd
+                            const llama_tokens text_tokens = input_tokens.get_text_tokens();
+                            std::vector<kv_chain_chunk> chunks = kv_chain->load_prefix(text_tokens, &n_saved);
+                            // diagnostic: cap the restore to the first N chunks (env
+                            // KVCHAIN_RESTORE_MAX_CHUNKS) to binary-search which chunk
+                            // range corrupts the re-prefill. the tail rs of the CAPPED
+                            // chain is used (its recurrent state is valid at that
+                            // shorter boundary), so the restore stays self-consistent.
+                            if (const char * cap_env = getenv("KVCHAIN_RESTORE_MAX_CHUNKS")) {
+                                const size_t cap = (size_t) std::atol(cap_env);
+                                if (cap > 0 && chunks.size() > cap) {
+                                    chunks.resize(cap);
+                                    n_saved = cap * (size_t) kv_chain->ubatch_size();
+                                    SLT_INF(slot, "kv-chain[restore]: CAPPED restore to %zu chunks (n_saved=%zu) via env\n", chunks.size(), n_saved);
+                                }
+                            }
+                            SLT_INF(slot, "kv-chain[restore]: load_prefix -> %zu chunks, n_saved=%zu (input_n=%zu)\n",
+                                    chunks.size(), n_saved, input_tokens.size());
+                            if (!chunks.empty() && n_saved > 0) {
+                                // wall time + bytes for the WHOLE restore below
+                                // (the streaming read-from-disk + upload-to-vram
+                                // of every chunk, not per-op): seq_rm, the attn
+                                // replay, the (dsv4) comp replay, the tail rs.
+                                // n_bytes_read = the BLOB bytes (the file header
+                                // with the token ids is not counted).
+                                const int64_t t_restore_start = ggml_time_us();
+                                uint64_t      n_bytes_read = 0;
+                                // wipe the slot's KV cells first: in the no-restart
+                                // case this resets the previous prompt+response
+                                // (per-token KV cells and recurrent state) to a
+                                // fresh-context state. (the prompt BUFFER was already
+                                // dropped above; this is the KV side of the same wipe)
+                                slot.mem.seq_rm(slot.id, 0, -1);
+                                SLT_INF(slot, "kv-chain[restore]: seq_rm(0,-1) done, replaying %zu .kvcache chunks (ubs=%zu)\n",
+                                        chunks.size(), (size_t) kv_chain->ubatch_size());
+                                 // replay the chunks one file at a time (peak RAM = one
+                                 // file). each .kvcache holds the ATTN_ONLY rows of its
+                                 // window [k*ubs,(k+1)*ubs): chunk 0 wipes, the rest append.
+                                 // a read failure mid-replay discards the whole restore
+                                 // (the loaded rows would be orphaned) -> 100% re-prefill.
+                                 bool ok = true;
+                                 const size_t ubs = (size_t) kv_chain->ubatch_size();
+                                 size_t n_replayed = 0;
+                                 for (size_t k = 0; k < chunks.size() && ok; ++k) {
+                                     const llama_pos pos_lo    = (llama_pos) (k * ubs);
+                                     const llama_pos pos_hi    = (llama_pos) ((k + 1) * ubs);
+                                    std::vector<uint8_t> attn_blob;
+                                    if (!kv_chain->read_chunk_file(chunks[k].attn_file, attn_blob, chunks[k].tokens)) {
+                                        SLT_WRN(slot, "kv-chain[storage]: kv read failed/mismatch at chunk %zu, discarding restore\n", k);
+                                        ok = false;
+                                        break;
+                                    }
+                                    n_bytes_read += attn_blob.size();
+                                    // ATTN_ONLY: the .kvcache blob was written with
+                                    // ATTN_ONLY, so the read must use the same flag.
+                                    const llama_state_seq_flags attn_flags =
+                                            (k == 0) ? LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY
+                                                    : (LLAMA_STATE_SEQ_FLAGS_ATTN_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND);
+                                    const size_t n_attn = llama_state_seq_set_data_window_ext(ctx_tgt,
+                                            attn_blob.data(), attn_blob.size(), slot.id,
+                                            attn_flags, pos_lo, pos_hi);
+                                    SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(ATTN_ONLY%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                            k, (k == 0) ? "" : "|APPEND", (int) pos_lo, (int) pos_hi,
+                                            attn_blob.size(), n_attn);
+                                    attn_blob.clear();
+                                    attn_blob.shrink_to_fit();
+                                    // 0 = failure
+                                    if (n_attn == 0) {
+                                        SLT_WRN(slot, "kv-chain[storage]: attn restore failed at chunk %zu\n", k);
+                                        ok = false;
+                                        break;
+                                    }
+                                    n_replayed++;
+                                }
+                                // replay the .cmcache chunks (dsv4 only): each holds the
+                                // COMP_ONLY comp rows of its window, additive across chunks
+                                // like the attn rows (chunk 0 clears the comp caches, the
+                                // rest APPEND). this rebuilds the prefix's completed comp
+                                // rows that the attention over the restored prefix needs.
+                                if (ok && kv_chain->has_comp()) {
+                                    // the qwen4exp QSA indexer is a SEPARATE cache that must track
+                                    // the attention cache cell-for-cell, so its restore must adopt the
+                                    // attn's slot layout (llama_kvchain_set_idx_window). dsv4's comp K
+                                    // caches live inside the dsv4 cache itself, so the plain
+                                    // set_data_window_ext is correct there.
+                                    const bool idx_mirrors_attn =
+                                            model_tgt != nullptr &&
+                                            std::string(llama_model_arch_name(model_tgt)) == "qwen4exp";
+                                    for (size_t k = 0; k < chunks.size() && ok; ++k) {
+                                        const llama_pos pos_lo = (llama_pos) (k * ubs);
+                                        const llama_pos pos_hi = (llama_pos) ((k + 1) * ubs);
+                                        std::vector<uint8_t> cm_blob;
+                                        if (!kv_chain->read_chunk_file(chunks[k].cm_file, cm_blob, chunks[k].tokens)) {
+                                            SLT_WRN(slot, "kv-chain[storage]: cm read failed/mismatch at chunk %zu, discarding restore\n", k);
+                                            ok = false;
+                                            break;
+                                        }
+                                        n_bytes_read += cm_blob.size();
+                                        const bool append = (k != 0);
+                                        const llama_state_seq_flags cm_flags =
+                                                append ? (LLAMA_STATE_SEQ_FLAGS_COMP_ONLY | LLAMA_STATE_SEQ_FLAGS_APPEND)
+                                                       : LLAMA_STATE_SEQ_FLAGS_COMP_ONLY;
+                                         // the idx restore only touches the idx cache (the generic
+                                         // windowed path would re-read the whole hybrid blob), so it
+                                         // does not invalidate the graph result itself - do it here,
+                                         // once per chunk: the next decode must rebuild the graph,
+                                         // or it sizes its windows (qwen4exp QSA) from a stale n_kv.
+                                         const size_t n_cm = idx_mirrors_attn
+                                                 ? llama_kvchain_set_idx_window(ctx_tgt, cm_blob.data(), cm_blob.size(),
+                                                         slot.id, cm_flags, pos_lo, pos_hi, append)
+                                                 : llama_state_seq_set_data_window_ext(ctx_tgt,
+                                                         cm_blob.data(), cm_blob.size(), slot.id,
+                                                         cm_flags, pos_lo, pos_hi);
+                                         if (idx_mirrors_attn) {
+                                             llama_kvchain_invalidate_graph(ctx_tgt);
+                                         }
+                                        SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                                k, (k == 0) ? "" : "|APPEND", idx_mirrors_attn ? "|idx-attn" : "",
+                                                (int) pos_lo, (int) pos_hi, cm_blob.size(), n_cm);
+                                        cm_blob.clear();
+                                        cm_blob.shrink_to_fit();
+                                        if (n_cm == 0) {
+                                            SLT_WRN(slot, "kv-chain[storage]: comp restore failed at chunk %zu\n", k);
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!ok) {
+                                    // the rows loaded so far would be orphaned (the
+                                    // recurrent tail is only loaded after the loop), so
+                                    // wipe and fall back to a 100% prefill.
+                                    slot.mem.seq_rm(slot.id, 0, -1);
+                                    n_saved = 0;
+                                    n_replayed = 0;
+                                }
+                                // load the recurrent tail from the TAIL chunk's .rscache
+                                // (validated up front by load_prefix). TAIL_ONLY, the same
+                                // flag the blob was dumped with.
+                                 if (ok && !chunks.empty()) {
+                                     std::vector<uint8_t> tail_recr;
+                                     const kv_chain_chunk & tail_chunk = chunks.back();
+                                     if (!tail_chunk.recr_file.empty()) {
+                                         if (!kv_chain->read_chunk_file(tail_chunk.recr_file, tail_recr, tail_chunk.tokens)) {
+                                             SLT_WRN(slot, "%s", "kv-chain[storage]: tail rs re-read failed at tail chunk, discarding restore");
+                                             ok = false;
+                                          } else {
+                                              n_bytes_read += tail_recr.size();
+                                              const size_t n_recr = llama_state_seq_set_data_ext(ctx_tgt,
+                                                      tail_recr.data(), tail_recr.size(), slot.id,
+                                                      LLAMA_STATE_SEQ_FLAGS_TAIL_ONLY);
+                                              SLT_DBG(slot, "kv-chain[restore]: tail set_data(TAIL_ONLY) blob=%zu -> %zu bytes (this is the dsv4 rings-only / qwen recr blob)\n",
+                                                      tail_recr.size(), n_recr);
+                                              if (n_recr == 0) {
+                                                  SLT_WRN(slot, "%s", "kv-chain[storage]: recr restore failed at tail chunk");
+                                                  ok = false;
+                                              }
+                                              tail_recr.clear();
+                                              tail_recr.shrink_to_fit();
+                                          }
+                                     }
+                                 }
+                                if (ok) {
+                                    for (size_t i = 0; i < n_saved && i < input_tokens.size(); ++i) {
+                                        slot.prompt.tokens.push_back(input_tokens[i]);
+                                    }
+                                    n_past = (int) n_saved;
+                                    slot.kv_chain_restored = true;
+                                    // the restore never covers the last token (load_prefix
+                                    // searches tokens[0, n-1)) -> something is left to prefill.
+                                    const size_t n_left = input_tokens.size() - (size_t) n_past;
+                                    GGML_ASSERT(n_left > 0);
+                                     const double t_restore_s = (ggml_time_us() - t_restore_start) / 1e6;
+                                     // diagnose the idx/attn cell-for-cell drift + re-dump the live
+                                     // state for an offline cmp against the no-restore run's /tmp/rt-save.
+                                     // gated on KVCHAIN_VERBOSE: each dump does a GPU sync + tensor_get.
+                                     if (llama_kvchain_diag_verbose()) {
+                                        // the per-cache seq_pos_max + the memory type show whether the QSA
+                                        // indexer (mem_idx) ended up at a different position than the main
+                                        // attn cache after a restore.
+                                        const int attn_pmax = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                                        SRV_INF("kv-chain[restore]: post-restore attn seq_pos_max=%d (slot %d)\n", attn_pmax, slot.id);
+                                        llama_kvchain_dbg_log(ctx_tgt, slot.id);
+                                        // round-trip reference: after the disk load + tail rs load the
+                                        // live state is the full prefix "as of the tail", so re-dump
+                                        // EVERY chunk's position-anchored window (.kvcache.k /
+                                        // .cmcache.k) and the live recurrent state (.rscache.k).
+                                        // cmp against /tmp/rt-save (the no-restore prefill+save of the
+                                        // same chunks): each .kvcache.k / .cmcache.k is verifiable,
+                                        // and .rscache.<last> (the tail) is verifiable against rt-save's
+                                        // .rscache.<last> (same boundary). NOTE: on this side the live
+                                        // recurrent state is ONE rolling object (the tail), so every
+                                        // .rscache.k holds the tail content - only .rscache.<last> is a
+                                        // meaningful compare (the earlier ones are not the as-of-k state,
+                                        // which the restore never computed). this mirrors the N-file
+                                        // on-disk layout so both sides produce N kvcache + N rscache.
+                                        if (!chunks.empty()) {
+                                            kv_chain->clear_diagnostic_dump("/tmp/rt-restore");
+                                            for (size_t k = 0; k < chunks.size(); ++k) {
+                                                kv_chain->dump_live_chunk_window(ctx_tgt, slot.id, k, "/tmp/rt-restore");
+                                                kv_chain->dump_live_recurrent(ctx_tgt, slot.id, k, "/tmp/rt-restore");
+                                            }
+                                        }
+                                     }
+                                    SLT_INF(slot, "kv-chain[storage]: restored %d tokens from disk cache (%zu chunks), %zu tokens left to prefill "
+                                            "(read %.2f GiB in %.2f s = %.2f GiB/s)\n",
+                                            n_past, n_replayed, n_left,
+                                            (double) n_bytes_read / (1024.0*1024.0*1024.0),
+                                            t_restore_s,
+                                            t_restore_s > 0.0 ? (double) n_bytes_read / (1024.0*1024.0*1024.0) / t_restore_s : 0.0);
+                                } else {
+                                    SLT_WRN(slot, "%s", "kv-chain[storage]: failed to restore chain, falling back to prefill");
+                                }
+                            }
+                        }
+
                         // [TAG_PROMPT_LOGITS]
-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
+                        // a restored prefix already has its last token in the cache, so it
+                        // must not be re-processed; skip the decrement in that case
+                        if (!slot.kv_chain_restored && n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
@@ -3671,7 +4409,9 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
+                    // truncate any data at [p0, end)
                     slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.kv_chain_restored = false;
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -3706,6 +4446,14 @@ private:
                     }
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+
+                    // disable context checkpoints when kv-chain is set: they are
+                    // redundant (the disk chain is the source of truth for prefix
+                    // reuse) and their early batch breaks fragment the prompt into
+                    // off-grid ubatches, desyncing the hash chain.
+                    if (kv_chain) {
+                        do_checkpoint = false;
+                    }
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
@@ -3777,8 +4525,18 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                    // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // add prompt tokens for processing in the current batch.
+                    // no per-slot fill limit: the batch allocator hard-caps each
+                    // ubatch at n_ubatch tokens, so a slot on an EMPTY batch
+                    // (the chunk-exclusive case) can never add MORE than one ubs
+                    // chunk anyway - there is nothing to limit. (a cap would only
+                    // hurt: it truncates a slot with < ubs left into a garbage
+                    // off-grid fill.) the v0.4.0 `batch.size() < n_batch` guard
+                    // is the only bound needed: a slot that starts filling after
+                    // another slot filled the batch adds ZERO and retries next
+                    // iteration.
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3858,7 +4616,9 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
-                    // entire prompt has been processed
+                    // entire prompt has been processed. a restored prefix never
+                    // covers the last token (it must be prefilled to produce
+                    // logits), so this batch always carries the re-prefilled tail.
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
@@ -3910,6 +4670,38 @@ private:
                 }
             });
         }
+
+        if (kv_chain && batch.size() > 0) {
+            // VERBOSE TRACE: per-slot token count + pos range + is_prompt/output
+            // breakdown, so a mixed batch (two slots in one ubatch) is obvious.
+            // "P" = prompt tokens, "O" = output/logits tokens, "D" = decode.
+            struct agg { int n = 0; int n_prompt = 0; int n_out = 0; int pmin = INT32_MAX; int pmax = INT32_MIN; };
+            std::map<int32_t, agg> per_slot;
+            for (const auto & t : batch.tokens) {
+                auto & a = per_slot[t.id_slot];
+                a.n++;
+                if (t.is_prompt) a.n_prompt++;
+                if (t.output)    a.n_out++;
+                if (t.pos[0] < a.pmin) a.pmin = t.pos[0];
+                if (t.pos[0] > a.pmax) a.pmax = t.pos[0];
+            }
+            std::string desc;
+            for (const auto & [sid, a] : per_slot) {
+                if (!desc.empty()) desc += " ";
+                // poff = pos - prompt.n_tokens(): 0 for a prefill slot whose KV
+                // pos is in sync with its prompt index; non-zero (e.g. 1) means
+                // the batch starts at a decode offset - a decode+prefill mix or
+                // a desynced restore. this is the fingerprint of the off-grid
+                // chunk saves.
+                const int poff = (a.pmin >= 0) ? (int) (a.pmin - (int) slots[sid].prompt.n_tokens()) : -1;
+                desc += string_format("s%d:%d(p%d/o%d,pos[%d..%d],poff=%d)", sid, a.n, a.n_prompt, a.n_out,
+                        a.n ? a.pmin : -1, a.n ? a.pmax : -1, poff);
+            }
+            SRV_INF("kv-chain[batch]: size=%d slotsToIncorporate=%zu  %s\n",
+                    batch.size(), kv_chain_slots_to_incorporate.size(), desc.c_str());
+        }
+
+        kv_chain_slots_to_incorporate.clear(); // the pick only lasts this iteration
     }
 
     // see https://github.com/ggml-org/llama.cpp/pull/29969
@@ -4172,6 +4964,20 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // VERBOSE: prefill finished -> decode. log the absolute pos so we
+                // can see how far the prompt actually advanced (vs task.n_tokens).
+                if (kv_chain) {
+                    const int pmax = (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    SRV_INF("kv-chain[lifecycle]: slot %d -> GENERATING (prefill done) pos_max=%d task_n=%d prompt_n=%d\n",
+                            slot.id, pmax, slot.task ? slot.task->n_tokens() : -1, slot.prompt.n_tokens());
+                }
+
+                // the prompt is fully committed; stop per-ubatch snapshots
+                if (kv_chain_prefill_slot == &slot) {
+                    kv_chain_prefill_slot = nullptr;
+                    kv_chain_cb_state.slot = nullptr;
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -4499,6 +5305,14 @@ private:
         }
     }
 };
+
+static void kv_chain_cb_ubatch(void * user_data, uint32_t n_pos_last) {
+    auto * s = static_cast<kv_chain_ubatch_state *>(user_data);
+    if (s == nullptr || s->ctx == nullptr || s->slot == nullptr) {
+        return;
+    }
+    s->ctx->kv_chain_save_prefill_ubatch(*s->slot, n_pos_last);
+}
 
 //
 // server_context (public API)

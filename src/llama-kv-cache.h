@@ -148,8 +148,8 @@ public:
 
     // state write/load
 
-    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
-    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX) const override;
+    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0, llama_pos pos_lo = 0, llama_pos pos_limit = INT32_MAX, const void * sinfos_in = nullptr) override;
 
     //
     // llama_kv_cache specific API
@@ -160,6 +160,11 @@ public:
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
+
+    // kv-chain diagnostics: the search head + used-cell count for a stream, so
+    // the QSA indexer (mem_idx) and attention caches can be compared cell-for-cell.
+    uint32_t get_head (llama_seq_id seq_id) const;
+    uint32_t get_used (llama_seq_id seq_id) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -180,8 +185,11 @@ public:
             llama_io_read_i & io,
                llama_seq_id   seq_id,
       llama_state_seq_flags   flags,
+                 llama_pos    pos_lo,
+                 llama_pos    pos_limit,
           slot_info_vec_t *   sinfos_out,
-    const slot_info_vec_t *   sinfos_in);
+    const slot_info_vec_t *   sinfos_in,
+                 bool         append);
 
     // undo a state_read() of seq_id (-1 for the whole cache) that another memory module failed to complete
     void state_clear(llama_seq_id seq_id);
@@ -349,8 +357,9 @@ private:
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
-    // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
+    // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller.
+    // append: when set, do not seq_rm the dest seq first (the kv-chain restore appends chunks)
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr, bool append = false);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);

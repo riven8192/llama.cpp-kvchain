@@ -1,0 +1,150 @@
+#pragma once
+
+#include "llama.h"
+#include "common.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+// one matched chunk, in chain order. holds only file paths, not blob data:
+// the caller replays the chunks one at a time (read -> set_data -> free),
+// so the whole chain is never in RAM at once.
+struct kv_chain_chunk {
+    fs::path     attn_file; // this chunk's .kvcache (ATTN_ONLY rows for [k*bs,(k+1)*bs))
+    fs::path     cm_file;   // this chunk's .cmcache (COMP_ONLY comp rows); dsv4 only, empty otherwise
+    fs::path     recr_file; // this chunk's .rscache; set for the TAIL chunk only
+    llama_tokens tokens;    // the chunk's token IDs, verbatim from the file header
+};
+
+// disk-backed, content-addressed KV state store.
+// layout: <cache_dir>/<chunk_hash_hex>.kvcache  (attn only)
+//         <cache_dir>/<chunk_hash_hex>.rscache  (recr tail)
+// each file: u32 magic KVC1, u32 version, u32 hash32, u32 n_tokens,
+//            llama_token[n_tokens], u32 blob_size, blob[blob_size].
+// no trailing checksum: verifying one costs a full pass over every (multi-MiB)
+// recr file, which dominated restore time.
+// the blob is a self-contained seq-state blob (its own io_magic + module
+// header, no source seq_id), feedable straight to the state_seq_set API.
+// root_hash = FNV-1a64 over a canonical metadata blob; everything in the blob
+// must affect the numeric content or layout of cached KV values, so any change
+// is a clean miss, never a garbage read.
+struct kv_chain_metadata {
+    int32_t  format_version;              // KV_CHAIN_VERSION (single version: file layout + this blob)
+    uint32_t chunk_size;                  // == n_ubatch at store construction
+    int64_t  model_file_size;             // stat() of the model file (-1 if stat fails)
+    int64_t  model_file_mtime;            // stat() mtime seconds
+    std::string arch;                     // model architecture string
+    std::string ftype;                    // model quantization string
+    uint32_t type_k;                      // ggml_type of the K cache
+    uint32_t type_v;                      // ggml_type of the V cache
+    int32_t  rope_scaling_type;           // llama_rope_scaling_type
+    uint32_t rope_freq_base_bits;         // float bits (0.0f = "from model")
+    uint32_t rope_freq_scale_bits;        // float bits (0.0f = "from model")
+    uint32_t n_seq_max;                   // --parallel: the attn blob's n_stream scales with it, so a
+                                          // different --parallel changes the root hash (clean miss)
+};
+
+class kv_chain_store {
+public:
+    // ubatch_size: the chunk stride == n_ubatch (-ub). chunk boundaries are the
+    // ubatch boundaries (where the state snapshots fire), not the n_batch size.
+    kv_chain_store(std::string root_dir, uint64_t limit_bytes, int32_t ubatch_size,
+                   const common_params & params, const llama_model * model);
+
+    // saves one chunk covering the window [pos_lo, pos_hi) of seq_id's state.
+    // chunk_tokens (pos_hi-pos_lo of them) are stored verbatim in the header for
+    // validation. returns false on failure (store disabled, io error, ...).
+    bool save(llama_context * ctx, llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_hi,
+              uint64_t chunk_hash, const llama_tokens & chunk_tokens,
+              uint64_t parent_hash = 0); // parent_hash: logging only
+
+    // hash for one chunk: FNV-1a over the chunk's token ids, seeded by prev_hash.
+    uint64_t hash_chunk(const llama_tokens & chunk_tokens, uint64_t prev_hash) const;
+
+    // the full hash chain for a prompt, computed once at prompt arrival:
+    // hashes[k] = hash for chunk k (tokens [k*bs, (k+1)*bs)). the restore walk
+    // and the per-ubatch save hook both index this vector, so save and restore
+    // can never disagree about a chunk's name.
+    std::vector<uint64_t> hash_chain(const llama_tokens & tokens) const;
+
+    // finds the longest saved prefix matching the prompt. walks the chain,
+    // stopping at the first missing file. returns the matched chunks in order
+    // (empty on miss) and sets *n_tokens = prefix length (= n_chunks*bs).
+    // the LAST token is never restored: logits come from a forward pass, so it
+    // must always be re-prefilled (the chain is searched over tokens[0, n-1)).
+    std::vector<kv_chain_chunk> load_prefix(const llama_tokens & tokens, size_t * n_tokens) const;
+
+    // reads + validates one chunk file (header magic/version + the token IDs
+    // must match expected_tokens) and returns the blob. returns false if
+    // missing/corrupt/token-mismatch.
+    bool read_chunk_file(const fs::path & file, std::vector<uint8_t> & out_blob,
+                         const llama_tokens & expected_tokens) const;
+
+    // round-trip diagnostic: remove all /tmp files named "<prefix>.*". call ONCE
+    // at the start of a dump session (the save side at its first boundary, the
+    // restore side before its per-chunk loop) so stale files from a previous run
+    // (different chunk count, or an old .cmcache when the model has no comp part)
+    // are gone before the fresh per-chunk files are written.
+    void clear_diagnostic_dump(const char * prefix);
+
+    // round-trip diagnostic: dump chunk k's POSITION-ANCHORED per-token blobs
+    // from the LIVE VRAM state to:
+    //   <prefix>.kvcache.<k>  ATTN_ONLY window [k*ubs,(k+1)*ubs)
+    //   <prefix>.cmcache.<k>  COMP_ONLY window (only when has_comp)
+    // these depend only on the window [k*ubs,(k+1)*ubs): the save side's window k
+    // (a no-restore run, at chunk k's boundary) is byte-comparable against the
+    // restore side's window k (re-dumped after the disk load). call
+    // clear_diagnostic_dump(prefix) once first. N chunks -> N kvcache files, all
+    // verifiable.
+    void dump_live_chunk_window(llama_context * ctx, llama_seq_id seq_id, size_t k,
+                                const char * out_prefix);
+
+    // round-trip diagnostic: dump the live TAIL_ONLY recurrent state (the ROLLING
+    // object, as of the CURRENT prefill boundary) to <prefix>.rscache.<k>. the
+    // recurrent tail's bytes depend on the BOUNDARY captured, so a file is only
+    // comparable against another captured at the SAME boundary: on the save
+    // (no-restore) side chunk k's dump is the state as of chunk k's boundary; on
+    // the restore side the live state is the tail, so ONLY the LAST chunk's
+    // rscache is verifiable. call clear_diagnostic_dump(prefix) once first. N
+    // chunks -> N rscache files, only the last verifiable.
+    void dump_live_recurrent(llama_context * ctx, llama_seq_id seq_id, size_t k,
+                             const char * out_prefix);
+
+    size_t total_bytes() const { return total_bytes_cur; }
+    bool   enabled() const { return !root_dir.empty(); }
+    int32_t ubatch_size() const { return ubatch_size_; }
+    uint64_t root_hash() const { return root_hash_; }
+    // true when the model has compressed K caches (arch deepseek4): then each
+    // chunk also gets a .cmcache file (the chunk's COMP_ONLY comp rows) and the
+    // .rscache is rings-only. non-dsv4 archs: false, two files, no cm loop.
+    bool has_comp() const { return has_comp_; }
+
+    static uint64_t fnv1a64(const uint8_t * data, size_t len);
+    static uint64_t fnv1a64(uint64_t h, const uint8_t * data, size_t len);
+
+private:
+    static std::string hash_str(uint64_t h);
+
+    // computes the root hash from the metadata blob (see struct above).
+    // the model file is stat()ed only, never opened.
+    void compute_root_hash(const common_params & params, const llama_model * model);
+
+    bool write_chunk(const fs::path & dir, uint64_t chunk_hash, const llama_tokens & chunk_tokens,
+                     const std::vector<uint8_t> & attn, const std::vector<uint8_t> & comp,
+                     const std::vector<uint8_t> & recr);
+    bool write_chunk_file(const fs::path & tmp, const fs::path & file, uint64_t chunk_hash,
+                          const llama_tokens & tokens, const std::vector<uint8_t> & blob);
+    void evict_oldest(uint64_t need_bytes);
+
+    std::string root_dir;
+    uint64_t    root_hash_ = 0; // identity of this model/config; parent for chunk 0's hash
+    uint64_t    limit_bytes;
+    int32_t     ubatch_size_; // chunk stride == n_ubatch
+    uint64_t    total_bytes_cur = 0;
+    bool        has_comp_ = false; // model has compressed K caches (deepseek4)
+};

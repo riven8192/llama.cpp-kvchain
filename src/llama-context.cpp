@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -142,6 +143,9 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    cparams.cb_ubatch      = params.cb_ubatch;
+    cparams.cb_ubatch_data = params.cb_ubatch_data;
 
     cparams.ctx_other = nullptr;
 
@@ -1923,11 +1927,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
-
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2053,6 +2052,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+
+        // kv-chain hook: notify after this ubatch is committed, with the
+        // position of its last token (the boundary just completed)
+        if (cparams.cb_ubatch) {
+            const llama_pos ub_last_pos = ubatch.n_tokens > 0 ? ubatch.pos[ubatch.n_tokens - 1] : -1;
+            cparams.cb_ubatch(cparams.cb_ubatch_data, (uint32_t) ub_last_pos);
+        }
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3189,15 +3195,30 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
     }
 }
 
-static constexpr uint32_t io_magic = 0xaf143cd8;
+// the seq-state blob header carries only this magic (no source seq_id: nothing
+// ever consumed it; the destination is the caller's seq_id arg). the value is
+// kept constant across the seq_id removal - old (seq_id-carrying) local caches
+// must be deleted.
+static constexpr uint32_t io_magic_seq = 0xaf143cd8;
 
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
-        io.write(&seq_id, sizeof(seq_id));
+        io.write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data(io, seq_id, flags);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_size_window(llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+    try {
+        io.write(&io_magic_seq, sizeof(io_magic_seq));
+
+        return state_seq_write_data_window(io, seq_id, flags, pos_lo, pos_limit);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error getting state size: %s\n", __func__, err.what());
         return 0;
@@ -3213,8 +3234,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
-        io->write(&seq_id, sizeof(seq_id));
+        io->write(&io_magic_seq, sizeof(io_magic_seq));
 
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -3224,23 +3244,27 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    // kv-chain restores cells out of band (no ubatch), which the normal
+    // apply() path would only notice at the next decode. invalidate the graph
+    // result NOW: the next decode must rebuild it, or it sizes its windows
+    // (qwen4exp QSA) from a stale n_kv and asserts.
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
-        // create a temporary io to read the magic and the src seq_id
+        // create a temporary io to read the magic
         io = std::make_unique<llama_io_read_host>(src, size);
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
 
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
-
-        GGML_ASSERT(mem_storage.find(seq_id_read) != mem_storage.end());
-
-        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
+        io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id]);
     } else {
         io = std::make_unique<llama_io_read_host>(src, size);
     }
@@ -3248,17 +3272,55 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
-
-        llama_seq_id seq_id_read;
-        io->read(&seq_id_read, sizeof(seq_id_read));
 
         return state_seq_read_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         io->discard();
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data_window(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    std::unique_ptr<llama_io_write_i> io;
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+    } else {
+        io = std::make_unique<llama_io_write_host>(dst, size);
+    }
+
+    try {
+        io->write(&io_magic_seq, sizeof(io_magic_seq));
+
+        return state_seq_write_data_window(*io, seq_id, flags, pos_lo, pos_limit);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_set_data_window(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    // see state_seq_set_data: invalidate the graph result after an out-of-band restore
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
+    gf_res_prev_active = nullptr;
+
+    std::unique_ptr<llama_io_read_i> io = std::make_unique<llama_io_read_host>(src, size);
+
+    try {
+        uint32_t magic_read;
+        io->read(&magic_read, sizeof(magic_read));
+        if (io_magic_seq != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+
+        return state_seq_read_data_window(*io, seq_id, flags, pos_lo, pos_limit);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
 }
@@ -3443,17 +3505,41 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) {
+    GGML_UNUSED(seq_id);
+
     if (memory) {
-        memory->state_write(io, seq_id, flags);
+        memory->state_write(io, seq_id, flags, 0, pos_limit);
     }
 
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_limit) {
+    GGML_UNUSED(seq_id);
+
     if (memory) {
-        memory->state_read(io, seq_id, flags);
+        memory->state_read(io, seq_id, flags, 0, pos_limit);
+    }
+
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_write_data_window(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    GGML_UNUSED(seq_id);
+
+    if (memory) {
+        memory->state_write(io, seq_id, flags, pos_lo, pos_limit);
+    }
+
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_read_data_window(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    GGML_UNUSED(seq_id);
+
+    if (memory) {
+        memory->state_read(io, seq_id, flags, pos_lo, pos_limit);
     }
 
     return io.n_bytes();
@@ -3784,6 +3870,8 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.cb_ubatch                   =*/ nullptr,
+        /*.cb_ubatch_data              =*/ nullptr,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -4343,6 +4431,10 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
     return ctx->state_seq_get_size(seq_id, flags);
 }
 
+size_t llama_state_seq_get_size_window_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    return ctx->state_seq_get_size_window(seq_id, flags, pos_lo, pos_limit);
+}
+
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 
@@ -4352,6 +4444,18 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_get_data_window_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_window(seq_id, dst, size, flags, pos_lo, pos_limit);
+}
+
+size_t llama_state_seq_set_data_window_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_lo, llama_pos pos_limit) {
+    ctx->synchronize();
+
+    return ctx->state_seq_set_data_window(seq_id, src, size, flags, pos_lo, pos_limit);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
@@ -4491,6 +4595,71 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_kvchain_dbg_log(const struct llama_context * ctx, int32_t seq_id) {
+    // downcast to the hybrid_idx memory (qwen4exp); no-op otherwise
+    auto * mem = llama_get_memory(ctx);
+    if (mem == nullptr) {
+        return;
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid_idx *>(mem)) {
+        hyb->log_kvchain_dbg(ctx, seq_id);
+    }
+}
+
+void llama_kvchain_invalidate_graph(const struct llama_context * ctx) {
+    // the cached compute graph must be dropped after an out-of-band state restore:
+    // the graph sizes its windows (qwen4exp QSA) from the cache n_kv at build time,
+    // and a stale graph would assert or read out of bounds.
+    // const_cast: the API takes a const ctx * like the rest of the kv-chain helpers.
+    auto * c = const_cast<struct llama_context *>(ctx);
+    for (auto & res : c->gf_res_prev) {
+        res.reset();
+    }
+    c->gf_res_prev_active = nullptr;
+}
+
+void llama_kvchain_sync(const struct llama_context * ctx) {
+    const_cast<struct llama_context *>(ctx)->synchronize();
+}
+
+size_t llama_kvchain_set_idx_window(const struct llama_context * ctx,
+        const uint8_t * src, size_t size, int32_t seq_id,
+        llama_state_seq_flags flags, int32_t pos_lo, int32_t pos_limit, bool append) {
+    // the graph invalidation for this out-of-band restore is done by the caller
+    // via the state_seq_set_data path; it only touches the idx cache here
+    auto * mem = llama_get_memory(ctx);
+    auto * hyb = mem ? dynamic_cast<llama_memory_hybrid_idx *>(mem) : nullptr;
+    if (hyb == nullptr) {
+        return 0;
+    }
+    // the idx must land on the same cell indices the attention cache holds, so the
+    // two stay cell-for-cell (qwen4exp assert). capture that layout now (after the
+    // attn restore has run) and feed it to the idx restore as sinfos_in.
+    // restrict to this chunk's window [pos_lo, pos_limit): the idx restore for
+    // chunk k restores exactly ubs cells, so it must adopt only the attn cells of
+    // chunk k, not the whole restored prefix (the full layout would make
+    // state_read_meta reject the restore with a mirrored-size mismatch).
+    const auto sinfos_attn = hyb->kvchain_attn_sinfos(seq_id, pos_lo, pos_limit);
+
+    std::unique_ptr<llama_io_read_i> io = std::make_unique<llama_io_read_host>(src, size);
+    try {
+        uint32_t magic_read;
+        io->read(&magic_read, sizeof(magic_read));
+        if (io_magic_seq != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        // mem_idx is a plain llama_kv_cache; clear COMP_ONLY (it would otherwise
+        // read an EMPTY state) and pass the attn layout so the cells adopt it.
+        const auto f = (llama_state_seq_flags) (flags & ~LLAMA_STATE_SEQ_FLAGS_COMP_ONLY);
+        hyb->get_mem_idx()->state_read_sinfo(*io, seq_id, f, pos_lo, pos_limit,
+                nullptr, sinfos_attn.empty() ? nullptr : &sinfos_attn, append);
+        return io->n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading idx state: %s\n", __func__, err.what());
+        return 0;
+    }
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

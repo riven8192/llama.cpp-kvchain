@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    kv-chain-store.cpp
+    kv-chain-store.h
     server-queue.cpp
     server-queue.h
     server-common.cpp

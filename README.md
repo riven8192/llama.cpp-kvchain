@@ -1,134 +1,98 @@
-# llama.cpp
+# Streaming kv-cache to disk for predictable cache-hits
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+The current caching strategy is llama.cpp is fully in VRAM and/or RAM. This means that when
+resources are limited, valuable kv-caches are evicted. Small prompts can and will evict
+large caches. Especially on local hardware this leads to the rebulding of kv-cache that may
+take a significant amount of time, where streaming kv-caches to disk would lead to guaranteed
+cache hits.
 
-<div align="center">
 
-<b>LLM inference in C/C++</b>
+## How streaming kv-cache works
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+Every prompt is split into chunks, with the size of the llama.cpp `--ubatch` parameter. Each
+chunk will be prefilled, and the resulting kv-cache of that region will be written to disk.
+When multiple prompts share a common prefix, they will share these chunk-sized kv-cache files.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+When the next prompt is presented, it will do the same split, find out which usable kv-cache
+files are already on disk, load them into VRAM and prefill the remaining tokens.
 
-</div>
+### Serialization and usage of kv-cache files
 
-## Quick start
+The kv-cache files form a hash-chain, meaning, the root-hash contains metadata (like model info),
+every next file has a filename generated like so: `hash_curr=hash(hash_prev | current_chunk_tokens)`.
+This mean that when switching models, hash-files of the other models are never read due to their
+different root. This also ensures that a chunk A containing the same tokens as chunk B, at different
+positions in the prompt, are never treated as equal, given that they will have distinct hashes.
 
-A few options to get `llama.cpp` installed on your machine:
+Depending on the model architecture, one or multiple files are written per chunk. The goal is to
+have zero redundancy in the stored files, so every type of kv-cache file should have the same size.
+
+### Eviction logic
+
+Every time kv-cache files are loaded, their last-modified-time is updated. This is the signal
+that they are still valuable. When the kv-cache directory size exceeds its quota, the files
+with the oldest last-modified-time are deleted, until we are below the quota. This means that
+the LRU state lives outside of llama.cpp memory, and survives a process restart or reboot.
+
+
+## How to use
+
+### Building from source
 
 ```bash
-# curl
-curl -LsSf https://llama.app/install.sh | sh
+cmake -S . -B ./build-directory -G Ninja \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DGGML_VULKAN=ON \
+  -DLLAMA_CURL=ON \
+  -DLLAMA_OPENSSL=ON \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_BUILD_BORINGSSL=ON \
+  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF
 
-# powershell
-irm https://llama.app/install.ps1 | iex
+cmake --build ./build-directory
 ```
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+### Running llama-server
 
-Once installed:
+- Parameter `--kv-chain-dir` enables the kv-cache streaming.
+- Parameter `--kv-chain-limit-gb` determines how much disk space will at most be allocated.
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bash
+./build-directory/llama-server \
+  -hf '<<your model>>' \
+  --kv-chain-dir ./kv-cache-dir \
+  --kv-chain-limit-gb 100 \
+  --ubatch 256 \
+  --cache-ram 0 \
+  --no-cache-idle-slots \
+  --no-mmproj \
+  --flash-attn on \
+  --jinja
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
 
-## Description
+## Misc
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+- This repo has merged all the upstream changes up to `tag v0.4.0`.
+- The goal is not to merge this feature into llama.cpp, given it changes the public API, which is typically ground for immediate dismissal.
+- Most of the code is generated by Qwen 3.8 27B, and should be considered to have a level of quality and reliability of a proof of concept.
+- Despite extensive local testing, and bootstrapping (most code is written by a model running on this fork), it should not be used in an environment containing anything of value.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
 
-## Supported backends
+## Tested models
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+- unsloth/Qwen3.8-27B-GGUF:UD-Q8_K_XL
+- unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
+- unsloth/DeepSeek-V4-Flash-0731-GGUF:UD-IQ3_S (DSV4-Flash requires the --ubatch value to be a multiple of 128)
+- unsloth/MiniMax-M2.7-GGUF:UD-Q3_K_XL
+- unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q8_K_XL
 
-## Documentation
 
-#### Tools
+## Tested hardware
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+- AMD Strix Halo - 128 GB (shared memory)
+- Linux 6.18.12-200.fc43.x86_64
+- On the Vulkan backend, with --parallel `1` & `2`
