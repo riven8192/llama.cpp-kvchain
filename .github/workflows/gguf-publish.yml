@@ -17,14 +17,11 @@ on:
     tags:
       - 'gguf-v*'           # Push events to every version tag
 
-cache-mode: none
-permissions:
-  contents: read
 
 jobs:
   deploy:
 
-    runs-on: ubuntu-24.04  # previously ubuntu-latest
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v6

@@ -15,17 +15,13 @@ on:
       '**/*.py'
     ]
 
-cache-mode: none
-permissions:
-  contents: read
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   flake8-lint:
-    runs-on: ubuntu-slim
+    runs-on: [self-hosted, fast]
     name: Lint
     steps:
       - name: Check out source repository
