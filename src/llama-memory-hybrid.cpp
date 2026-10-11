@@ -217,8 +217,18 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (read_attn) {
         mem_attn->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
     }
+
     if (read_recr) {
-        mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
+        try {
+            mem_recr->state_read(io, seq_id, flags, pos_lo, pos_limit, sinfos_in);
+        } catch (...) {
+            // the attention part is already restored - undo it
+            if (read_attn) {
+                mem_attn->state_clear(seq_id);
+            }
+
+            throw;
+        }
     }
 }
 
