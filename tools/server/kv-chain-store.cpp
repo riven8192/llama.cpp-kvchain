@@ -26,7 +26,11 @@ static constexpr uint32_t KV_CHAIN_MAGIC   = 0x4b564331; // "KVC1"
 // (a per-token cache, llama_memory_hybrid_idx::mem_idx) moves out of the ATTN_ONLY
 // blob into the per-chunk .cmcache (per-token rows, identity window). old qwen4exp
 // chunks (idx carried in .kvcache) are a clean miss.
-static constexpr uint32_t KV_CHAIN_VERSION = 7;
+// v8: rebase onto v0.6.0. upstream added n_rot_k/n_rot_v to the per-token kv blob
+// (llama_kv_cache::state_write_data/state_read_data), so the .kvcache/.cmcache blobs
+// changed shape. old (pre-rotation) chunk files would mis-parse, so bump to a clean
+// miss rather than a silent garbage read.
+static constexpr uint32_t KV_CHAIN_VERSION = 8;
 
 // true when the model has a per-token "comp" cache that is neither the main
 // attention KV nor the recurrent tail, so it needs its own additive per-chunk

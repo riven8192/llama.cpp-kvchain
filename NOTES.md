@@ -1,6 +1,6 @@
 # Hash-chain KV cache - current state
 
-Base: llama.cpp **v0.4.0** (tag `v0.4.0`, 5266f24da), branch `hash-chain-kv`
+Base: llama.cpp **v0.6.0** (tag `v0.6.0`, 69ecae922), branch `hash-chain-kv`
 (fork: github.com/riven8192/llama.cpp-kvchain). Local hack, not upstream-grade
 (see `../docs/project-plan.md` for the design). The code is the source of truth
 for HOW things work; this file only holds what/where + test status + quirks.
