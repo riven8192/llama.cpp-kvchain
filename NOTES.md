@@ -9,7 +9,7 @@ llama-server as `-hf`. three archs supported: Qwen3.8-27B (16 full-attn + 48
 Gated DeltaNet recurrent layers), DSV4F (arch `deepseek4`, section 4b) and
 Qwen3.8-Flash-Next (arch `qwen4exp` QSA indexer, section 4c).
 
-CURRENT STATE: KV_CHAIN_VERSION 6. Per chunk, files in a FLAT cache dir:
+CURRENT STATE: Per chunk, files in a FLAT cache dir:
   - `<hash>.kvcache` = ATTN_ONLY blob (per-token KV rows for exactly the chunk
     window, additive across chunks)
   - `<hash>.rscache` = TAIL_ONLY blob (the fixed-size recurrent tail; on Qwen
@@ -179,8 +179,8 @@ then set n_past and prefill the remainder (which rebuilds comp rows for tokens
 >= n_saved and overwrites the now-stale tail-of-ring). A missing .cmcache
 breaks the chain (like a missing .kvcache). NON-dsv4 archs: COMP_ONLY is an
 empty blob, so no .cmcache is written/read (gated on arch) — 2 files,
-byte-identical to the Qwen path. Versions were bumped once at the end
-(KV_CHAIN_VERSION 5->6, DSV4_STATE_VERSION 1->2, DSV4_K_CACHE_STATE_VER 2->3).
+ byte-identical to the Qwen path. (the current version numbers are in
+src/llama-kv-cache-dsv4.cpp and tools/server/kv-chain-store.cpp.)
 
 ## 4c. Qwen3.8-Flash-Next (qwen4exp) support
 
