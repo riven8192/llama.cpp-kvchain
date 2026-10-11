@@ -490,10 +490,22 @@ check_coherence() {
 	require_all_phrases "coherence-b"
 }
 
+# truly-CONCURRENT prefill: fire two long, identical prompts at the same instant
+# so both land on separate slots at the same time (the prefill-grid exclusivity
+# only serialises chunk SAVES, not the prefills themselves). this is what the
+# sequential do_prompt/do_prompt pair could never do.
+#
+# the assertion targets the qwen4exp (Qwen3.8-Flash-Next) --parallel>=2 idx
+# restore: the QSA indexer (mem_idx) must mirror the attn cache cell for cell,
+# and a concurrent-restore can desync that layout, making the idx restore throw
+# "mirrored cache holds cells this one does not" and the whole chain fall back
+# to a full prefill. on that model+parallel this currently FAILS; on other
+# archs it only exercises the concurrent path (no comp/idx part, so the error
+# cannot occur).
 check_parallel_prefill() {
 	flush_cache
 
-        FILLER="$( cat "${DEVS}/prompt_30k.txt" | tail -n 50 )"
+        FILLER="$( cat "${DEVS}/prompt_30k.txt" | tail -n 100 )"
         PASSAGE="$( cat "${DEVS}/prompt_7sentences.txt" )"
         PROMPT="---- the following is **filler** to test output coherence in a fork of llama.cpp ----
                 ${FILLER}
@@ -501,8 +513,38 @@ check_parallel_prefill() {
                 please repeat this entire passage exactly, word for word, with no additions or omissions:
                 '${PASSAGE}'"
 
-	do_prompt "parallel-prefill-a" "${PROMPT}"
-	do_prompt "parallel-prefill-b" "${PROMPT}"
+        echo "${PROMPT}" >"$(get_file "parallel-prefill-a" "prompt")"
+
+        serverlog_lines_pre="$(wc -l <"${LLAMA_LOG}")"
+        # fire both at once; each writes its own response + stats
+        ./llama_prompt.sh "${PROMPT}" \
+                1>"$(get_file "parallel-prefill-a" "response")" \
+                2>"$(get_file "parallel-prefill-a" "stats")" &
+        local pid_a=$!
+        ./llama_prompt.sh "${PROMPT}" \
+                1>"$(get_file "parallel-prefill-b" "response")" \
+                2>"$(get_file "parallel-prefill-b" "stats")" &
+        local pid_b=$!
+        wait "${pid_a}" || true
+        wait "${pid_b}" || true
+        serverlog_lines_post="$(wc -l <"${LLAMA_LOG}")"
+
+        awk "FNR>=${serverlog_lines_pre} && FNR<=${serverlog_lines_post}" "${LLAMA_LOG}" \
+                1>"$(get_file "parallel-prefill" "serverlog")"
+
+        # a concurrent-restore idx desync surfaces as this error (the chain then
+        # falls back to a full prefill). its presence is the regression.
+        local n_mir
+        n_mir="$(grep -c 'mirrored cache holds cells this one does not' \
+                "$(get_file "parallel-prefill" "serverlog")" 2>/dev/null)"
+        if [ "${n_mir}" -gt 0 ] ; then
+                record 1 "parallel-prefill: concurrent idx-restore mirror mismatch (x${n_mir})"
+        else
+                record 0 "parallel-prefill: no concurrent idx-restore mirror mismatch"
+        fi
+
+        cat "$(get_file "parallel-prefill-a" "stats")"
+        cat "$(get_file "parallel-prefill-b" "stats")"
 }
 
 
