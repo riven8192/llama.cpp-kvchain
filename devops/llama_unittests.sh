@@ -490,21 +490,44 @@ check_coherence() {
 	require_all_phrases "coherence-b"
 }
 
+check_parallel_prefill() {
+	flush_cache
 
-# ============================================================================
-echo "=== starting kv-chain server (one session for the whole run) ==="
-start_kv_server
-echo
+        FILLER="$( cat "${DEVS}/prompt_30k.txt" | tail -n 50 )"
+        PASSAGE="$( cat "${DEVS}/prompt_7sentences.txt" )"
+        PROMPT="---- the following is **filler** to test output coherence in a fork of llama.cpp ----
+                ${FILLER}
+                ---- now the real test ----
+                please repeat this entire passage exactly, word for word, with no additions or omissions:
+                '${PASSAGE}'"
 
-check_hello
-check_restore
-check_fork
-check_ubatch_edge_cases
-check_rscache_file_deletion
-check_kvcache_file_deletion
-check_verbatim
-check_coherence
+	do_prompt "parallel-prefill-a" "${PROMPT}"
+	do_prompt "parallel-prefill-b" "${PROMPT}"
+}
 
+
+if [ "${1:-}" = '--skip-restart' ] ; then
+	shift 1
+else
+	echo "=== starting kv-chain server (one session for the whole run) ==="
+	start_kv_server
+	echo
+fi
+
+test="${1:-}"
+
+if [ -z "${test}" ] ; then
+	check_restore
+	check_fork
+	check_ubatch_edge_cases
+	check_rscache_file_deletion
+	check_kvcache_file_deletion
+	check_verbatim
+	check_coherence
+	check_parallel_prefill
+else
+	"check_${test}"
+fi
 
 # ============================================================================
 echo "=== summary ==="

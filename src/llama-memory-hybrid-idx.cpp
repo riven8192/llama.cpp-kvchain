@@ -485,18 +485,23 @@ void llama_memory_hybrid_idx::dump_idx_k(const struct llama_context * ctx, llama
 
 llama_kv_cache::slot_info_vec_t llama_memory_hybrid_idx::kvchain_attn_sinfos(llama_seq_id seq_id, llama_pos pos_lo, llama_pos pos_limit) const {
     const auto * attn = get_mem_attn();
-    if (attn == nullptr || seq_id < 0) {
+    const auto * idx  = get_mem_idx();
+    if (attn == nullptr || idx == nullptr || seq_id < 0) {
         return {};
     }
     // the attn's current cells for seq_id, in cell-index order: this is the layout
     // the idx must adopt so the two caches stay cell-for-cell after a restore.
-    // kv-chain runs with a single stream, so the stream index is 0.
+    // the vector must have one entry per stream (sinfos_in->size() == n_stream
+    // check in state_read_sinfo); only the current seq's stream holds cells,
+    // the rest are empty.
     // a per-chunk idx restore restores exactly one chunk's window, so restrict the
     // layout to [pos_lo, pos_limit) when given: feeding the whole restored prefix
     // here makes the mirrored-layout size check reject the chunk-sized restore.
     const bool windowed = pos_limit > pos_lo;
+    const uint32_t n_stream = idx->get_n_stream();
     const auto & cells = attn->get_cells(seq_id);
-    const uint32_t strm = 0;
+    const uint32_t strm = (seq_id < (llama_seq_id) n_stream) ? (uint32_t) seq_id : 0;
+
     llama_kv_cache::slot_info sinfo;
     sinfo.s0 = strm;
     sinfo.s1 = strm;
@@ -513,8 +518,9 @@ llama_kv_cache::slot_info_vec_t llama_memory_hybrid_idx::kvchain_attn_sinfos(lla
             sinfo.idxs[0].push_back(i);
         }
     }
-    llama_kv_cache::slot_info_vec_t res;
-    res.push_back(std::move(sinfo));
+
+    llama_kv_cache::slot_info_vec_t res(n_stream);
+    res[strm] = std::move(sinfo);
     return res;
 }
 
