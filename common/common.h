@@ -640,7 +640,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string kv_chain_dir    = "";    // disk-backed hash-chain KV cache dir (empty = disabled)
-    int32_t kv_chain_limit_gb   = 16;    // max total size of the hash-chain KV cache, in GiB (0 = no limit)
+    int32_t kv_chain_limit_gb   = 100;   // max total size of the hash-chain KV cache, in GiB (0 = no limit)
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

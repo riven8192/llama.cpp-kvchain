@@ -129,7 +129,9 @@ files become a clean miss instead of a mis-parse. Current value:
 ## 4. Config + eviction
 
 - `--kv-chain-dir <path>` — empty/unset = feature OFF (zero behavior change).
-- `--kv-chain-limit-gb N` — default 16 (`devops/env.sh` passes 100); 0 = no limit.
+- `--kv-chain-limit-gb N` — default 100 (0 = no limit). keep it generous: the
+  per-chunk `.rscache` files are large (~112 MiB each at `-ub 32`), so a small
+  limit makes them churn and prematurely evict the other chunk files.
 - Eviction: LRU by mtime, run after each write; a file vanishing mid-restore is a
   benign "cache ends here". Stray `.tmp` files removed at startup.
 - LRU touch on restore: `load_prefix` touches every matched `.kvcache`/`.cmcache`,
