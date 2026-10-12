@@ -4229,14 +4229,16 @@ private:
                                 // rest APPEND). this rebuilds the prefix's completed comp
                                 // rows that the attention over the restored prefix needs.
                                 if (ok && kv_chain->has_comp()) {
-                                    // the qwen4exp QSA indexer is a SEPARATE cache that must track
-                                    // the attention cache cell-for-cell, so its restore must adopt the
-                                    // attn's slot layout (llama_kvchain_set_idx_window). dsv4's comp K
-                                    // caches live inside the dsv4 cache itself, so the plain
-                                    // set_data_window_ext is correct there.
-                                    const bool idx_mirrors_attn =
-                                            model_tgt != nullptr &&
-                                            std::string(llama_model_arch_name(model_tgt)) == "qwen4exp";
+                                     // the qwen4exp QSA indexer is a SEPARATE cache, so its
+                                     // restore goes through llama_kvchain_set_idx_window (a
+                                     // NON-mirror restore: the idx is a plain llama_kv_cache,
+                                     // restored into its own cells via find_slot - NOT the
+                                     // attn's layout, which broke under --parallel > 1). dsv4's
+                                     // comp K caches live inside the dsv4 cache itself, so the
+                                     // plain set_data_window_ext is correct there.
+                                     const bool idx_custom_restore =
+                                             model_tgt != nullptr &&
+                                             std::string(llama_model_arch_name(model_tgt)) == "qwen4exp";
                                     for (size_t k = 0; k < chunks.size() && ok; ++k) {
                                         const llama_pos pos_lo = (llama_pos) (k * ubs);
                                         const llama_pos pos_hi = (llama_pos) ((k + 1) * ubs);
@@ -4256,18 +4258,18 @@ private:
                                          // does not invalidate the graph result itself - do it here,
                                          // once per chunk: the next decode must rebuild the graph,
                                          // or it sizes its windows (qwen4exp QSA) from a stale n_kv.
-                                         const size_t n_cm = idx_mirrors_attn
-                                                 ? llama_kvchain_set_idx_window(ctx_tgt, cm_blob.data(), cm_blob.size(),
-                                                         slot.id, cm_flags, pos_lo, pos_hi, append)
-                                                 : llama_state_seq_set_data_window_ext(ctx_tgt,
-                                                         cm_blob.data(), cm_blob.size(), slot.id,
-                                                         cm_flags, pos_lo, pos_hi);
-                                         if (idx_mirrors_attn) {
-                                             llama_kvchain_invalidate_graph(ctx_tgt);
-                                         }
-                                        SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s%s) [%d,%d) blob=%zu -> %zu bytes\n",
-                                                k, (k == 0) ? "" : "|APPEND", idx_mirrors_attn ? "|idx-attn" : "",
-                                                (int) pos_lo, (int) pos_hi, cm_blob.size(), n_cm);
+                                          const size_t n_cm = idx_custom_restore
+                                                  ? llama_kvchain_set_idx_window(ctx_tgt, cm_blob.data(), cm_blob.size(),
+                                                          slot.id, cm_flags, pos_lo, pos_hi, append)
+                                                  : llama_state_seq_set_data_window_ext(ctx_tgt,
+                                                          cm_blob.data(), cm_blob.size(), slot.id,
+                                                          cm_flags, pos_lo, pos_hi);
+                                          if (idx_custom_restore) {
+                                              llama_kvchain_invalidate_graph(ctx_tgt);
+                                          }
+                                         SLT_DBG(slot, "kv-chain[restore]: chunk %zu set_data(COMP_ONLY%s%s) [%d,%d) blob=%zu -> %zu bytes\n",
+                                                 k, (k == 0) ? "" : "|APPEND", idx_custom_restore ? "|idx" : "",
+                                                 (int) pos_lo, (int) pos_hi, cm_blob.size(), n_cm);
                                         cm_blob.clear();
                                         cm_blob.shrink_to_fit();
                                         if (n_cm == 0) {
