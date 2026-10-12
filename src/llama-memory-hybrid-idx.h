@@ -122,16 +122,6 @@ public:
     // no-restore run. ctx is needed to sync the backend before the read.
     void dump_idx_k(const struct llama_context * ctx, llama_seq_id seq_id, const char * path, uint32_t n_cells) const;
 
-    // kv-chain: capture the attention cache's current slot layout for seq_id, so
-    // the QSA indexer (a separate cache that must track the attention cell for
-    // cell) can be restored into those SAME indices instead of running its own
-    // find_slot (which drifts under APPEND). returns an empty vector on failure.
-    // when pos_limit > pos_lo only the cells with pos in [pos_lo, pos_limit) are
-    // returned: a per-chunk idx restore (cell_count = ubs) must adopt the attn
-    // cells of THAT chunk's window, not the whole restored prefix, or the
-    // mirrored-layout size check in state_read_meta rejects the restore.
-    llama_kv_cache::slot_info_vec_t kvchain_attn_sinfos(llama_seq_id seq_id, llama_pos pos_lo = -1, llama_pos pos_limit = -1) const;
-
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore

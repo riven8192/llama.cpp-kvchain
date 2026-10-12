@@ -4634,14 +4634,24 @@ size_t llama_kvchain_set_idx_window(const struct llama_context * ctx,
     if (hyb == nullptr) {
         return 0;
     }
-    // the idx must land on the same cell indices the attention cache holds, so the
-    // two stay cell-for-cell (qwen4exp assert). capture that layout now (after the
-    // attn restore has run) and feed it to the idx restore as sinfos_in.
-    // restrict to this chunk's window [pos_lo, pos_limit): the idx restore for
-    // chunk k restores exactly ubs cells, so it must adopt only the attn cells of
-    // chunk k, not the whole restored prefix (the full layout would make
-    // state_read_meta reject the restore with a mirrored-size mismatch).
-    const auto sinfos_attn = hyb->kvchain_attn_sinfos(seq_id, pos_lo, pos_limit);
+    // NON-MIRROR restore: the idx (mem_idx) is a plain llama_kv_cache, so restore
+    // it into the restorer's own cells via find_slot (sinfos_in = nullptr) - exactly
+    // like the attn .kvcache restore does. this is stream-robust: each cache places
+    // its cells in its own stream, so there is no cross-stream comparison that a
+    // saver/restorer slot mismatch could break.
+    //
+    // (an earlier version adopted the attn cache's layout as a mirror, to keep the
+    // two caches cell-for-cell. but the .cmcache blob is serialized per the SAVING
+    // slot's stream, while the adopted layout sits in the RESTORING slot's stream -
+    // under --parallel > 1 those differ (slot 0 vs slot 1 map the same prompt to the
+    // same chunk but different physical streams), so the mirror check rejected the
+    // restore with "mirrored cache holds cells this one does not". find_slot agrees
+    // between attn and idx because both are cell-for-cell mirrors in steady state and
+    // both are restored from the same positions, so the invariant still holds.)
+    //
+    // mem_idx is a plain llama_kv_cache; clear COMP_ONLY (it would otherwise read an
+    // EMPTY state).
+    const auto f = (llama_state_seq_flags) (flags & ~LLAMA_STATE_SEQ_FLAGS_COMP_ONLY);
 
     std::unique_ptr<llama_io_read_i> io = std::make_unique<llama_io_read_host>(src, size);
     try {
@@ -4650,11 +4660,8 @@ size_t llama_kvchain_set_idx_window(const struct llama_context * ctx,
         if (io_magic_seq != magic_read) {
             throw std::runtime_error("wrong sequence state magic");
         }
-        // mem_idx is a plain llama_kv_cache; clear COMP_ONLY (it would otherwise
-        // read an EMPTY state) and pass the attn layout so the cells adopt it.
-        const auto f = (llama_state_seq_flags) (flags & ~LLAMA_STATE_SEQ_FLAGS_COMP_ONLY);
         hyb->get_mem_idx()->state_read_sinfo(*io, seq_id, f, pos_lo, pos_limit,
-                nullptr, sinfos_attn.empty() ? nullptr : &sinfos_attn, append);
+                nullptr, nullptr, append);
         return io->n_bytes();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading idx state: %s\n", __func__, err.what());

@@ -535,8 +535,11 @@ check_parallel_prefill() {
         # a concurrent-restore idx desync surfaces as this error (the chain then
         # falls back to a full prefill). its presence is the regression.
         local n_mir
+        # || true: grep -c exits 1 on zero matches (the PASSING case), which would
+        # trip `set -e` and abort the whole suite before the summary.
         n_mir="$(grep -c 'mirrored cache holds cells this one does not' \
-                "$(get_file "parallel-prefill" "serverlog")" 2>/dev/null)"
+                "$(get_file "parallel-prefill" "serverlog")" 2>/dev/null || true)"
+        n_mir="${n_mir:-0}"
         if [ "${n_mir}" -gt 0 ] ; then
                 record 1 "parallel-prefill: concurrent idx-restore mirror mismatch (x${n_mir})"
         else
